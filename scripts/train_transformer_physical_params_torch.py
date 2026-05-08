@@ -469,6 +469,7 @@ class TransformerPhysicalTrainConfig:
     phase_window_stride_seconds: float = 0.64
     phase_window_top_k: int = 4
     phase_window_score_temperature: float = 0.25
+    phase_window_gate_score_ref: float = 0.12
     phase_window_max_lag_seconds: float = 0.50
     phase_window_lag_temperature: float = 0.04
     phase_window_freq_min: float = 0.05
@@ -1403,6 +1404,7 @@ def adaptive_phase_window_training_loss(
         stride_seconds=float(cfg.phase_window_stride_seconds),
         top_k=int(cfg.phase_window_top_k),
         score_temperature=float(cfg.phase_window_score_temperature),
+        gate_target_score_ref=float(cfg.phase_window_gate_score_ref),
         max_lag_seconds=float(cfg.phase_window_max_lag_seconds),
         lag_temperature=float(cfg.phase_window_lag_temperature),
         freq_min=float(cfg.phase_window_freq_min),
@@ -2654,6 +2656,7 @@ def parse_args() -> tuple[
     parser.add_argument("--phase-window-stride-seconds", type=float, default=d.phase_window_stride_seconds)
     parser.add_argument("--phase-window-top-k", type=int, default=d.phase_window_top_k)
     parser.add_argument("--phase-window-score-temperature", type=float, default=d.phase_window_score_temperature)
+    parser.add_argument("--phase-window-gate-score-ref", type=float, default=d.phase_window_gate_score_ref)
     parser.add_argument("--phase-window-max-lag-seconds", type=float, default=d.phase_window_max_lag_seconds)
     parser.add_argument("--phase-window-lag-temperature", type=float, default=d.phase_window_lag_temperature)
     parser.add_argument("--phase-window-freq-min", type=float, default=d.phase_window_freq_min)
@@ -2876,6 +2879,7 @@ def parse_args() -> tuple[
         phase_window_stride_seconds=float(args.phase_window_stride_seconds),
         phase_window_top_k=int(args.phase_window_top_k),
         phase_window_score_temperature=float(args.phase_window_score_temperature),
+        phase_window_gate_score_ref=float(args.phase_window_gate_score_ref),
         phase_window_max_lag_seconds=float(args.phase_window_max_lag_seconds),
         phase_window_lag_temperature=float(args.phase_window_lag_temperature),
         phase_window_freq_min=float(args.phase_window_freq_min),
@@ -2962,6 +2966,7 @@ def main() -> None:
             f"start={cfg.phase_window_start}, end={cfg.phase_window_end}, "
             f"size={cfg.phase_window_size_seconds}, stride={cfg.phase_window_stride_seconds}, "
             f"top_k={cfg.phase_window_top_k}, "
+            f"gate_score_ref={cfg.phase_window_gate_score_ref}, "
             f"freq=[{cfg.phase_window_freq_min}, {cfg.phase_window_freq_max}]"
         )
     print(f"  fast_core_precompute_newmark = {cfg.fast_core_precompute_newmark}")

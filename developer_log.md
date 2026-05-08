@@ -831,3 +831,10 @@ alpha_y(t) + response/load + static conditioning 在 240-step 训练中有效。
 | 2026-05-08 Asia/Shanghai | `src/student/transformer/frequency_losses.py` | 新增 | 新增 `adaptive_phase_window_loss(...)` 及局部辅助函数：对全序列滑动窗口计算 detached local phase-drift score，自动选取 high-score windows；在这些窗口上返回可微 local lag loss、complex spectrum phase loss、RMS amp guard 和可选 `g_phase` alignment loss。 | phase-gated fast residual 自主相位修正训练 |
 | 2026-05-08 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 修改 | 将 adaptive phase-window hard mining 与 complex spectrum phase loss 接入 `compute_response_loss(...)`；新增 CLI 配置 `--use-adaptive-phase-window-loss`、`--phase-window-*`、`--w-adaptive-phase-*`、`--w-complex-phase-*`、`--w-complex-amp-guard-*`、`--w-phase-gate-align`，默认关闭以保持旧实验兼容。 | phase-gated fast residual 自主相位修正训练 |
 | 2026-05-08 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 修改 | 扩展训练/验证 history 指标，记录 `adaptive_phase_loss`、`complex_phase_loss`、`complex_amp_guard_loss`、`phase_gate_align_loss`、adaptive score、被选窗口起点范围、被选窗口 gate 均值与 gate target 均值，用于判断模型是否自主定位相位漂移窗口。 | phase-gated fast residual 自主相位修正诊断 |
+
+# 开发者日志
+
+| 修改时间 | 涉及脚本/文件 | 增改类型 | 修改内容 | 所属阶段 |
+|---|---|---|---|---|
+| 2026-05-09 Asia/Shanghai | `src/student/transformer/frequency_losses.py` | 修改 | `adaptive_phase_window_loss(...)` 新增 `gate_target_score_ref`，用可配置参考 score 缩放 gate alignment target，使 hard phase-drift windows 能给 `g_phase` 更明确的局部开启目标。 | phase-gated fast residual 自主相位修正训练 |
+| 2026-05-09 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 修改 | 新增 `--phase-window-gate-score-ref` 配置，训练时传入 adaptive phase-window loss，并在启动信息中打印该值；默认 `0.12`。 | phase-gated fast residual 自主相位修正训练 |

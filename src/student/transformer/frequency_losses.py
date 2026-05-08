@@ -650,6 +650,7 @@ def adaptive_phase_window_loss(
     stride_seconds: float = 0.64,
     top_k: int = 4,
     score_temperature: float = 0.25,
+    gate_target_score_ref: float = 0.12,
     max_lag_seconds: float = 0.5,
     lag_temperature: float = 0.04,
     freq_min: float = 0.05,
@@ -663,7 +664,10 @@ def adaptive_phase_window_loss(
     phase drift indicators, then applies differentiable lag/complex-phase
     losses mostly on the highest-score windows. When a phase gate is provided,
     it also returns a soft gate-alignment loss so the fast branch learns to
-    open where the current rollout shows local phase drift.
+    open where the current rollout shows local phase drift. The gate target is
+    calibrated by ``gate_target_score_ref`` so a meaningful local drift score can
+    ask for a clearly active gate instead of being compressed to a near-zero
+    target.
     """
     pred_btd = _as_btd(pred)
     target_btd = _as_btd(target)
@@ -820,7 +824,8 @@ def adaptive_phase_window_loss(
     gate_target_mean = zero.detach()
     if gate_means:
         gate_tensor = torch.stack(gate_means)
-        gate_target = (score_tensor / (score_tensor + 1.0)).clamp(0.0, 1.0).detach()
+        score_ref = max(float(gate_target_score_ref), 1.0e-8)
+        gate_target = (score_tensor / score_ref).clamp(0.0, 1.0).detach()
         gate_align_loss = torch.mean((gate_tensor - gate_target) ** 2)
         selected_gate_mean = torch.sum(selected_weights * gate_tensor[selected_idx]).detach()
         gate_target_mean = torch.sum(selected_weights * gate_target[selected_idx]).detach()
