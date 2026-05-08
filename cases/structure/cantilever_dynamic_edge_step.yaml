@@ -1,0 +1,16 @@
+case_name: "cantilever_dynamic_edge_step"
+
+description: "BeamDyn dynamic benchmark - edgewise step load excitation"
+
+beamdyn:
+  driver_input_file: "data/raw/reference_cases/beamdyn/nrel5mw/bd_driver_dynamic_nrel_5mw.inp"
+  notes: "Constant tip load applied in Y-direction (edgewise) at t=0."
+
+loads:
+  type: "tip_load"
+  magnitude_N: 10000.0
+  direction: "edgewise"
+
+boundary_conditions:
+  root: "fixed"
+  tip: "free"

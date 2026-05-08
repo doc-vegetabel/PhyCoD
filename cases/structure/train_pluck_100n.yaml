@@ -1,0 +1,13 @@
+case_name: train_pluck_100n
+description: 'Auto-generated scenario: pluck load with 0.1kN at node 49'
+dynamic_solve: true
+t_max: 20.0
+dt: 0.01
+boundary_condition: cantilever
+load_type: dynamic_point_load
+load_profile: pluck
+point_load_node: 49
+point_load_file: data/interim/beamdyn_loads/bd_load_train_pluck_100n.dat
+beamdyn:
+  driver_input_file: data/raw/reference_cases/beamdyn/nrel5mw/bd_driver_dynamic_nrel_5mw.inp
+pluck_duration: 2.0

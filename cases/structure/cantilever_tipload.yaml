@@ -1,0 +1,16 @@
+case_name: "cantilever_tipload"
+
+description: "BeamDyn standalone static benchmark using NREL 5MW reference files"
+
+beamdyn:
+  driver_input_file: "data/raw/reference_cases/beamdyn/nrel5mw/bd_driver_static_nrel_5mw.inp"
+  notes: "Run BeamDyn standalone static example by copying case files to results directory first."
+
+loads:
+  type: "tip_load"
+  magnitude_N: 1000.0
+  direction: "flapwise"
+
+boundary_conditions:
+  root: "fixed"
+  tip: "free"

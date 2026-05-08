@@ -1,0 +1,14 @@
+model_name: "student_stage2_static_flap_edge_v0"
+
+description: "Provisional stage-2 static calibration using flapwise tip-load, flapwise uniform-load, and edgewise tip-load."
+
+alpha_flap: 1.01
+alpha_edge: 0.89
+alpha_torsion: 1.0
+
+calibration_cases:
+  - "cantilever_tipload"
+  - "cantilever_uniformload"
+  - "cantilever_tipload_edgewise"
+
+notes: "alpha_flap is frozen from two flapwise static benchmarks; alpha_edge is provisional and currently calibrated from edgewise tip-load only."

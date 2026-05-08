@@ -1,0 +1,14 @@
+executables:
+  openfast: 'C:/tools/openfast/openfast_x64.exe'
+  beamdyn_driver: 'C:/tools/openfast/BeamDyn_Driver_x64.exe'
+  aerodyn_driver: 'C:/tools/openfast/AeroDyn_Driver_x64.exe'
+project:
+  raw_data_dir: "data/raw"
+  processed_data_dir: "data/processed"
+  results_dir: "results"
+
+reference_data:
+  iea15_root: "data/raw/nrel5mw"
+  beamdyn_reference_dir: "data/raw/nrel5mw/beamdyn_reference"
+  aerodyn_reference_dir: "data/raw/nrel5mw/aerodyn_reference"
+  openfast_reference_dir: "data/raw/nrel5mw/openfast_reference"

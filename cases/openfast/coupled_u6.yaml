@@ -1,0 +1,20 @@
+case_name: "coupled_u6"
+
+description: "Minimal placeholder OpenFAST coupled benchmark case"
+
+openfast:
+  primary_input_file: ""
+  notes: "To be filled later after OpenFAST input files are prepared."
+
+operating_condition:
+  wind_speed_mps: 6.0
+  rotor_speed_rpm: 5.0
+  pitch_deg: 0.0
+
+modules:
+  structure: "BeamDyn"
+  aero: "AeroDyn"
+  inflow: "uniform"
+
+goal:
+  type: "minimal_coupled_check"

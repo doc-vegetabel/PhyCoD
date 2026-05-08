@@ -1,0 +1,17 @@
+# Copy to paths.yaml and edit for your machine.
+
+executables:
+  openfast: "/absolute/path/to/openfast"
+  beamdyn_driver: "/absolute/path/to/beamdyn_driver"
+  aerodyn_driver: "/absolute/path/to/aerodyn_driver"
+
+project:
+  raw_data_dir: "data/raw"
+  processed_data_dir: "data/processed"
+  results_dir: "results"
+
+reference_data:
+  iea15_root: "data/raw/nrel5mw"
+  beamdyn_reference_dir: "data/raw/nrel5mw/beamdyn_reference"
+  aerodyn_reference_dir: "data/raw/nrel5mw/aerodyn_reference"
+  openfast_reference_dir: "data/raw/nrel5mw/openfast_reference"

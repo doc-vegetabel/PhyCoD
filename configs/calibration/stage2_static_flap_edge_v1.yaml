@@ -1,0 +1,11 @@
+model_name: "student_stage2_static_flap_edge_v1"
+
+# --- 静力校准系数 (已冻结) ---
+alpha_flap: 1.01
+alpha_edge: 0.925
+alpha_torsion: 1.0
+
+# --- 动力学校准系数 (已冻结) ---
+# 结构等效阻尼比 (用于 Rayleigh 阻尼 C = beta * K)
+# 基于 Teacher 纯结构自由振动衰减 benchmark 校准得出
+zeta_structural: 0.015

@@ -1,0 +1,18 @@
+case_name: "steady_u6_rpm5_pitch0"
+
+description: "Minimal placeholder AeroDyn benchmark case"
+
+aerodyn:
+  driver_input_file: ""
+  notes: "To be filled later after AeroDyn standalone input files are prepared."
+
+operating_condition:
+  wind_speed_mps: 6.0
+  rotor_speed_rpm: 5.0
+  pitch_deg: 0.0
+
+blade_model:
+  type: "rigid"
+
+inflow:
+  type: "uniform"

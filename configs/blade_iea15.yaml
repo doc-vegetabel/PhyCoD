@@ -1,0 +1,16 @@
+blade:
+  name: "IEA-15-240-RWT"
+  rotor_radius_m: 120.0
+  blade_length_m: 117.0
+  hub_radius_m: 3.97
+
+files:
+  blade_master_csv: "data/raw/nrel5mw/blade_master.csv"
+  airfoil_dir: "data/raw/nrel5mw/airfoils"
+  airfoil_index_csv: "data/raw/nrel5mw/airfoil_index.csv"
+  common_span_grid_csv: "data/processed/common_span_grid.csv"
+
+metadata:
+  span_coordinate: "r"
+  nondim_coordinate: "r_over_R"
+  notes: "Stage 0 placeholder config. Update after raw data ingestion."

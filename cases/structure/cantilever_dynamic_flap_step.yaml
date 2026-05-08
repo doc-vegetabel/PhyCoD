@@ -1,0 +1,17 @@
+case_name: "cantilever_dynamic_flap_step"
+
+description: "BeamDyn standalone dynamic benchmark - flapwise step load excitation"
+
+beamdyn:
+  # 注意：这里指向的是动态的 inp 文件
+  driver_input_file: "data/raw/reference_cases/beamdyn/nrel5mw/bd_driver_dynamic_nrel_5mw.inp"
+  notes: "Constant tip load applied at t=0 acts as a step excitation, causing transient oscillation."
+
+loads:
+  type: "tip_load"
+  magnitude_N: 10000.0  # 施加 10kN 以激发明显的振荡幅度
+  direction: "flapwise"
+
+boundary_conditions:
+  root: "fixed"
+  tip: "free"

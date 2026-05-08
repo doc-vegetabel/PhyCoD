@@ -1,0 +1,26 @@
+# cases/structure/dynamic_pluck.yaml
+case_name: dynamic_pluck
+description: "纯结构动力学：阶跃释放激振 (Pluck Test)，用于激活大变形非线性和低阶模态"
+
+# 求解器核心控制
+dynamic_solve: True
+t_max: 10.0
+dt: 0.01
+
+# 边界与载荷条件
+boundary_condition: cantilever
+load_type: dynamic_point_load
+point_load_node: 49
+point_load_file: "data/interim/beamdyn_loads/bd_load_pluck.dat"
+
+# cases/structure/dynamic_pluck.yaml
+
+# ... (上面的配置保持不变) ...
+
+# cases/structure/dynamic_pluck.yaml
+
+# ... (上面的控制参数保持不变) ...
+
+beamdyn:
+  # 使用相对项目根目录的完整路径，指向动态驱动模板
+  driver_input_file: "data/raw/reference_cases/beamdyn/nrel5mw/bd_driver_dynamic_nrel_5mw.inp"
