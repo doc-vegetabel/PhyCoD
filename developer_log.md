@@ -866,3 +866,4 @@ alpha_y(t) + response/load + static conditioning 在 240-step 训练中有效。
 |---|---|---|---|---|
 | 2026-05-09 Asia/Shanghai | `src/student/transformer/transformer_rollout_torch.py` | 新增 | `TransformerRolloutConfig` 新增 `profile_timing` 与 `profile_timing_sync_cuda`；static rollout 在 metadata 中记录 encoder、core prepare、Newmark loop、state stack 的耗时，用于定位训练瓶颈，不改变物理接口和数值路径。 | 训练速度诊断 |
 | 2026-05-09 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 新增 | 新增 `--profile-train-timing` 与 `--profile-timing-sync-cuda`；训练/验证阶段聚合 total、model forward、encoder、core prepare、Newmark loop、loss、backward、metric accumulation、grad clip、optimizer step 等耗时，并写入 `training_history.csv`。 | 训练速度诊断 |
+| 2026-05-09 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 修复 | 修复计时诊断改动中 `compute_response_loss(...)` 组装 `result` 后未返回的问题，避免训练阶段出现 `loss_dict is None`。 | 训练速度诊断 |

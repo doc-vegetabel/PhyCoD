@@ -1923,6 +1923,7 @@ def compute_response_loss(
             }
         },
     }
+    return result
 
 def evaluate_cases(
         *,
