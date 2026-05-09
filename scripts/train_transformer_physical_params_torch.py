@@ -1305,6 +1305,10 @@ TIMING_LOG_METRIC_KEYS = [
     "timing_encoder_seconds",
     "timing_core_prepare_seconds",
     "timing_newmark_loop_seconds",
+    "timing_newmark_assemble_seconds",
+    "timing_newmark_rhs_seconds",
+    "timing_newmark_solve_seconds",
+    "timing_newmark_update_seconds",
     "timing_state_stack_seconds",
     "timing_loss_seconds",
     "timing_backward_seconds",
@@ -2035,6 +2039,10 @@ def evaluate_cases(
                     ("encoder_seconds", "timing_encoder_seconds"),
                     ("core_prepare_seconds", "timing_core_prepare_seconds"),
                     ("newmark_loop_seconds", "timing_newmark_loop_seconds"),
+                    ("newmark_assemble_seconds", "timing_newmark_assemble_seconds"),
+                    ("newmark_rhs_seconds", "timing_newmark_rhs_seconds"),
+                    ("newmark_solve_seconds", "timing_newmark_solve_seconds"),
+                    ("newmark_update_seconds", "timing_newmark_update_seconds"),
                     ("state_stack_seconds", "timing_state_stack_seconds"),
                 ):
                     timing_sums[dst_key] += float(out.metadata.get(src_key, 0.0))
@@ -2339,6 +2347,10 @@ def train_cases_grad_accum(
                 ("encoder_seconds", "timing_encoder_seconds"),
                 ("core_prepare_seconds", "timing_core_prepare_seconds"),
                 ("newmark_loop_seconds", "timing_newmark_loop_seconds"),
+                ("newmark_assemble_seconds", "timing_newmark_assemble_seconds"),
+                ("newmark_rhs_seconds", "timing_newmark_rhs_seconds"),
+                ("newmark_solve_seconds", "timing_newmark_solve_seconds"),
+                ("newmark_update_seconds", "timing_newmark_update_seconds"),
                 ("state_stack_seconds", "timing_state_stack_seconds"),
             ):
                 timing_sums[dst_key] += float(out.metadata.get(src_key, 0.0))
@@ -3894,6 +3906,10 @@ def main() -> None:
                     f"forward={row['train_timing_model_forward_seconds']:.2f}s "
                     f"encoder={row['train_timing_encoder_seconds']:.2f}s "
                     f"newmark={row['train_timing_newmark_loop_seconds']:.2f}s "
+                    f"assemble={row['train_timing_newmark_assemble_seconds']:.2f}s "
+                    f"rhs={row['train_timing_newmark_rhs_seconds']:.2f}s "
+                    f"solve={row['train_timing_newmark_solve_seconds']:.2f}s "
+                    f"update={row['train_timing_newmark_update_seconds']:.2f}s "
                     f"loss={row['train_timing_loss_seconds']:.2f}s "
                     f"backward={row['train_timing_backward_seconds']:.2f}s "
                     f"valid_total={row['valid_timing_total_seconds']:.2f}s"

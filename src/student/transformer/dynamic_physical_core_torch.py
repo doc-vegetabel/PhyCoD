@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
@@ -394,6 +394,45 @@ class DynamicPhysicalCoreTorch(nn.Module):
 
         return u_t1, v_t1, a_t1
 
+    def _newmark_step_single_fast_timed(
+        self,
+        *,
+        u_t: torch.Tensor,
+        v_t: torch.Tensor,
+        a_t: torch.Tensor,
+        F_t1: torch.Tensor,
+        theta_t: Optional[torch.Tensor] = None,
+        time_fn: Callable[[], float],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
+        """Timed variant of the unchecked fast Newmark update."""
+        dt = self._dt
+        gamma = self._gamma
+        a0, a1, a2, a3, a4, a5 = self._newmark_constants()
+        timing: dict[str, float] = {}
+
+        t0 = time_fn()
+        A = self._newmark_effective_matrix_fast(theta_t)
+        timing["newmark_assemble_seconds"] = time_fn() - t0
+
+        t0 = time_fn()
+        rhs = (
+            F_t1
+            + self.M0 @ (a0 * u_t + a2 * v_t + a3 * a_t)
+            + self.C0 @ (a1 * u_t + a4 * v_t + a5 * a_t)
+        )
+        timing["newmark_rhs_seconds"] = time_fn() - t0
+
+        t0 = time_fn()
+        u_t1 = self._linear_solve(A, rhs)
+        timing["newmark_solve_seconds"] = time_fn() - t0
+
+        t0 = time_fn()
+        a_t1 = a0 * (u_t1 - u_t) - a2 * v_t - a3 * a_t
+        v_t1 = v_t + dt * ((1.0 - gamma) * a_t + gamma * a_t1)
+        timing["newmark_update_seconds"] = time_fn() - t0
+
+        return u_t1, v_t1, a_t1, timing
+
     def newmark_step_fast(
         self,
         *,
@@ -454,6 +493,82 @@ class DynamicPhysicalCoreTorch(nn.Module):
             a_out.append(a1)
 
         return torch.stack(u_out, dim=0), torch.stack(v_out, dim=0), torch.stack(a_out, dim=0)
+
+    def newmark_step_fast_timed(
+        self,
+        *,
+        u_t: torch.Tensor,
+        v_t: torch.Tensor,
+        a_t: torch.Tensor,
+        F_t1: torch.Tensor,
+        theta_t: Optional[torch.Tensor] = None,
+        time_fn: Callable[[], float],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
+        """
+        Timed Newmark step for profiling only.
+
+        This follows the same operations as ``newmark_step_fast`` but splits
+        timing into effective-matrix assembly, RHS build, linear solve, and
+        state update. It is intentionally used only when rollout profiling is
+        enabled because synchronized timing can slow training.
+        """
+        if u_t.ndim == 1:
+            return self._newmark_step_single_fast_timed(
+                u_t=u_t,
+                v_t=v_t,
+                a_t=a_t,
+                F_t1=F_t1,
+                theta_t=theta_t,
+                time_fn=time_fn,
+            )
+
+        B = int(u_t.shape[0])
+        if theta_t is None:
+            theta_batch = [None for _ in range(B)]
+        elif theta_t.ndim == 1:
+            theta_batch = [theta_t for _ in range(B)]
+        else:
+            theta_batch = [theta_t[i] for i in range(B)]
+
+        timing = {
+            "newmark_assemble_seconds": 0.0,
+            "newmark_rhs_seconds": 0.0,
+            "newmark_solve_seconds": 0.0,
+            "newmark_update_seconds": 0.0,
+        }
+
+        if B == 1:
+            u1, v1, a1, step_timing = self._newmark_step_single_fast_timed(
+                u_t=u_t[0],
+                v_t=v_t[0],
+                a_t=a_t[0],
+                F_t1=F_t1[0],
+                theta_t=theta_batch[0],
+                time_fn=time_fn,
+            )
+            for key, value in step_timing.items():
+                timing[key] += float(value)
+            return u1.unsqueeze(0), v1.unsqueeze(0), a1.unsqueeze(0), timing
+
+        u_out = []
+        v_out = []
+        a_out = []
+        for b in range(B):
+            u1, v1, a1, step_timing = self._newmark_step_single_fast_timed(
+                u_t=u_t[b],
+                v_t=v_t[b],
+                a_t=a_t[b],
+                F_t1=F_t1[b],
+                theta_t=theta_batch[b],
+                time_fn=time_fn,
+            )
+            for key, value in step_timing.items():
+                timing[key] += float(value)
+            u_out.append(u1)
+            v_out.append(v1)
+            a_out.append(a1)
+
+        return torch.stack(u_out, dim=0), torch.stack(v_out, dim=0), torch.stack(a_out, dim=0), timing
 
     def newmark_step(
         self,

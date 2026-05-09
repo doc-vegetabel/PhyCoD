@@ -335,6 +335,12 @@ class TransformerPhysicalRolloutTorch(nn.Module):
         a_list = [a_t]
 
         t0 = self._time_now(core_device) if profile_timing else 0.0
+        newmark_detail_timing = {
+            "newmark_assemble_seconds": 0.0,
+            "newmark_rhs_seconds": 0.0,
+            "newmark_solve_seconds": 0.0,
+            "newmark_update_seconds": 0.0,
+        }
         for t in range(T - 1):
             theta_t = theta_core[:, t, :]
 
@@ -343,13 +349,25 @@ class TransformerPhysicalRolloutTorch(nn.Module):
                 v_t = v_t.detach()
                 a_t = a_t.detach()
 
-            u_next, v_next, a_next = self.physical_core.newmark_step_fast(
-                u_t=u_t,
-                v_t=v_t,
-                a_t=a_t,
-                F_t1=F_core[:, t + 1, :],
-                theta_t=theta_t,
-            )
+            if profile_timing:
+                u_next, v_next, a_next, step_timing = self.physical_core.newmark_step_fast_timed(
+                    u_t=u_t,
+                    v_t=v_t,
+                    a_t=a_t,
+                    F_t1=F_core[:, t + 1, :],
+                    theta_t=theta_t,
+                    time_fn=lambda: self._time_now(core_device),
+                )
+                for key, value in step_timing.items():
+                    newmark_detail_timing[key] += float(value)
+            else:
+                u_next, v_next, a_next = self.physical_core.newmark_step_fast(
+                    u_t=u_t,
+                    v_t=v_t,
+                    a_t=a_t,
+                    F_t1=F_core[:, t + 1, :],
+                    theta_t=theta_t,
+                )
 
             u_list.append(u_next)
             v_list.append(v_next)
@@ -358,6 +376,7 @@ class TransformerPhysicalRolloutTorch(nn.Module):
             u_t, v_t, a_t = u_next, v_next, a_next
         if profile_timing:
             timing["newmark_loop_seconds"] = self._time_now(core_device) - t0
+            timing.update(newmark_detail_timing)
 
         t0 = self._time_now(core_device) if profile_timing else 0.0
         u_pred = torch.stack(u_list, dim=1)
