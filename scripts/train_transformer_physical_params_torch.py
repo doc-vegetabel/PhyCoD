@@ -482,6 +482,21 @@ class TransformerPhysicalTrainConfig:
     w_complex_amp_guard_y: float = 0.0
     w_phase_gate_align: float = 0.0
 
+    # Response-level no-regression guard for cases that should not be harmed
+    # while high-frequency / complex phase correction is strengthened.
+    use_no_regression_guard: bool = False
+    no_regression_guard_case_keywords: str = "simple,tip_fx,tip_fy,freq_low,f0p150,low"
+    w_no_regression_response: float = 0.0
+    w_no_regression_lag: float = 0.0
+    w_no_regression_amp: float = 0.0
+    no_regression_x_ratio_limit: float = 1.0
+    no_regression_y_ratio_limit: float = 1.0
+    no_regression_tip_y_ratio_limit: float = 1.02
+    no_regression_last5_y_ratio_limit: float = 1.02
+    no_regression_lag_tol_seconds: float = 0.02
+    no_regression_amp_log_tol: float = 0.08
+    best_score_guard_weight: float = 1.0
+
     # Optional slow + phase-gated fast decomposition for alpha_x / alpha_xy.
     # False keeps old bounded theta head unchanged.
     use_phase_gated_decomposition: bool = False
@@ -1176,6 +1191,22 @@ def _is_simple_training_case_name(case_name: str) -> bool:
     )
 
 
+def _split_keyword_list(value: str) -> list[str]:
+    return [
+        item.strip().lower()
+        for item in str(value).replace(";", ",").split(",")
+        if item.strip()
+    ]
+
+
+def _is_no_regression_guard_case_name(case_name: str, cfg: TransformerPhysicalTrainConfig) -> bool:
+    if not bool(getattr(cfg, "use_no_regression_guard", False)):
+        return False
+    name = str(case_name).lower()
+    keywords = _split_keyword_list(str(cfg.no_regression_guard_case_keywords))
+    return any(keyword in name for keyword in keywords)
+
+
 PHASE_GATED_LOG_METRIC_KEYS = [
     "phase_reg_loss",
     "theta_slow_smooth",
@@ -1248,6 +1279,22 @@ ADAPTIVE_PHASE_MIN_METRIC_KEYS = {
     "adaptive_x_selected_t_start_min",
     "adaptive_y_selected_t_start_min",
 }
+
+NO_REGRESSION_LOG_METRIC_KEYS = [
+    "no_regression_guard_loss",
+    "no_regression_response_guard_loss",
+    "no_regression_lag_guard_loss",
+    "no_regression_amp_guard_loss",
+    "no_regression_guard_active",
+    "no_regression_x_ratio_excess",
+    "no_regression_y_ratio_excess",
+    "no_regression_tip_y_ratio_excess",
+    "no_regression_last5_y_ratio_excess",
+    "no_regression_x_lag_excess_s",
+    "no_regression_y_lag_excess_s",
+    "no_regression_x_amp_log_excess",
+    "no_regression_y_amp_log_excess",
+]
 
 
 def _metric_to_float(metrics: dict[str, Any], key: str) -> float:
@@ -1474,6 +1521,104 @@ def adaptive_phase_window_training_loss(
     return out
 
 
+def _demeaned_rms_ratio(
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        dof_indices: torch.Tensor,
+        eps: torch.Tensor,
+) -> torch.Tensor:
+    p = pred[:, dof_indices]
+    t = target[:, dof_indices]
+    p = p - torch.mean(p, dim=0, keepdim=True)
+    t = t - torch.mean(t, dim=0, keepdim=True)
+    p_rms = torch.sqrt(torch.mean(p * p).clamp_min(eps))
+    t_rms = torch.sqrt(torch.mean(t * t).clamp_min(eps))
+    return p_rms / t_rms.clamp_min(eps)
+
+
+def no_regression_guard_loss(
+        *,
+        pred: torch.Tensor,
+        teacher: torch.Tensor,
+        cfg: TransformerPhysicalTrainConfig,
+        case_name: str,
+        x_idx: torch.Tensor,
+        y_idx: torch.Tensor,
+        x_ratio: torch.Tensor,
+        y_ratio: torch.Tensor,
+        tip_y_ratio: torch.Tensor,
+        last5_y_ratio: torch.Tensor,
+        align_x: dict[str, torch.Tensor],
+        align_y: dict[str, torch.Tensor],
+        eps: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    zero = torch.zeros((), dtype=pred.dtype, device=pred.device)
+    active = _is_no_regression_guard_case_name(case_name, cfg)
+    if not active:
+        return {
+            "no_regression_guard_loss": zero,
+            "no_regression_response_guard_loss": zero,
+            "no_regression_lag_guard_loss": zero,
+            "no_regression_amp_guard_loss": zero,
+            "no_regression_guard_active": zero.detach(),
+            "no_regression_x_ratio_excess": zero.detach(),
+            "no_regression_y_ratio_excess": zero.detach(),
+            "no_regression_tip_y_ratio_excess": zero.detach(),
+            "no_regression_last5_y_ratio_excess": zero.detach(),
+            "no_regression_x_lag_excess_s": zero.detach(),
+            "no_regression_y_lag_excess_s": zero.detach(),
+            "no_regression_x_amp_log_excess": zero.detach(),
+            "no_regression_y_amp_log_excess": zero.detach(),
+        }
+
+    x_ratio_excess = torch.relu(x_ratio - float(cfg.no_regression_x_ratio_limit))
+    y_ratio_excess = torch.relu(y_ratio - float(cfg.no_regression_y_ratio_limit))
+    tip_y_ratio_excess = torch.relu(tip_y_ratio - float(cfg.no_regression_tip_y_ratio_limit))
+    last5_y_ratio_excess = torch.relu(last5_y_ratio - float(cfg.no_regression_last5_y_ratio_limit))
+    response_guard = (
+        x_ratio_excess ** 2
+        + y_ratio_excess ** 2
+        + tip_y_ratio_excess ** 2
+        + last5_y_ratio_excess ** 2
+    )
+
+    lag_tol = float(cfg.no_regression_lag_tol_seconds)
+    x_lag_excess = torch.relu(align_x["mean_abs_lag_s"].to(dtype=pred.dtype, device=pred.device) - lag_tol)
+    y_lag_excess = torch.relu(align_y["mean_abs_lag_s"].to(dtype=pred.dtype, device=pred.device) - lag_tol)
+    x_lag_gate = (x_lag_excess.detach() > 0).to(dtype=pred.dtype)
+    y_lag_gate = (y_lag_excess.detach() > 0).to(dtype=pred.dtype)
+    lag_guard = x_lag_gate * align_x["lag_loss"] + y_lag_gate * align_y["lag_loss"]
+
+    amp_tol = float(cfg.no_regression_amp_log_tol)
+    x_amp_ratio = _demeaned_rms_ratio(pred, teacher, x_idx, eps)
+    y_amp_ratio = _demeaned_rms_ratio(pred, teacher, y_idx, eps)
+    x_amp_log_excess = torch.relu(torch.abs(torch.log(x_amp_ratio.clamp_min(eps))) - amp_tol)
+    y_amp_log_excess = torch.relu(torch.abs(torch.log(y_amp_ratio.clamp_min(eps))) - amp_tol)
+    amp_guard = x_amp_log_excess ** 2 + y_amp_log_excess ** 2
+
+    guard_loss = (
+        float(cfg.w_no_regression_response) * response_guard
+        + float(cfg.w_no_regression_lag) * lag_guard
+        + float(cfg.w_no_regression_amp) * amp_guard
+    )
+
+    return {
+        "no_regression_guard_loss": guard_loss,
+        "no_regression_response_guard_loss": response_guard,
+        "no_regression_lag_guard_loss": lag_guard,
+        "no_regression_amp_guard_loss": amp_guard,
+        "no_regression_guard_active": torch.as_tensor(1.0, dtype=pred.dtype, device=pred.device),
+        "no_regression_x_ratio_excess": x_ratio_excess.detach(),
+        "no_regression_y_ratio_excess": y_ratio_excess.detach(),
+        "no_regression_tip_y_ratio_excess": tip_y_ratio_excess.detach(),
+        "no_regression_last5_y_ratio_excess": last5_y_ratio_excess.detach(),
+        "no_regression_x_lag_excess_s": x_lag_excess.detach(),
+        "no_regression_y_lag_excess_s": y_lag_excess.detach(),
+        "no_regression_x_amp_log_excess": x_amp_log_excess.detach(),
+        "no_regression_y_amp_log_excess": y_amp_log_excess.detach(),
+    }
+
+
 def compute_response_loss(
         *,
         u_pred: torch.Tensor,
@@ -1613,6 +1758,22 @@ def compute_response_loss(
             + float(cfg.w_lag_y) * align_y["lag_loss"]
     )
 
+    no_regression = no_regression_guard_loss(
+        pred=pred,
+        teacher=teacher,
+        cfg=cfg,
+        case_name=case_name,
+        x_idx=x_idx,
+        y_idx=y_idx,
+        x_ratio=x_ratio,
+        y_ratio=y_ratio,
+        tip_y_ratio=tip_y_ratio,
+        last5_y_ratio=last5_y_ratio,
+        align_x=align_x,
+        align_y=align_y,
+        eps=eps,
+    )
+
     adaptive_phase = adaptive_phase_window_training_loss(
         pred=pred,
         teacher=teacher,
@@ -1647,7 +1808,7 @@ def compute_response_loss(
     base_reg_loss = float(cfg.w_theta_amp) * amp + float(cfg.w_theta_smooth) * smooth
     reg_loss = base_reg_loss + phase_reg["phase_reg_loss"]
 
-    total_loss = response_loss + freq_loss + reg_loss
+    total_loss = response_loss + freq_loss + reg_loss + no_regression["no_regression_guard_loss"]
 
     return {
         "total_loss": total_loss,
@@ -1661,6 +1822,19 @@ def compute_response_loss(
         "complex_phase_loss": adaptive_phase["complex_phase_loss"],
         "complex_amp_guard_loss": adaptive_phase["complex_amp_guard_loss"],
         "phase_gate_align_loss": adaptive_phase["phase_gate_align_loss"],
+        "no_regression_guard_loss": no_regression["no_regression_guard_loss"],
+        "no_regression_response_guard_loss": no_regression["no_regression_response_guard_loss"],
+        "no_regression_lag_guard_loss": no_regression["no_regression_lag_guard_loss"],
+        "no_regression_amp_guard_loss": no_regression["no_regression_amp_guard_loss"],
+        "no_regression_guard_active": no_regression["no_regression_guard_active"],
+        "no_regression_x_ratio_excess": no_regression["no_regression_x_ratio_excess"],
+        "no_regression_y_ratio_excess": no_regression["no_regression_y_ratio_excess"],
+        "no_regression_tip_y_ratio_excess": no_regression["no_regression_tip_y_ratio_excess"],
+        "no_regression_last5_y_ratio_excess": no_regression["no_regression_last5_y_ratio_excess"],
+        "no_regression_x_lag_excess_s": no_regression["no_regression_x_lag_excess_s"],
+        "no_regression_y_lag_excess_s": no_regression["no_regression_y_lag_excess_s"],
+        "no_regression_x_amp_log_excess": no_regression["no_regression_x_amp_log_excess"],
+        "no_regression_y_amp_log_excess": no_regression["no_regression_y_amp_log_excess"],
         "reg_loss": reg_loss,
         "x_mse": x_mse,
         "y_mse": y_mse,
@@ -1743,6 +1917,7 @@ def evaluate_cases(
             "theta_abs_max": zero,
             **{k: zero for k in PHASE_GATED_LOG_METRIC_KEYS},
             **{k: zero for k in ADAPTIVE_PHASE_LOG_METRIC_KEYS},
+            **{k: zero for k in NO_REGRESSION_LOG_METRIC_KEYS},
             "num_cases": 0,
         }
 
@@ -1788,6 +1963,9 @@ def evaluate_cases(
         }
         adaptive_metric_values: dict[str, list[torch.Tensor]] = {
             k: [] for k in ADAPTIVE_PHASE_LOG_METRIC_KEYS
+        }
+        no_regression_metric_values: dict[str, list[torch.Tensor]] = {
+            k: [] for k in NO_REGRESSION_LOG_METRIC_KEYS
         }
 
         for case in cases:
@@ -1865,6 +2043,8 @@ def evaluate_cases(
                 phase_metric_values[k].append(loss_dict[k])
             for k in ADAPTIVE_PHASE_LOG_METRIC_KEYS:
                 adaptive_metric_values[k].append(loss_dict[k])
+            for k in NO_REGRESSION_LOG_METRIC_KEYS:
+                no_regression_metric_values[k].append(loss_dict[k])
 
         total_loss = torch.stack(losses).mean()
         data_loss = torch.stack(data_losses).mean()
@@ -1916,6 +2096,10 @@ def evaluate_cases(
                 adaptive_metrics[k] = stacked.min()
             else:
                 adaptive_metrics[k] = stacked.mean()
+        no_regression_metrics = {
+            k: torch.stack(values).mean()
+            for k, values in no_regression_metric_values.items()
+        }
 
     return {
         "total_loss": total_loss,
@@ -1954,6 +2138,7 @@ def evaluate_cases(
         "theta_abs_max": theta_abs_max,
         **phase_metrics,
         **adaptive_metrics,
+        **no_regression_metrics,
         "num_cases": len(cases),
     }
 
@@ -2048,7 +2233,12 @@ def train_cases_grad_accum(
         k for k in ADAPTIVE_PHASE_LOG_METRIC_KEYS
         if k in ADAPTIVE_PHASE_MIN_METRIC_KEYS
     ]
-    metric_keys = metric_keys + phase_metric_mean_keys + adaptive_metric_mean_keys
+    metric_keys = (
+        metric_keys
+        + phase_metric_mean_keys
+        + adaptive_metric_mean_keys
+        + list(NO_REGRESSION_LOG_METRIC_KEYS)
+    )
 
     # Keep logging reductions on device during the per-case backward loop.
     # Pulling every scalar to CPU after every case forces many CUDA sync points
@@ -2195,16 +2385,29 @@ def select_best_score(metrics: dict[str, Any], cfg: TransformerPhysicalTrainConf
     mode = str(cfg.best_score_mode).lower().strip()
     if mode == "response":
         key = "response_loss" if "response_loss" in metrics else "data_loss"
+        value = metrics[key]
     elif mode == "freq":
         key = "freq_loss"
+        value = metrics[key]
     elif mode == "mixed":
         key = "total_loss"
+        value = metrics[key]
+    elif mode == "guarded_freq":
+        freq_value = metrics["freq_loss"]
+        guard_value = metrics.get("no_regression_guard_loss", 0.0)
+        if torch.is_tensor(freq_value) or torch.is_tensor(guard_value):
+            if not torch.is_tensor(freq_value):
+                freq_value = torch.as_tensor(float(freq_value))
+            if not torch.is_tensor(guard_value):
+                guard_value = torch.as_tensor(float(guard_value), device=freq_value.device, dtype=freq_value.dtype)
+            value = freq_value + float(cfg.best_score_guard_weight) * guard_value
+        else:
+            value = float(freq_value) + float(cfg.best_score_guard_weight) * float(guard_value)
     else:
         raise ValueError(
             f"Unsupported best_score_mode={cfg.best_score_mode!r}. "
-            "Expected one of: response, freq, mixed."
+            "Expected one of: response, freq, mixed, guarded_freq."
         )
-    value = metrics[key]
     return float(value.detach().cpu()) if torch.is_tensor(value) else float(value)
 
 
@@ -2707,7 +2910,25 @@ def parse_args() -> tuple[
     parser.add_argument("--w-complex-amp-guard-y", type=float, default=d.w_complex_amp_guard_y)
     parser.add_argument("--w-phase-gate-align", type=float, default=d.w_phase_gate_align)
 
-    parser.add_argument("--best-score-mode", type=str, default=d.best_score_mode, choices=["response", "freq", "mixed"])
+    parser.add_argument("--use-no-regression-guard", action="store_true",
+                        default=d.use_no_regression_guard)
+    parser.add_argument("--no-no-regression-guard", dest="use_no_regression_guard",
+                        action="store_false")
+    parser.add_argument("--no-regression-guard-case-keywords", type=str,
+                        default=d.no_regression_guard_case_keywords)
+    parser.add_argument("--w-no-regression-response", type=float, default=d.w_no_regression_response)
+    parser.add_argument("--w-no-regression-lag", type=float, default=d.w_no_regression_lag)
+    parser.add_argument("--w-no-regression-amp", type=float, default=d.w_no_regression_amp)
+    parser.add_argument("--no-regression-x-ratio-limit", type=float, default=d.no_regression_x_ratio_limit)
+    parser.add_argument("--no-regression-y-ratio-limit", type=float, default=d.no_regression_y_ratio_limit)
+    parser.add_argument("--no-regression-tip-y-ratio-limit", type=float, default=d.no_regression_tip_y_ratio_limit)
+    parser.add_argument("--no-regression-last5-y-ratio-limit", type=float, default=d.no_regression_last5_y_ratio_limit)
+    parser.add_argument("--no-regression-lag-tol-seconds", type=float, default=d.no_regression_lag_tol_seconds)
+    parser.add_argument("--no-regression-amp-log-tol", type=float, default=d.no_regression_amp_log_tol)
+    parser.add_argument("--best-score-guard-weight", type=float, default=d.best_score_guard_weight)
+
+    parser.add_argument("--best-score-mode", type=str, default=d.best_score_mode,
+                        choices=["response", "freq", "mixed", "guarded_freq"])
 
     best_constraint_group = parser.add_mutually_exclusive_group()
     best_constraint_group.add_argument(
@@ -2930,6 +3151,18 @@ def parse_args() -> tuple[
         w_complex_amp_guard_x=float(args.w_complex_amp_guard_x),
         w_complex_amp_guard_y=float(args.w_complex_amp_guard_y),
         w_phase_gate_align=float(args.w_phase_gate_align),
+        use_no_regression_guard=bool(args.use_no_regression_guard),
+        no_regression_guard_case_keywords=str(args.no_regression_guard_case_keywords),
+        w_no_regression_response=float(args.w_no_regression_response),
+        w_no_regression_lag=float(args.w_no_regression_lag),
+        w_no_regression_amp=float(args.w_no_regression_amp),
+        no_regression_x_ratio_limit=float(args.no_regression_x_ratio_limit),
+        no_regression_y_ratio_limit=float(args.no_regression_y_ratio_limit),
+        no_regression_tip_y_ratio_limit=float(args.no_regression_tip_y_ratio_limit),
+        no_regression_last5_y_ratio_limit=float(args.no_regression_last5_y_ratio_limit),
+        no_regression_lag_tol_seconds=float(args.no_regression_lag_tol_seconds),
+        no_regression_amp_log_tol=float(args.no_regression_amp_log_tol),
+        best_score_guard_weight=float(args.best_score_guard_weight),
         best_score_mode=args.best_score_mode,
         early_stop_patience=args.early_stop_patience,
         early_stop_min_delta=args.early_stop_min_delta,
@@ -3009,6 +3242,19 @@ def main() -> None:
             f"top_k={cfg.phase_window_top_k}, "
             f"gate_score_ref={cfg.phase_window_gate_score_ref}, "
             f"freq=[{cfg.phase_window_freq_min}, {cfg.phase_window_freq_max}]"
+        )
+    print(f"  use_no_regression_guard = {cfg.use_no_regression_guard}")
+    if bool(cfg.use_no_regression_guard):
+        print(
+            "  no_regression_guard = "
+            f"keywords={cfg.no_regression_guard_case_keywords}, "
+            f"w_response={cfg.w_no_regression_response}, "
+            f"w_lag={cfg.w_no_regression_lag}, "
+            f"w_amp={cfg.w_no_regression_amp}, "
+            f"ratio_limits=({cfg.no_regression_x_ratio_limit}, {cfg.no_regression_y_ratio_limit}), "
+            f"lag_tol={cfg.no_regression_lag_tol_seconds}, "
+            f"amp_log_tol={cfg.no_regression_amp_log_tol}, "
+            f"best_guard_weight={cfg.best_score_guard_weight}"
         )
     print(f"  fast_core_precompute_newmark = {cfg.fast_core_precompute_newmark}")
     print(f"  linear_solve_mode = {cfg.linear_solve_mode}")
@@ -3504,6 +3750,9 @@ def main() -> None:
         for adaptive_key in ADAPTIVE_PHASE_LOG_METRIC_KEYS:
             row[f"train_{adaptive_key}"] = _metric_to_float(train_eval, adaptive_key)
             row[f"valid_{adaptive_key}"] = _metric_to_float(valid_eval_for_log, adaptive_key)
+        for guard_key in NO_REGRESSION_LOG_METRIC_KEYS:
+            row[f"train_{guard_key}"] = _metric_to_float(train_eval, guard_key)
+            row[f"valid_{guard_key}"] = _metric_to_float(valid_eval_for_log, guard_key)
 
         history.append(row)
 

@@ -201,3 +201,12 @@ python tests/compare_full_corrected_core_vs_student.py --time-series-load-file d
 |---|---|---|---|---|
 | 2026-05-09 Asia/Shanghai | `src/student/transformer/dynamic_physical_core_torch.py` | 修改 Newmark core hot path | 缓存固定的 Newmark 常数 `a0~a5`，新增 `newmark_step_fast(...)`，要求调用方已完成 device/dtype 转换，从而跳过每步重复 `torch.as_tensor`、shape 检查和 registry 拆分；线性求解仍使用原 `linear_solve_mode`，默认训练命令仍使用 `solve`。 | 训练速度优化 |
 | 2026-05-09 Asia/Shanghai | `src/student/transformer/transformer_rollout_torch.py` | 修改 rollout 调用路径 | static rollout 中将整条 `theta_seq` 一次性转换到 core dtype/device，然后逐步调用 `physical_core.newmark_step_fast(...)`；不改变 `theta=[alpha_x_total, alpha_xy_total]` 接口、不改变 Newmark 方程、不改变 `core_dtype=float64` 要求。 | 训练速度优化 |
+
+---
+
+## 14. 2026-05-09 response no-regression guard 更新
+
+| 修改时间 | 涉及脚本/文件 | 需增改说明 | 修改内容 | 所属阶段 |
+|---|---|---|---|---|
+| 2026-05-09 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 新增响应层 no-regression guard | 新增 `--use-no-regression-guard` 及 `--no-regression-*` 配置，仅对匹配关键词的 low/simple case 生效；guard 直接约束响应 ratio、局部 lag 和 RMS 幅值偏差，不约束 `g_phase` 本身，允许 fast branch 自由使用但不能恶化受保护工况。 | 高频/复杂相位强化与低频/simple 防退化 |
+| 2026-05-09 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 修改 best checkpoint 选择 | `--best-score-mode` 新增 `guarded_freq`，使用 `freq_loss + best_score_guard_weight * no_regression_guard_loss` 选择 best checkpoint，避免只看频域目标时保存到 low/simple 有副作用的模型。 | 高频/复杂相位强化与低频/simple 防退化 |

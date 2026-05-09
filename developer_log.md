@@ -852,3 +852,10 @@ alpha_y(t) + response/load + static conditioning 在 240-step 训练中有效。
 |---|---|---|---|---|
 | 2026-05-09 Asia/Shanghai | `src/student/transformer/dynamic_physical_core_torch.py` | 优化 | 缓存固定 Newmark 常数，新增 `newmark_step_fast(...)` 作为 rollout hot path；该路径要求输入已在 core device/dtype 上，避免每个时间步重复张量包装、shape 检查和 registry 拆分，仍保留原 `newmark_step(...)` 兼容路径。 | 训练速度优化 |
 | 2026-05-09 Asia/Shanghai | `src/student/transformer/transformer_rollout_torch.py` | 优化 | static rollout 中一次性将 `theta_seq` 转为 core dtype/device，并调用 `physical_core.newmark_step_fast(...)`；未改变 dynamic core 外部物理接口、Newmark 方程、`linear_solve_mode` 或 `core_dtype=float64` 约定。 | 训练速度优化 |
+
+# 开发者日志
+
+| 修改时间 | 涉及脚本/文件 | 增改类型 | 修改内容 | 所属阶段 |
+|---|---|---|---|---|
+| 2026-05-09 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 新增 | 新增 response-level no-regression guard：`--use-no-regression-guard`、`--no-regression-guard-case-keywords`、`--w-no-regression-response/lag/amp`、ratio/lag/amp 容忍参数；guard 只按 case 名称匹配 low/simple 等受保护工况，并直接惩罚响应退化、局部 lag 超限和幅值偏差。 | 高频/复杂相位强化与低频/simple 防退化 |
+| 2026-05-09 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 修改 | 训练/验证日志新增 `no_regression_*` 指标；`--best-score-mode` 新增 `guarded_freq`，用 `freq_loss + best_score_guard_weight * no_regression_guard_loss` 选择 best checkpoint。 | 高频/复杂相位强化与低频/simple 防退化 |
