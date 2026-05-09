@@ -210,3 +210,12 @@ python tests/compare_full_corrected_core_vs_student.py --time-series-load-file d
 |---|---|---|---|---|
 | 2026-05-09 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 新增响应层 no-regression guard | 新增 `--use-no-regression-guard` 及 `--no-regression-*` 配置，仅对匹配关键词的 low/simple case 生效；guard 直接约束响应 ratio、局部 lag 和 RMS 幅值偏差，不约束 `g_phase` 本身，允许 fast branch 自由使用但不能恶化受保护工况。 | 高频/复杂相位强化与低频/simple 防退化 |
 | 2026-05-09 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 修改 best checkpoint 选择 | `--best-score-mode` 新增 `guarded_freq`，使用 `freq_loss + best_score_guard_weight * no_regression_guard_loss` 选择 best checkpoint，避免只看频域目标时保存到 low/simple 有副作用的模型。 | 高频/复杂相位强化与低频/simple 防退化 |
+
+---
+
+## 15. 2026-05-09 训练分段计时诊断更新
+
+| 修改时间 | 涉及脚本/文件 | 需增改说明 | 修改内容 | 所属阶段 |
+|---|---|---|---|---|
+| 2026-05-09 Asia/Shanghai | `src/student/transformer/transformer_rollout_torch.py` | 新增 rollout 内部耗时 metadata | `TransformerRolloutConfig` 新增 `profile_timing` 与 `profile_timing_sync_cuda`；开启后在 `TransformerRolloutOutput.metadata` 中写入 `encoder_seconds`、`core_prepare_seconds`、`newmark_loop_seconds`、`state_stack_seconds`，用于判断 encoder、Newmark 积分和状态堆叠的相对耗时。 | 训练速度诊断 |
+| 2026-05-09 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 新增训练计时 CLI 与 history 列 | 新增 `--profile-train-timing` 和 `--profile-timing-sync-cuda`；`training_history.csv` 新增 `train_/valid_timing_*` 列，覆盖 total、model forward、encoder、core prepare、Newmark loop、loss、backward、metric accumulation、grad clip、optimizer step。默认不启用，不影响既有训练结果。 | 训练速度诊断 |

@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import subprocess
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -418,6 +419,8 @@ class TransformerPhysicalTrainConfig:
     cache_npz_in_ram: bool = False
     allow_tf32_encoder: bool = False
     matmul_precision: str = "high"
+    profile_train_timing: bool = False
+    profile_timing_sync_cuda: bool = False
 
     # response-domain loss 权重。
     # alpha_x 第一阶段以 x/y 相位与频率对齐为主，response MSE 只作为弱约束。
@@ -1296,6 +1299,20 @@ NO_REGRESSION_LOG_METRIC_KEYS = [
     "no_regression_y_amp_log_excess",
 ]
 
+TIMING_LOG_METRIC_KEYS = [
+    "timing_total_seconds",
+    "timing_model_forward_seconds",
+    "timing_encoder_seconds",
+    "timing_core_prepare_seconds",
+    "timing_newmark_loop_seconds",
+    "timing_state_stack_seconds",
+    "timing_loss_seconds",
+    "timing_backward_seconds",
+    "timing_metric_accum_seconds",
+    "timing_grad_clip_seconds",
+    "timing_optimizer_step_seconds",
+]
+
 
 def _metric_to_float(metrics: dict[str, Any], key: str) -> float:
     value = metrics.get(key)
@@ -1304,6 +1321,21 @@ def _metric_to_float(metrics: dict[str, Any], key: str) -> float:
     if torch.is_tensor(value):
         return float(value.detach().cpu())
     return float(value)
+
+
+def _sync_for_timing(cfg: TransformerPhysicalTrainConfig, device: torch.device | None = None) -> None:
+    if not bool(getattr(cfg, "profile_timing_sync_cuda", False)):
+        return
+    if not torch.cuda.is_available():
+        return
+    if device is not None and device.type != "cuda":
+        return
+    torch.cuda.synchronize(device)
+
+
+def _time_now(cfg: TransformerPhysicalTrainConfig, device: torch.device | None = None) -> float:
+    _sync_for_timing(cfg, device)
+    return time.perf_counter()
 
 
 def phase_gated_decomposition_regularization_loss(
@@ -1810,7 +1842,7 @@ def compute_response_loss(
 
     total_loss = response_loss + freq_loss + reg_loss + no_regression["no_regression_guard_loss"]
 
-    return {
+    result = {
         "total_loss": total_loss,
         "response_loss": response_loss,
         "data_loss": response_loss,
@@ -1918,10 +1950,14 @@ def evaluate_cases(
             **{k: zero for k in PHASE_GATED_LOG_METRIC_KEYS},
             **{k: zero for k in ADAPTIVE_PHASE_LOG_METRIC_KEYS},
             **{k: zero for k in NO_REGRESSION_LOG_METRIC_KEYS},
+            **{k: 0.0 for k in TIMING_LOG_METRIC_KEYS},
             "num_cases": 0,
         }
 
     context = torch.enable_grad() if require_grad else torch.inference_mode()
+    profile_timing = bool(getattr(cfg, "profile_train_timing", False))
+    timing_sums: dict[str, float] = {k: 0.0 for k in TIMING_LOG_METRIC_KEYS}
+    total_t0 = _time_now(cfg, next(model.parameters()).device) if profile_timing else 0.0
 
     with context:
         losses = []
@@ -1980,6 +2016,7 @@ def evaluate_cases(
             v0 = case.v_static[:1, :].to(dtype=torch.float32)
             a0 = case.a_static[:1, :].to(dtype=torch.float32)
 
+            t0 = _time_now(cfg, next(model.parameters()).device) if profile_timing else 0.0
             out = model(
                 u_static=u_static,
                 v_static=v_static,
@@ -1991,7 +2028,17 @@ def evaluate_cases(
                 v0=v0,
                 a0=a0,
             )
+            if profile_timing:
+                timing_sums["timing_model_forward_seconds"] += _time_now(cfg, next(model.parameters()).device) - t0
+                for src_key, dst_key in (
+                    ("encoder_seconds", "timing_encoder_seconds"),
+                    ("core_prepare_seconds", "timing_core_prepare_seconds"),
+                    ("newmark_loop_seconds", "timing_newmark_loop_seconds"),
+                    ("state_stack_seconds", "timing_state_stack_seconds"),
+                ):
+                    timing_sums[dst_key] += float(out.metadata.get(src_key, 0.0))
 
+            t0 = _time_now(cfg, next(model.parameters()).device) if profile_timing else 0.0
             loss_dict = compute_response_loss(
                 u_pred=out.u_pred,
                 case=case,
@@ -2004,7 +2051,10 @@ def evaluate_cases(
                 theta_aux=out.theta_aux,
                 case_name=case.name,
             )
+            if profile_timing:
+                timing_sums["timing_loss_seconds"] += _time_now(cfg, next(model.parameters()).device) - t0
 
+            t0 = _time_now(cfg, next(model.parameters()).device) if profile_timing else 0.0
             losses.append(loss_dict["total_loss"])
             data_losses.append(loss_dict["data_loss"])
             response_losses.append(loss_dict["response_loss"])
@@ -2045,6 +2095,8 @@ def evaluate_cases(
                 adaptive_metric_values[k].append(loss_dict[k])
             for k in NO_REGRESSION_LOG_METRIC_KEYS:
                 no_regression_metric_values[k].append(loss_dict[k])
+            if profile_timing:
+                timing_sums["timing_metric_accum_seconds"] += _time_now(cfg, next(model.parameters()).device) - t0
 
         total_loss = torch.stack(losses).mean()
         data_loss = torch.stack(data_losses).mean()
@@ -2101,7 +2153,7 @@ def evaluate_cases(
             for k, values in no_regression_metric_values.items()
         }
 
-    return {
+    result = {
         "total_loss": total_loss,
         "data_loss": data_loss,
         "response_loss": response_loss,
@@ -2139,8 +2191,12 @@ def evaluate_cases(
         **phase_metrics,
         **adaptive_metrics,
         **no_regression_metrics,
+        **timing_sums,
         "num_cases": len(cases),
     }
+    if profile_timing:
+        result["timing_total_seconds"] = _time_now(cfg, next(model.parameters()).device) - total_t0
+    return result
 
 
 def train_cases_grad_accum(
@@ -2176,6 +2232,10 @@ def train_cases_grad_accum(
     optimizer.zero_grad(set_to_none=True)
 
     n_cases = len(cases)
+    profile_timing = bool(getattr(cfg, "profile_train_timing", False))
+    timing_device = next(model.parameters()).device
+    timing_sums: dict[str, float] = {k: 0.0 for k in TIMING_LOG_METRIC_KEYS}
+    total_t0 = _time_now(cfg, timing_device) if profile_timing else 0.0
 
     metric_keys = [
         "total_loss",
@@ -2260,6 +2320,7 @@ def train_cases_grad_accum(
         v0 = case.v_static[:1, :].to(dtype=torch.float32)
         a0 = case.a_static[:1, :].to(dtype=torch.float32)
 
+        t0 = _time_now(cfg, timing_device) if profile_timing else 0.0
         out = model(
             u_static=u_static,
             v_static=v_static,
@@ -2271,7 +2332,17 @@ def train_cases_grad_accum(
             v0=v0,
             a0=a0,
         )
+        if profile_timing:
+            timing_sums["timing_model_forward_seconds"] += _time_now(cfg, timing_device) - t0
+            for src_key, dst_key in (
+                ("encoder_seconds", "timing_encoder_seconds"),
+                ("core_prepare_seconds", "timing_core_prepare_seconds"),
+                ("newmark_loop_seconds", "timing_newmark_loop_seconds"),
+                ("state_stack_seconds", "timing_state_stack_seconds"),
+            ):
+                timing_sums[dst_key] += float(out.metadata.get(src_key, 0.0))
 
+        t0 = _time_now(cfg, timing_device) if profile_timing else 0.0
         loss_dict = compute_response_loss(
             u_pred=out.u_pred,
             case=case,
@@ -2286,9 +2357,16 @@ def train_cases_grad_accum(
         )
 
         # 关键：除以 n_cases，保证等价于 mean loss 再 backward。
-        scaled_loss = loss_dict["total_loss"] / float(n_cases)
-        scaled_loss.backward()
+        if profile_timing:
+            timing_sums["timing_loss_seconds"] += _time_now(cfg, timing_device) - t0
 
+        scaled_loss = loss_dict["total_loss"] / float(n_cases)
+        t0 = _time_now(cfg, timing_device) if profile_timing else 0.0
+        scaled_loss.backward()
+        if profile_timing:
+            timing_sums["timing_backward_seconds"] += _time_now(cfg, timing_device) - t0
+
+        t0 = _time_now(cfg, timing_device) if profile_timing else 0.0
         for k in metric_keys:
             value = loss_dict[k].detach().to(dtype=torch.float64)
             if metric_sums[k] is None:
@@ -2325,16 +2403,25 @@ def train_cases_grad_accum(
         )
 
         # 显式删除大对象，帮助 CUDA 更早释放计算图引用。
+        if profile_timing:
+            timing_sums["timing_metric_accum_seconds"] += _time_now(cfg, timing_device) - t0
+
         del out
         del loss_dict
         del scaled_loss
 
+    t0 = _time_now(cfg, timing_device) if profile_timing else 0.0
     grad_norm = torch.nn.utils.clip_grad_norm_(
         model.encoder.parameters(),
         max_norm=float(cfg.grad_clip_norm),
     )
+    if profile_timing:
+        timing_sums["timing_grad_clip_seconds"] = _time_now(cfg, timing_device) - t0
 
+    t0 = _time_now(cfg, timing_device) if profile_timing else 0.0
     optimizer.step()
+    if profile_timing:
+        timing_sums["timing_optimizer_step_seconds"] = _time_now(cfg, timing_device) - t0
 
     dtype_out = torch.float64
     result: dict[str, Any] = {}
@@ -2376,6 +2463,10 @@ def train_cases_grad_accum(
         if torch.is_tensor(grad_norm)
         else float(grad_norm)
     )
+    for k, value in timing_sums.items():
+        result[k] = float(value)
+    if profile_timing:
+        result["timing_total_seconds"] = _time_now(cfg, timing_device) - total_t0
 
     return result
 
@@ -2641,6 +2732,8 @@ def build_training_model(
             core_dtype=dtype_core,
             detach_static_conditioning=False,
             detach_rollout_state_each_step=False,
+            profile_timing=bool(cfg.profile_train_timing),
+            profile_timing_sync_cuda=bool(cfg.profile_timing_sync_cuda),
         ),
     ).to(device)
 
@@ -2993,6 +3086,22 @@ def parse_args() -> tuple[
         choices=["highest", "high", "medium"],
         help="torch.set_float32_matmul_precision setting for float32 matmul kernels.",
     )
+    parser.add_argument(
+        "--profile-train-timing",
+        action="store_true",
+        help=(
+            "Record per-epoch timing diagnostics in training_history.csv for model forward, "
+            "encoder, Newmark loop, loss, backward, grad clip, and optimizer step."
+        ),
+    )
+    parser.add_argument(
+        "--profile-timing-sync-cuda",
+        action="store_true",
+        help=(
+            "Synchronize CUDA before timing reads for more precise profiling. "
+            "This slows training and should be used only for short diagnostic runs."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -3007,6 +3116,10 @@ def parse_args() -> tuple[
 
     if args.cache_npz_in_ram:
         print("[Fast NPZ Cache] enabled: training/validation .npz files will be cached in RAM.")
+    if args.profile_train_timing:
+        print("[Timing Profile]")
+        print("  enabled = True")
+        print(f"  sync_cuda = {bool(args.profile_timing_sync_cuda)}")
 
     cfg = TransformerPhysicalTrainConfig(
         teacher_exe=args.teacher_exe,
@@ -3087,6 +3200,8 @@ def parse_args() -> tuple[
         cache_npz_in_ram=bool(args.cache_npz_in_ram),
         allow_tf32_encoder=bool(args.allow_tf32_encoder),
         matmul_precision=str(args.matmul_precision),
+        profile_train_timing=bool(args.profile_train_timing),
+        profile_timing_sync_cuda=bool(args.profile_timing_sync_cuda),
         w_y=args.w_y,
         w_x=args.w_x,
         w_x_guard=args.w_x_guard,
@@ -3753,6 +3868,9 @@ def main() -> None:
         for guard_key in NO_REGRESSION_LOG_METRIC_KEYS:
             row[f"train_{guard_key}"] = _metric_to_float(train_eval, guard_key)
             row[f"valid_{guard_key}"] = _metric_to_float(valid_eval_for_log, guard_key)
+        for timing_key in TIMING_LOG_METRIC_KEYS:
+            row[f"train_{timing_key}"] = _metric_to_float(train_eval, timing_key)
+            row[f"valid_{timing_key}"] = _metric_to_float(valid_eval_for_log, timing_key)
 
         history.append(row)
 
@@ -3768,6 +3886,17 @@ def main() -> None:
                 f"theta_max={row['train_theta_abs_max']:.4e} "
                 f"lr={current_lr:.3e}"
             )
+            if bool(cfg.profile_train_timing):
+                print(
+                    "          "
+                    f"timing_train_total={row['train_timing_total_seconds']:.2f}s "
+                    f"forward={row['train_timing_model_forward_seconds']:.2f}s "
+                    f"encoder={row['train_timing_encoder_seconds']:.2f}s "
+                    f"newmark={row['train_timing_newmark_loop_seconds']:.2f}s "
+                    f"loss={row['train_timing_loss_seconds']:.2f}s "
+                    f"backward={row['train_timing_backward_seconds']:.2f}s "
+                    f"valid_total={row['valid_timing_total_seconds']:.2f}s"
+                )
 
         if int(cfg.save_every) > 0 and epoch % int(cfg.save_every) == 0:
             torch.save(

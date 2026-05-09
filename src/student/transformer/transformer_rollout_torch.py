@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -43,6 +44,8 @@ class TransformerRolloutConfig:
 
     # 当前测试阶段先不做 truncated BPTT。
     detach_rollout_state_each_step: bool = False
+    profile_timing: bool = False
+    profile_timing_sync_cuda: bool = False
 
 
 @dataclass
@@ -102,6 +105,18 @@ class TransformerPhysicalRolloutTorch(nn.Module):
             raise ValueError(
                 f"Unsupported conditioning_mode={self.config.conditioning_mode!r}."
             )
+
+    @staticmethod
+    def _sync_for_timing(enabled: bool, device: torch.device | None = None) -> None:
+        if not enabled or not torch.cuda.is_available():
+            return
+        if device is not None and device.type != "cuda":
+            return
+        torch.cuda.synchronize(device)
+
+    def _time_now(self, device: torch.device | None = None) -> float:
+        self._sync_for_timing(bool(self.config.profile_timing_sync_cuda), device)
+        return time.perf_counter()
 
     @staticmethod
     def _check_btd_tensor(
@@ -274,6 +289,11 @@ class TransformerPhysicalRolloutTorch(nn.Module):
                     f"got {tuple(load_spectral_features.shape[:2])}."
                 )
 
+        profile_timing = bool(self.config.profile_timing)
+        timing: dict[str, float] = {}
+
+        encoder_device = next(self.encoder.parameters()).device
+        t0 = self._time_now(encoder_device) if profile_timing else 0.0
         encoder_out = self._encode_static_conditioning(
             u_static=u_static,
             v_static=v_static,
@@ -282,6 +302,8 @@ class TransformerPhysicalRolloutTorch(nn.Module):
             geometry_features=geometry_features,
             load_spectral_features=load_spectral_features,
         )
+        if profile_timing:
+            timing["encoder_seconds"] = self._time_now(encoder_device) - t0
 
         theta_seq = encoder_out.theta
 
@@ -293,6 +315,7 @@ class TransformerPhysicalRolloutTorch(nn.Module):
         core_dtype = self.config.core_dtype
         core_device = self.physical_core.K0.device
 
+        t0 = self._time_now(core_device) if profile_timing else 0.0
         F_core = F.to(device=core_device, dtype=core_dtype)
         theta_core = theta_seq.to(device=core_device, dtype=core_dtype)
 
@@ -304,11 +327,14 @@ class TransformerPhysicalRolloutTorch(nn.Module):
             v0=v0,
             a0=a0,
         )
+        if profile_timing:
+            timing["core_prepare_seconds"] = self._time_now(core_device) - t0
 
         u_list = [u_t]
         v_list = [v_t]
         a_list = [a_t]
 
+        t0 = self._time_now(core_device) if profile_timing else 0.0
         for t in range(T - 1):
             theta_t = theta_core[:, t, :]
 
@@ -330,10 +356,15 @@ class TransformerPhysicalRolloutTorch(nn.Module):
             a_list.append(a_next)
 
             u_t, v_t, a_t = u_next, v_next, a_next
+        if profile_timing:
+            timing["newmark_loop_seconds"] = self._time_now(core_device) - t0
 
+        t0 = self._time_now(core_device) if profile_timing else 0.0
         u_pred = torch.stack(u_list, dim=1)
         v_pred = torch.stack(v_list, dim=1)
         a_pred = torch.stack(a_list, dim=1)
+        if profile_timing:
+            timing["state_stack_seconds"] = self._time_now(core_device) - t0
 
         return TransformerRolloutOutput(
             u_pred=u_pred,
@@ -351,6 +382,7 @@ class TransformerPhysicalRolloutTorch(nn.Module):
                 "D": D,
                 "theta_dim": int(theta_seq.shape[-1]),
                 "theta_usage": "theta[:,t,:] is used for Newmark step t -> t+1",
+                **timing,
             },
         )
 

@@ -859,3 +859,10 @@ alpha_y(t) + response/load + static conditioning 在 240-step 训练中有效。
 |---|---|---|---|---|
 | 2026-05-09 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 新增 | 新增 response-level no-regression guard：`--use-no-regression-guard`、`--no-regression-guard-case-keywords`、`--w-no-regression-response/lag/amp`、ratio/lag/amp 容忍参数；guard 只按 case 名称匹配 low/simple 等受保护工况，并直接惩罚响应退化、局部 lag 超限和幅值偏差。 | 高频/复杂相位强化与低频/simple 防退化 |
 | 2026-05-09 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 修改 | 训练/验证日志新增 `no_regression_*` 指标；`--best-score-mode` 新增 `guarded_freq`，用 `freq_loss + best_score_guard_weight * no_regression_guard_loss` 选择 best checkpoint。 | 高频/复杂相位强化与低频/simple 防退化 |
+
+# 开发者日志
+
+| 修改时间 | 涉及脚本/文件 | 增改类型 | 修改内容 | 所属阶段 |
+|---|---|---|---|---|
+| 2026-05-09 Asia/Shanghai | `src/student/transformer/transformer_rollout_torch.py` | 新增 | `TransformerRolloutConfig` 新增 `profile_timing` 与 `profile_timing_sync_cuda`；static rollout 在 metadata 中记录 encoder、core prepare、Newmark loop、state stack 的耗时，用于定位训练瓶颈，不改变物理接口和数值路径。 | 训练速度诊断 |
+| 2026-05-09 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 新增 | 新增 `--profile-train-timing` 与 `--profile-timing-sync-cuda`；训练/验证阶段聚合 total、model forward、encoder、core prepare、Newmark loop、loss、backward、metric accumulation、grad clip、optimizer step 等耗时，并写入 `training_history.csv`。 | 训练速度诊断 |
