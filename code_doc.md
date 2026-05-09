@@ -183,3 +183,12 @@ python tests/compare_full_corrected_core_vs_student.py --time-series-load-file d
 |---|---|---|---|---|
 | 2026-05-09 Asia/Shanghai | `src/student/transformer/frequency_losses.py` | 修改 adaptive gate alignment 说明 | `adaptive_phase_window_loss(...)` 新增 `gate_target_score_ref`，将局部相位漂移 score 按可配置参考值映射到 `g_phase` 目标，避免 gate target 被压缩到过低导致 fast branch 难以局部打开。 | phase-gated fast residual 自主相位修正训练 |
 | 2026-05-09 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 修改训练入口与打印说明 | 新增命令行参数 `--phase-window-gate-score-ref`，并在 adaptive phase-window loss 调用和启动配置打印中使用；默认值为 `0.12`，用于增强 hard window 对 phase gate 的监督强度。 | phase-gated fast residual 自主相位修正训练 |
+
+---
+
+## 12. 2026-05-09 phase gate 诊断阈值与训练日志加速更新
+
+| 修改时间 | 涉及脚本/文件 | 需增改说明 | 修改内容 | 所属阶段 |
+|---|---|---|---|---|
+| 2026-05-09 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 修改 phase gate 诊断配置 | 新增 `--phase-gate-active-threshold`，用于控制 `phase_gate_active_ratio` 的统计阈值；默认仍为 `0.2` 以兼容旧日志，新一轮可显式设为 `0.10` 观察 gate 是否已在 high/complex 工况局部抬升。 | phase-gated fast residual 自主相位修正诊断 |
+| 2026-05-09 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 修改训练日志统计实现 | `train_cases_grad_accum(...)` 将 per-case 日志指标的累加、max/min 统计保留在当前 torch device 上，epoch 汇总时再转出，减少每个 case 后大量 `.cpu()` 标量同步；不改变 forward/backward、loss 权重、优化器 step 或 Newmark/core 数值路径。 | 训练速度优化 |

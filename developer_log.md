@@ -838,3 +838,10 @@ alpha_y(t) + response/load + static conditioning 在 240-step 训练中有效。
 |---|---|---|---|---|
 | 2026-05-09 Asia/Shanghai | `src/student/transformer/frequency_losses.py` | 修改 | `adaptive_phase_window_loss(...)` 新增 `gate_target_score_ref`，用可配置参考 score 缩放 gate alignment target，使 hard phase-drift windows 能给 `g_phase` 更明确的局部开启目标。 | phase-gated fast residual 自主相位修正训练 |
 | 2026-05-09 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 修改 | 新增 `--phase-window-gate-score-ref` 配置，训练时传入 adaptive phase-window loss，并在启动信息中打印该值；默认 `0.12`。 | phase-gated fast residual 自主相位修正训练 |
+
+# 开发者日志
+
+| 修改时间 | 涉及脚本/文件 | 增改类型 | 修改内容 | 所属阶段 |
+|---|---|---|---|---|
+| 2026-05-09 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 修改 | 新增 `--phase-gate-active-threshold`，使 `phase_gate_active_ratio` 的统计阈值可由命令行配置；默认保持 `0.2`，下一轮 gate-open 训练建议设为 `0.10`。 | phase-gated fast residual 自主相位修正诊断 |
+| 2026-05-09 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 优化 | 优化 `train_cases_grad_accum(...)` 日志指标累加方式：per-case backward 后不再立即对每个标量执行 CPU 同步，而是在 torch device 上完成 sum/max/min，epoch 汇总时再同步，减少训练日志统计开销且不改变训练目标和梯度路径。 | 训练速度优化 |

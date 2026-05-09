@@ -498,6 +498,7 @@ class TransformerPhysicalTrainConfig:
     w_phase_gate_l1: float = 1.0e-3
     w_phase_gate_tv: float = 1.0e-3
     w_phase_gate_simple_l1: float = 5.0e-3
+    phase_gate_active_threshold: float = 0.2
 
     # best checkpoint selection: response / freq / mixed
     best_score_mode: str = "freq"
@@ -1342,7 +1343,9 @@ def phase_gated_decomposition_regularization_loss(
         "phase_gate_simple_l1": simple_gate_l1,
         "phase_gate_mean": torch.mean(g_phase),
         "phase_gate_max": torch.max(g_phase),
-        "phase_gate_active_ratio": torch.mean((g_phase > 0.2).to(dtype=dtype)),
+        "phase_gate_active_ratio": torch.mean(
+            (g_phase > float(cfg.phase_gate_active_threshold)).to(dtype=dtype)
+        ),
         "theta_fast_abs_max": torch.max(torch.abs(theta_fast)),
         "theta_gated_fast_rms": torch.sqrt(torch.mean(theta_gated_fast ** 2)),
         "theta_gated_fast_abs_max": torch.max(torch.abs(theta_gated_fast)),
@@ -2047,11 +2050,14 @@ def train_cases_grad_accum(
     ]
     metric_keys = metric_keys + phase_metric_mean_keys + adaptive_metric_mean_keys
 
-    metric_sums: dict[str, float] = {k: 0.0 for k in metric_keys}
-    phase_metric_max_values: dict[str, float] = {k: 0.0 for k in phase_metric_max_keys}
-    adaptive_metric_max_values: dict[str, float] = {k: 0.0 for k in adaptive_metric_max_keys}
-    adaptive_metric_min_values: dict[str, float] = {k: float("inf") for k in adaptive_metric_min_keys}
-    theta_abs_max_value = 0.0
+    # Keep logging reductions on device during the per-case backward loop.
+    # Pulling every scalar to CPU after every case forces many CUDA sync points
+    # and can dominate small/medium training runs without changing gradients.
+    metric_sums: dict[str, Optional[torch.Tensor]] = {k: None for k in metric_keys}
+    phase_metric_max_values: dict[str, Optional[torch.Tensor]] = {k: None for k in phase_metric_max_keys}
+    adaptive_metric_max_values: dict[str, Optional[torch.Tensor]] = {k: None for k in adaptive_metric_max_keys}
+    adaptive_metric_min_values: dict[str, Optional[torch.Tensor]] = {k: None for k in adaptive_metric_min_keys}
+    theta_abs_max_value: Optional[torch.Tensor] = None
 
     for case in cases:
         u_static = case.u_static.unsqueeze(0)
@@ -2094,26 +2100,38 @@ def train_cases_grad_accum(
         scaled_loss.backward()
 
         for k in metric_keys:
-            metric_sums[k] += float(loss_dict[k].detach().cpu())
+            value = loss_dict[k].detach().to(dtype=torch.float64)
+            if metric_sums[k] is None:
+                metric_sums[k] = value.clone()
+            else:
+                metric_sums[k] = metric_sums[k] + value
         for k in phase_metric_max_keys:
-            phase_metric_max_values[k] = max(
-                phase_metric_max_values[k],
-                float(loss_dict[k].detach().cpu()),
+            value = loss_dict[k].detach().to(dtype=torch.float64)
+            phase_metric_max_values[k] = (
+                value.clone()
+                if phase_metric_max_values[k] is None
+                else torch.maximum(phase_metric_max_values[k], value)
             )
         for k in adaptive_metric_max_keys:
-            adaptive_metric_max_values[k] = max(
-                adaptive_metric_max_values[k],
-                float(loss_dict[k].detach().cpu()),
+            value = loss_dict[k].detach().to(dtype=torch.float64)
+            adaptive_metric_max_values[k] = (
+                value.clone()
+                if adaptive_metric_max_values[k] is None
+                else torch.maximum(adaptive_metric_max_values[k], value)
             )
         for k in adaptive_metric_min_keys:
-            adaptive_metric_min_values[k] = min(
-                adaptive_metric_min_values[k],
-                float(loss_dict[k].detach().cpu()),
+            value = loss_dict[k].detach().to(dtype=torch.float64)
+            adaptive_metric_min_values[k] = (
+                value.clone()
+                if adaptive_metric_min_values[k] is None
+                else torch.minimum(adaptive_metric_min_values[k], value)
             )
 
-        theta_abs_max_value = max(
-            theta_abs_max_value,
-            float(torch.max(torch.abs(out.theta.detach())).cpu()),
+        current_theta_abs_max = torch.max(torch.abs(out.theta.detach())).to(dtype=torch.float64)
+        theta_abs_max_value = (
+            current_theta_abs_max.clone()
+            if theta_abs_max_value is None
+            else torch.maximum(theta_abs_max_value, current_theta_abs_max)
         )
 
         # 显式删除大对象，帮助 CUDA 更早释放计算图引用。
@@ -2132,17 +2150,36 @@ def train_cases_grad_accum(
     result: dict[str, Any] = {}
 
     for k in metric_keys:
-        result[k] = torch.as_tensor(metric_sums[k] / float(n_cases), dtype=dtype_out)
+        value = metric_sums[k]
+        result[k] = (
+            torch.as_tensor(float("nan"), dtype=dtype_out)
+            if value is None
+            else (value / float(n_cases)).to(dtype=dtype_out)
+        )
     for k, value in phase_metric_max_values.items():
-        result[k] = torch.as_tensor(value, dtype=dtype_out)
+        result[k] = (
+            torch.as_tensor(float("nan"), dtype=dtype_out)
+            if value is None
+            else value.to(dtype=dtype_out)
+        )
     for k, value in adaptive_metric_max_values.items():
-        result[k] = torch.as_tensor(value, dtype=dtype_out)
+        result[k] = (
+            torch.as_tensor(float("nan"), dtype=dtype_out)
+            if value is None
+            else value.to(dtype=dtype_out)
+        )
     for k, value in adaptive_metric_min_values.items():
-        if not np.isfinite(value):
-            value = float("nan")
-        result[k] = torch.as_tensor(value, dtype=dtype_out)
+        result[k] = (
+            torch.as_tensor(float("nan"), dtype=dtype_out)
+            if value is None
+            else value.to(dtype=dtype_out)
+        )
 
-    result["theta_abs_max"] = torch.as_tensor(theta_abs_max_value, dtype=dtype_out)
+    result["theta_abs_max"] = (
+        torch.as_tensor(float("nan"), dtype=dtype_out)
+        if theta_abs_max_value is None
+        else theta_abs_max_value.to(dtype=dtype_out)
+    )
     result["num_cases"] = n_cases
     result["grad_norm"] = (
         float(grad_norm.detach().cpu())
@@ -2610,6 +2647,7 @@ def parse_args() -> tuple[
     parser.add_argument("--w-phase-gate-l1", type=float, default=d.w_phase_gate_l1)
     parser.add_argument("--w-phase-gate-tv", type=float, default=d.w_phase_gate_tv)
     parser.add_argument("--w-phase-gate-simple-l1", type=float, default=d.w_phase_gate_simple_l1)
+    parser.add_argument("--phase-gate-active-threshold", type=float, default=d.phase_gate_active_threshold)
     parser.add_argument("--w-tip-y", type=float, default=d.w_tip_y)
     parser.add_argument("--w-last5-y", type=float, default=d.w_last5_y)
 
@@ -2842,6 +2880,7 @@ def parse_args() -> tuple[
         w_phase_gate_l1=args.w_phase_gate_l1,
         w_phase_gate_tv=args.w_phase_gate_tv,
         w_phase_gate_simple_l1=args.w_phase_gate_simple_l1,
+        phase_gate_active_threshold=float(args.phase_gate_active_threshold),
         w_tip_y=args.w_tip_y,
         w_last5_y=args.w_last5_y,
         w_spec_x=args.w_spec_x,
@@ -2950,6 +2989,8 @@ def main() -> None:
     print("=" * 100)
     print(f"  enabled_params = {cfg.enabled_params}")
     print(f"  use_phase_gated_decomposition = {getattr(cfg, 'use_phase_gated_decomposition', False)}")
+    if bool(getattr(cfg, "use_phase_gated_decomposition", False)):
+        print(f"  phase_gate_active_threshold = {cfg.phase_gate_active_threshold}")
     print(f"  best_score_mode = {cfg.best_score_mode}")
     print(
         f"  branches: response={cfg.use_response_branch}, load={cfg.use_load_branch}, geometry={cfg.use_geometry_branch}")
