@@ -65,6 +65,9 @@ class DynamicPhysicalCoreTorch(nn.Module):
         self.config = config if config is not None else DynamicPhysicalCoreConfig()
         self.registry = registry
         self.dtype = self.config.dtype
+        self._newmark_constants_cache = self._compute_newmark_constants()
+        self._dt = float(self.config.dt)
+        self._gamma = float(self.config.gamma)
 
         M0_t = self._as_matrix_tensor(M0, "M0")
         K0_t = self._as_matrix_tensor(K0, "K0")
@@ -103,6 +106,13 @@ class DynamicPhysicalCoreTorch(nn.Module):
                 )
             self.register_buffer(template_name, tpl)
             self.enabled_template_names[param_name] = template_name
+
+        self.enabled_param_names = tuple(self.registry.names)
+        self.enabled_template_buffer_names = tuple(
+            self.enabled_template_names[name]
+            for name in self.enabled_param_names
+        )
+        self._fast_scalar_theta = int(self.registry.total_dim) == len(self.enabled_template_buffer_names)
 
         if bool(self.config.precompute_newmark_matrices):
             self.register_buffer(
@@ -170,12 +180,8 @@ class DynamicPhysicalCoreTorch(nn.Module):
 
         return K_eff, dK_dict
 
-    def _newmark_constants(self) -> tuple[float, float, float, float, float, float]:
-        """Return Newmark constants for the current fixed dt/gamma/beta.
-
-        These constants do not depend on theta or on the current state, so the
-        dynamic step can reuse them without changing the numerical scheme.
-        """
+    def _compute_newmark_constants(self) -> tuple[float, float, float, float, float, float]:
+        """Compute Newmark constants for the current fixed dt/gamma/beta."""
         dt = float(self.config.dt)
         gamma = float(self.config.gamma)
         beta = float(self.config.beta)
@@ -192,6 +198,10 @@ class DynamicPhysicalCoreTorch(nn.Module):
         a4 = gamma / beta - 1.0
         a5 = dt * (gamma / (2.0 * beta) - 1.0)
         return a0, a1, a2, a3, a4, a5
+
+    def _newmark_constants(self) -> tuple[float, float, float, float, float, float]:
+        """Return cached Newmark constants for the fixed dt/gamma/beta."""
+        return self._newmark_constants_cache
 
     def _base_stiffness_for_newmark(self) -> torch.Tensor:
         """Return the K0 part used in K_eff before adding dynamic templates."""
@@ -229,6 +239,39 @@ class DynamicPhysicalCoreTorch(nn.Module):
             dK_total = 0.5 * (dK_total + dK_total.T)
         return dK_total
 
+    def _assemble_dynamic_stiffness_delta_fast(self, theta: torch.Tensor) -> torch.Tensor:
+        """Fast theta-dependent stiffness assembly for already-normalized scalar theta."""
+        if not self._fast_scalar_theta:
+            return self._assemble_dynamic_stiffness_delta(theta)
+
+        dK_total = None
+        for idx, template_name in enumerate(self.enabled_template_buffer_names):
+            template = getattr(self, template_name)
+            dK = theta[idx] * template
+            dK_total = dK if dK_total is None else dK_total + dK
+
+        if dK_total is None:
+            dK_total = torch.zeros_like(self.K0)
+
+        if bool(self.config.symmetrize_k_eff):
+            dK_total = 0.5 * (dK_total + dK_total.T)
+        return dK_total
+
+    def _assemble_stiffness_fast(self, theta: torch.Tensor) -> torch.Tensor:
+        """Fast K_eff assembly for already-normalized scalar theta."""
+        if not self._fast_scalar_theta:
+            K_eff, _ = self.assemble_stiffness(theta)
+            return K_eff
+
+        K_eff = self.K0
+        for idx, template_name in enumerate(self.enabled_template_buffer_names):
+            template = getattr(self, template_name)
+            K_eff = K_eff + theta[idx] * template
+
+        if bool(self.config.symmetrize_k_eff):
+            K_eff = 0.5 * (K_eff + K_eff.T)
+        return K_eff
+
     def _newmark_effective_matrix(self, theta_t: Optional[torch.Tensor]) -> torch.Tensor:
         """Build A = K_eff + a0 M + a1 C for one Newmark step.
 
@@ -245,6 +288,26 @@ class DynamicPhysicalCoreTorch(nn.Module):
             return A_base + self._assemble_dynamic_stiffness_delta(theta_t)
 
         K_eff, _ = self.assemble_stiffness(theta_t)
+        return K_eff + a0 * self.M0 + a1 * self.C0
+
+    def _newmark_effective_matrix_fast(self, theta_t: Optional[torch.Tensor]) -> torch.Tensor:
+        """Fast A assembly for theta tensors already on core device/dtype."""
+        a0, a1, _, _, _, _ = self._newmark_constants()
+        if theta_t is None:
+            if bool(self.config.precompute_newmark_matrices):
+                A_base = self.newmark_A_base
+                if A_base is None:
+                    A_base = self._build_newmark_A_base()
+                return A_base
+            return self._base_stiffness_for_newmark() + a0 * self.M0 + a1 * self.C0
+
+        if bool(self.config.precompute_newmark_matrices):
+            A_base = self.newmark_A_base
+            if A_base is None:
+                A_base = self._build_newmark_A_base()
+            return A_base + self._assemble_dynamic_stiffness_delta_fast(theta_t)
+
+        K_eff = self._assemble_stiffness_fast(theta_t)
         return K_eff + a0 * self.M0 + a1 * self.C0
 
     def _linear_solve(self, A: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -303,6 +366,94 @@ class DynamicPhysicalCoreTorch(nn.Module):
         v_t1 = v_t + dt * ((1.0 - gamma) * a_t + gamma * a_t1)
 
         return u_t1, v_t1, a_t1
+
+    def _newmark_step_single_fast(
+        self,
+        *,
+        u_t: torch.Tensor,
+        v_t: torch.Tensor,
+        a_t: torch.Tensor,
+        F_t1: torch.Tensor,
+        theta_t: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Unchecked one-step Newmark update for tensors already on core device/dtype."""
+        dt = self._dt
+        gamma = self._gamma
+        a0, a1, a2, a3, a4, a5 = self._newmark_constants()
+
+        A = self._newmark_effective_matrix_fast(theta_t)
+        rhs = (
+            F_t1
+            + self.M0 @ (a0 * u_t + a2 * v_t + a3 * a_t)
+            + self.C0 @ (a1 * u_t + a4 * v_t + a5 * a_t)
+        )
+
+        u_t1 = self._linear_solve(A, rhs)
+        a_t1 = a0 * (u_t1 - u_t) - a2 * v_t - a3 * a_t
+        v_t1 = v_t + dt * ((1.0 - gamma) * a_t + gamma * a_t1)
+
+        return u_t1, v_t1, a_t1
+
+    def newmark_step_fast(
+        self,
+        *,
+        u_t: torch.Tensor,
+        v_t: torch.Tensor,
+        a_t: torch.Tensor,
+        F_t1: torch.Tensor,
+        theta_t: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Fast Newmark step for the rollout hot path.
+
+        The caller must pass tensors already converted to the physical-core
+        device and dtype. This keeps the same Newmark equation and linear solve
+        mode as ``newmark_step`` while avoiding repeated dtype/device wrapping,
+        shape checks, and registry splitting inside the time loop.
+        """
+        if u_t.ndim == 1:
+            return self._newmark_step_single_fast(
+                u_t=u_t,
+                v_t=v_t,
+                a_t=a_t,
+                F_t1=F_t1,
+                theta_t=theta_t,
+            )
+
+        B = int(u_t.shape[0])
+        if theta_t is None:
+            theta_batch = [None for _ in range(B)]
+        elif theta_t.ndim == 1:
+            theta_batch = [theta_t for _ in range(B)]
+        else:
+            theta_batch = [theta_t[i] for i in range(B)]
+
+        if B == 1:
+            u1, v1, a1 = self._newmark_step_single_fast(
+                u_t=u_t[0],
+                v_t=v_t[0],
+                a_t=a_t[0],
+                F_t1=F_t1[0],
+                theta_t=theta_batch[0],
+            )
+            return u1.unsqueeze(0), v1.unsqueeze(0), a1.unsqueeze(0)
+
+        u_out = []
+        v_out = []
+        a_out = []
+        for b in range(B):
+            u1, v1, a1 = self._newmark_step_single_fast(
+                u_t=u_t[b],
+                v_t=v_t[b],
+                a_t=a_t[b],
+                F_t1=F_t1[b],
+                theta_t=theta_batch[b],
+            )
+            u_out.append(u1)
+            v_out.append(v1)
+            a_out.append(a1)
+
+        return torch.stack(u_out, dim=0), torch.stack(v_out, dim=0), torch.stack(a_out, dim=0)
 
     def newmark_step(
         self,

@@ -845,3 +845,10 @@ alpha_y(t) + response/load + static conditioning 在 240-step 训练中有效。
 |---|---|---|---|---|
 | 2026-05-09 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 修改 | 新增 `--phase-gate-active-threshold`，使 `phase_gate_active_ratio` 的统计阈值可由命令行配置；默认保持 `0.2`，下一轮 gate-open 训练建议设为 `0.10`。 | phase-gated fast residual 自主相位修正诊断 |
 | 2026-05-09 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 优化 | 优化 `train_cases_grad_accum(...)` 日志指标累加方式：per-case backward 后不再立即对每个标量执行 CPU 同步，而是在 torch device 上完成 sum/max/min，epoch 汇总时再同步，减少训练日志统计开销且不改变训练目标和梯度路径。 | 训练速度优化 |
+
+# 开发者日志
+
+| 修改时间 | 涉及脚本/文件 | 增改类型 | 修改内容 | 所属阶段 |
+|---|---|---|---|---|
+| 2026-05-09 Asia/Shanghai | `src/student/transformer/dynamic_physical_core_torch.py` | 优化 | 缓存固定 Newmark 常数，新增 `newmark_step_fast(...)` 作为 rollout hot path；该路径要求输入已在 core device/dtype 上，避免每个时间步重复张量包装、shape 检查和 registry 拆分，仍保留原 `newmark_step(...)` 兼容路径。 | 训练速度优化 |
+| 2026-05-09 Asia/Shanghai | `src/student/transformer/transformer_rollout_torch.py` | 优化 | static rollout 中一次性将 `theta_seq` 转为 core dtype/device，并调用 `physical_core.newmark_step_fast(...)`；未改变 dynamic core 外部物理接口、Newmark 方程、`linear_solve_mode` 或 `core_dtype=float64` 约定。 | 训练速度优化 |

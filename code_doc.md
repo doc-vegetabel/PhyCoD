@@ -192,3 +192,12 @@ python tests/compare_full_corrected_core_vs_student.py --time-series-load-file d
 |---|---|---|---|---|
 | 2026-05-09 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 修改 phase gate 诊断配置 | 新增 `--phase-gate-active-threshold`，用于控制 `phase_gate_active_ratio` 的统计阈值；默认仍为 `0.2` 以兼容旧日志，新一轮可显式设为 `0.10` 观察 gate 是否已在 high/complex 工况局部抬升。 | phase-gated fast residual 自主相位修正诊断 |
 | 2026-05-09 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 修改训练日志统计实现 | `train_cases_grad_accum(...)` 将 per-case 日志指标的累加、max/min 统计保留在当前 torch device 上，epoch 汇总时再转出，减少每个 case 后大量 `.cpu()` 标量同步；不改变 forward/backward、loss 权重、优化器 step 或 Newmark/core 数值路径。 | 训练速度优化 |
+
+---
+
+## 13. 2026-05-09 Newmark hot-path 安全加速更新
+
+| 修改时间 | 涉及脚本/文件 | 需增改说明 | 修改内容 | 所属阶段 |
+|---|---|---|---|---|
+| 2026-05-09 Asia/Shanghai | `src/student/transformer/dynamic_physical_core_torch.py` | 修改 Newmark core hot path | 缓存固定的 Newmark 常数 `a0~a5`，新增 `newmark_step_fast(...)`，要求调用方已完成 device/dtype 转换，从而跳过每步重复 `torch.as_tensor`、shape 检查和 registry 拆分；线性求解仍使用原 `linear_solve_mode`，默认训练命令仍使用 `solve`。 | 训练速度优化 |
+| 2026-05-09 Asia/Shanghai | `src/student/transformer/transformer_rollout_torch.py` | 修改 rollout 调用路径 | static rollout 中将整条 `theta_seq` 一次性转换到 core dtype/device，然后逐步调用 `physical_core.newmark_step_fast(...)`；不改变 `theta=[alpha_x_total, alpha_xy_total]` 接口、不改变 Newmark 方程、不改变 `core_dtype=float64` 要求。 | 训练速度优化 |

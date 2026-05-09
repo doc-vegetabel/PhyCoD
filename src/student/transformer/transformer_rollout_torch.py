@@ -294,6 +294,7 @@ class TransformerPhysicalRolloutTorch(nn.Module):
         core_device = self.physical_core.K0.device
 
         F_core = F.to(device=core_device, dtype=core_dtype)
+        theta_core = theta_seq.to(device=core_device, dtype=core_dtype)
 
         u_t, v_t, a_t = self._prepare_initial_state(
             u_static=u_static,
@@ -309,14 +310,14 @@ class TransformerPhysicalRolloutTorch(nn.Module):
         a_list = [a_t]
 
         for t in range(T - 1):
-            theta_t = theta_seq[:, t, :]
+            theta_t = theta_core[:, t, :]
 
             if self.config.detach_rollout_state_each_step:
                 u_t = u_t.detach()
                 v_t = v_t.detach()
                 a_t = a_t.detach()
 
-            u_next, v_next, a_next = self.physical_core.newmark_step(
+            u_next, v_next, a_next = self.physical_core.newmark_step_fast(
                 u_t=u_t,
                 v_t=v_t,
                 a_t=a_t,
