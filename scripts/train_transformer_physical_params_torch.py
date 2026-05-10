@@ -550,6 +550,7 @@ class TransformerPhysicalTrainConfig:
     w_last5_y: float = 0.0
 
     # checkpoint / early stop
+    init_checkpoint: Optional[str] = None
     use_valid_for_best: bool = True
 
     # validation frequency
@@ -3388,6 +3389,17 @@ def parse_args() -> tuple[
     parser.add_argument("--best-score-mode", type=str, default=d.best_score_mode,
                         choices=["response", "freq", "mixed", "guarded_freq"])
 
+    parser.add_argument(
+        "--init-checkpoint",
+        type=str,
+        default=d.init_checkpoint,
+        help=(
+            "Optional checkpoint used to initialize model weights before training. "
+            "Only model/encoder weights are loaded; optimizer state is intentionally "
+            "not restored so LR and loss weights can be changed for follow-up runs."
+        ),
+    )
+
     best_constraint_group = parser.add_mutually_exclusive_group()
     best_constraint_group.add_argument(
         "--use-x-constraint-for-best",
@@ -3659,6 +3671,7 @@ def parse_args() -> tuple[
         no_regression_amp_log_tol=float(args.no_regression_amp_log_tol),
         best_score_guard_weight=float(args.best_score_guard_weight),
         best_score_mode=args.best_score_mode,
+        init_checkpoint=args.init_checkpoint,
         early_stop_patience=args.early_stop_patience,
         early_stop_min_delta=args.early_stop_min_delta,
         min_epochs=args.min_epochs,
@@ -4021,6 +4034,31 @@ def main() -> None:
 
     if bool(cfg.use_load_spectral_features) and spectral_mean is not None and spectral_std is not None:
         model.encoder.set_load_spectral_normalization(spectral_mean, spectral_std)
+
+    if cfg.init_checkpoint is not None and str(cfg.init_checkpoint).strip():
+        init_checkpoint_path = Path(str(cfg.init_checkpoint)).expanduser()
+        if not init_checkpoint_path.exists():
+            raise FileNotFoundError(f"Initial checkpoint not found: {init_checkpoint_path}")
+
+        checkpoint = torch.load(init_checkpoint_path, map_location=device)
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            load_result = model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+            loaded_part = "model_state_dict"
+        elif isinstance(checkpoint, dict) and "encoder_state_dict" in checkpoint:
+            load_result = model.encoder.load_state_dict(checkpoint["encoder_state_dict"], strict=True)
+            loaded_part = "encoder_state_dict"
+        else:
+            load_result = model.load_state_dict(checkpoint, strict=True)
+            loaded_part = "raw_state_dict"
+
+        print()
+        print("[Init Checkpoint]")
+        print(f"  path        = {init_checkpoint_path}")
+        print(f"  loaded_part = {loaded_part}")
+        if getattr(load_result, "missing_keys", None):
+            print(f"  missing_keys   = {list(load_result.missing_keys)}")
+        if getattr(load_result, "unexpected_keys", None):
+            print(f"  unexpected_keys = {list(load_result.unexpected_keys)}")
 
     optimizer = torch.optim.AdamW(
         model.encoder.parameters(),

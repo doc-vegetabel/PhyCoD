@@ -2,6 +2,12 @@
 
 # Full-Order Corrected Student 项目代码说明书（阶段 1 起始版）
 
+## 2026-05-10 init-checkpoint continuation update
+
+| 修改时间 | 涉及脚本/文件 | 需增改说明 | 修改内容 | 所属阶段 |
+|---|---|---|---|---|
+| 2026-05-10 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 新增续训初始化入口 | 新增 `--init-checkpoint` 参数，用于在训练开始前加载已有 `model_state_dict`、`encoder_state_dict` 或原始 state dict；只初始化模型权重，不恢复 optimizer state，便于在已有 best/last checkpoint 基础上更换学习率、gate 权重和 loss 权重继续训练。 | phase-gated fast residual 训练效率优化 |
+
 本说明书仅涵盖当前项目的主线代码、核心脚本、叶片参数文件及验证规划。旧版的 `physics_difference` / 模态 (modal) / 缩减阶 (reduced) 相关脚本已移出主线，不在此列。
 
 ---

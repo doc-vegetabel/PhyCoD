@@ -883,3 +883,9 @@ alpha_y(t) + response/load + static conditioning 在 240-step 训练中有效。
 |---|---|---|---|---|
 | 2026-05-10 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 新增 | 新增 static-quality gate suppression：`--use-static-quality-gate-suppression`、`--w-static-good-gate-l1` 及 `--static-quality-*` 配置。训练时按局部窗口比较 static student 与 teacher 的 corr/lag/amp，自动识别 static 已经足够好的窗口，并在这些窗口压低 `g_phase`，不依赖 case 名称。 | automatic gate selectivity |
 | 2026-05-10 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 修改 | `training_history.csv` 新增 `static_quality_*`、`static_good_gate_mean`、`static_bad_gate_mean`、`static_gate_selectivity_gap` 等指标，用于判断 gate 是否学会在 static-good 窗口关闭、在 static-bad 窗口保持可用。 | automatic gate selectivity |
+
+# 2026-05-10 init-checkpoint continuation update
+
+| Time | Files | Change Type | Content | Stage |
+|---|---|---|---|---|
+| 2026-05-10 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Add | Add `--init-checkpoint` so a follow-up run can initialize model weights from an existing checkpoint without restoring optimizer state; this keeps LR and phase/gate loss weights adjustable for continuation experiments. | phase-gated fast residual training efficiency |
