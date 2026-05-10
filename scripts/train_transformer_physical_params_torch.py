@@ -313,6 +313,9 @@ class TransformerPhysicalTrainConfig:
 
     load_suffix: str = DEFAULT_LOAD_SUFFIX
     load_case_start_index: int = DEFAULT_LOAD_CASE_START_INDEX
+    guard_load_files: Optional[str] = None
+    guard_case_paths: Optional[str] = None
+    w_guard_case_loss: float = 1.0
 
     n_train_cases: int = DEFAULT_N_TRAIN_CASES
     n_valid_cases: int = DEFAULT_N_VALID_CASES
@@ -1296,7 +1299,20 @@ NO_REGRESSION_LOG_METRIC_KEYS = [
     "no_regression_x_lag_excess_s",
     "no_regression_y_lag_excess_s",
     "no_regression_x_amp_log_excess",
-    "no_regression_y_amp_log_excess",
+        "no_regression_y_amp_log_excess",
+    ]
+
+GUARD_CASE_LOG_METRIC_KEYS = [
+    "guard_case_count",
+    "guard_total_loss",
+    "guard_no_regression_guard_loss",
+    "guard_x_ratio",
+    "guard_y_ratio",
+    "guard_tip_y_ratio",
+    "guard_last5_y_ratio",
+    "guard_phase_gate_mean",
+    "guard_phase_gate_max",
+    "guard_phase_gate_active_ratio",
 ]
 
 TIMING_LOG_METRIC_KEYS = [
@@ -1667,6 +1683,7 @@ def compute_response_loss(
         theta: torch.Tensor,
         theta_aux: Optional[dict[str, torch.Tensor]] = None,
         case_name: str = "",
+        guard_only: bool = False,
 ) -> dict[str, torch.Tensor]:
     """
     alpha_x / alpha_xy training loss.
@@ -1844,7 +1861,10 @@ def compute_response_loss(
     base_reg_loss = float(cfg.w_theta_amp) * amp + float(cfg.w_theta_smooth) * smooth
     reg_loss = base_reg_loss + phase_reg["phase_reg_loss"]
 
-    total_loss = response_loss + freq_loss + reg_loss + no_regression["no_regression_guard_loss"]
+    if bool(guard_only):
+        total_loss = no_regression["no_regression_guard_loss"] + reg_loss
+    else:
+        total_loss = response_loss + freq_loss + reg_loss + no_regression["no_regression_guard_loss"]
 
     result = {
         "total_loss": total_loss,
@@ -2212,6 +2232,7 @@ def train_cases_grad_accum(
         *,
         model: TransformerPhysicalRolloutTorch,
         cases: list[TransformerTrainingCase],
+        guard_cases: Optional[list[TransformerTrainingCase]] = None,
         geometry: torch.Tensor,
         cfg: TransformerPhysicalTrainConfig,
         x_idx: torch.Tensor,
@@ -2317,6 +2338,19 @@ def train_cases_grad_accum(
     adaptive_metric_max_values: dict[str, Optional[torch.Tensor]] = {k: None for k in adaptive_metric_max_keys}
     adaptive_metric_min_values: dict[str, Optional[torch.Tensor]] = {k: None for k in adaptive_metric_min_keys}
     theta_abs_max_value: Optional[torch.Tensor] = None
+    guard_metric_keys = [
+        "total_loss",
+        "no_regression_guard_loss",
+        "x_ratio",
+        "y_ratio",
+        "tip_y_ratio",
+        "last5_y_ratio",
+        "phase_gate_mean",
+        "phase_gate_max",
+        "phase_gate_active_ratio",
+    ]
+    guard_metric_sums: dict[str, Optional[torch.Tensor]] = {k: None for k in guard_metric_keys}
+    guard_cases = list(guard_cases or [])
 
     for case in cases:
         u_static = case.u_static.unsqueeze(0)
@@ -2423,6 +2457,64 @@ def train_cases_grad_accum(
         del loss_dict
         del scaled_loss
 
+    if guard_cases:
+        n_guard_cases = len(guard_cases)
+        for case in guard_cases:
+            u_static = case.u_static.unsqueeze(0)
+            v_static = case.v_static.unsqueeze(0)
+            a_static = case.a_static.unsqueeze(0)
+            F = case.F_raw.unsqueeze(0)
+            F_spectral = case.F_spectral.unsqueeze(0) if case.F_spectral is not None else None
+
+            u0 = case.u_static[:1, :].to(dtype=torch.float32)
+            v0 = case.v_static[:1, :].to(dtype=torch.float32)
+            a0 = case.a_static[:1, :].to(dtype=torch.float32)
+
+            out = model(
+                u_static=u_static,
+                v_static=v_static,
+                a_static=a_static,
+                F=F,
+                geometry_features=geometry,
+                load_spectral_features=F_spectral,
+                u0=u0,
+                v0=v0,
+                a0=a0,
+            )
+            loss_dict = compute_response_loss(
+                u_pred=out.u_pred,
+                case=case,
+                cfg=cfg,
+                x_idx=x_idx,
+                y_idx=y_idx,
+                tip_y_idx=tip_y_idx,
+                last5_y_idx=last5_y_idx,
+                theta=out.theta,
+                theta_aux=out.theta_aux,
+                case_name=case.name,
+                guard_only=True,
+            )
+            scaled_guard_loss = (
+                float(cfg.w_guard_case_loss)
+                * loss_dict["total_loss"]
+                / float(n_guard_cases)
+            )
+            t0 = _time_now(cfg, timing_device) if profile_timing else 0.0
+            scaled_guard_loss.backward()
+            if profile_timing:
+                timing_sums["timing_backward_seconds"] += _time_now(cfg, timing_device) - t0
+
+            for k in guard_metric_keys:
+                value = loss_dict[k].detach().to(dtype=torch.float64)
+                if guard_metric_sums[k] is None:
+                    guard_metric_sums[k] = value.clone()
+                else:
+                    guard_metric_sums[k] = guard_metric_sums[k] + value
+
+            del out
+            del loss_dict
+            del scaled_guard_loss
+
     t0 = _time_now(cfg, timing_device) if profile_timing else 0.0
     grad_norm = torch.nn.utils.clip_grad_norm_(
         model.encoder.parameters(),
@@ -2476,6 +2568,13 @@ def train_cases_grad_accum(
         if torch.is_tensor(grad_norm)
         else float(grad_norm)
     )
+    result["guard_case_count"] = float(len(guard_cases))
+    for k, value in guard_metric_sums.items():
+        result[f"guard_{k}"] = (
+            torch.zeros((), dtype=dtype_out)
+            if value is None
+            else (value / float(max(1, len(guard_cases)))).to(dtype=dtype_out)
+        )
     for k, value in timing_sums.items():
         result[k] = float(value)
     if profile_timing:
@@ -2773,6 +2872,8 @@ def parse_args() -> tuple[
     list[str],
     list[str],
     list[str],
+    list[str],
+    list[str],
 ]:
     d = TransformerPhysicalTrainConfig()
 
@@ -2799,9 +2900,24 @@ def parse_args() -> tuple[
     parser.add_argument("--train-load-files", type=str, default=None)
     parser.add_argument("--valid-load-files", type=str, default=None)
     parser.add_argument("--test-load-files", type=str, default=None)
+    parser.add_argument(
+        "--guard-load-files",
+        type=str,
+        default=d.guard_load_files,
+        help=(
+            "Comma-separated auxiliary load files used only for guard-only training loss. "
+            "These cases are prepared under the train split when --prepare-cases is used."
+        ),
+    )
 
     parser.add_argument("--train-case-paths", type=str, default=None)
     parser.add_argument("--valid-case-paths", type=str, default=None)
+    parser.add_argument(
+        "--guard-case-paths",
+        type=str,
+        default=d.guard_case_paths,
+        help="Optional explicit .npz paths for auxiliary guard-only cases.",
+    )
 
     parser.add_argument("--t-initial", type=float, default=d.t_initial)
     parser.add_argument("--t-final", type=float, default=d.t_final)
@@ -3025,6 +3141,7 @@ def parse_args() -> tuple[
     parser.add_argument("--w-no-regression-response", type=float, default=d.w_no_regression_response)
     parser.add_argument("--w-no-regression-lag", type=float, default=d.w_no_regression_lag)
     parser.add_argument("--w-no-regression-amp", type=float, default=d.w_no_regression_amp)
+    parser.add_argument("--w-guard-case-loss", type=float, default=d.w_guard_case_loss)
     parser.add_argument("--no-regression-x-ratio-limit", type=float, default=d.no_regression_x_ratio_limit)
     parser.add_argument("--no-regression-y-ratio-limit", type=float, default=d.no_regression_y_ratio_limit)
     parser.add_argument("--no-regression-tip-y-ratio-limit", type=float, default=d.no_regression_tip_y_ratio_limit)
@@ -3144,6 +3261,9 @@ def parse_args() -> tuple[
         train_load_dir=str(TRAIN_LOAD_DIR),
         valid_load_dir=str(VALID_LOAD_DIR),
         test_load_dir=str(TEST_LOAD_DIR),
+        guard_load_files=args.guard_load_files,
+        guard_case_paths=args.guard_case_paths,
+        w_guard_case_loss=float(args.w_guard_case_loss),
         train_load_prefix=DEFAULT_TRAIN_LOAD_PREFIX,
         valid_load_prefix=DEFAULT_VALID_LOAD_PREFIX,
         test_load_prefix=DEFAULT_TEST_LOAD_PREFIX,
@@ -3313,11 +3433,22 @@ def parse_args() -> tuple[
     train_load_files = _parse_file_list(args.train_load_files, default_train_load_files)
     valid_load_files = _parse_file_list(args.valid_load_files, default_valid_load_files)
     test_load_files = _parse_file_list(args.test_load_files, default_test_load_files)
+    guard_load_files = _parse_file_list(args.guard_load_files, [])
 
     train_case_paths = _parse_path_list(args.train_case_paths)
     valid_case_paths = _parse_path_list(args.valid_case_paths)
+    guard_case_paths = _parse_path_list(args.guard_case_paths)
 
-    return cfg, train_load_files, valid_load_files, test_load_files, train_case_paths, valid_case_paths
+    return (
+        cfg,
+        train_load_files,
+        valid_load_files,
+        test_load_files,
+        train_case_paths,
+        valid_case_paths,
+        guard_load_files,
+        guard_case_paths,
+    )
 
 
 # ============================================================
@@ -3332,6 +3463,8 @@ def main() -> None:
         test_load_files,
         train_case_paths,
         valid_case_paths,
+        guard_load_files,
+        guard_case_paths,
     ) = parse_args()
 
     torch.manual_seed(int(cfg.seed))
@@ -3379,6 +3512,7 @@ def main() -> None:
             f"w_response={cfg.w_no_regression_response}, "
             f"w_lag={cfg.w_no_regression_lag}, "
             f"w_amp={cfg.w_no_regression_amp}, "
+            f"w_guard_case={cfg.w_guard_case_loss}, "
             f"ratio_limits=({cfg.no_regression_x_ratio_limit}, {cfg.no_regression_y_ratio_limit}), "
             f"lag_tol={cfg.no_regression_lag_tol_seconds}, "
             f"amp_log_tol={cfg.no_regression_amp_log_tol}, "
@@ -3412,6 +3546,10 @@ def main() -> None:
     print("  test load files:")
     for p in test_load_files:
         print(f"    {p}")
+    if guard_load_files:
+        print("  guard load files:")
+        for p in guard_load_files:
+            print(f"    {p}")
 
     if bool(cfg.prepare_cases):
         prep_cfg = PhysicalTrainingCasePrepConfig(
@@ -3435,15 +3573,36 @@ def main() -> None:
             rebuild_cases=bool(cfg.rebuild_cases),
         )
 
+        prep_train_load_files = list(train_load_files)
+        for p in guard_load_files:
+            if p not in prep_train_load_files:
+                prep_train_load_files.append(p)
+
         prepared = prepare_physical_training_cases(
             cfg=prep_cfg,
-            train_load_files=train_load_files,
+            train_load_files=prep_train_load_files,
             valid_load_files=valid_load_files,
             rebuild=bool(cfg.rebuild_cases),
         )
 
-        train_case_paths = [str(p) for p in prepared["train"]]
+        train_case_paths = [
+            str(_expected_case_path(
+                training_case_dir=cfg.training_case_dir,
+                split="train",
+                load_file=p,
+            ))
+            for p in train_load_files
+        ]
         valid_case_paths = [str(p) for p in prepared["valid"]]
+        if guard_load_files and not guard_case_paths:
+            guard_case_paths = [
+                str(_expected_case_path(
+                    training_case_dir=cfg.training_case_dir,
+                    split="train",
+                    load_file=p,
+                ))
+                for p in guard_load_files
+            ]
 
     if not train_case_paths:
         train_case_paths = [
@@ -3465,6 +3624,16 @@ def main() -> None:
             for p in valid_load_files
         ]
 
+    if guard_load_files and not guard_case_paths:
+        guard_case_paths = [
+            str(_expected_case_path(
+                training_case_dir=cfg.training_case_dir,
+                split="train",
+                load_file=p,
+            ))
+            for p in guard_load_files
+        ]
+
     print("  train cases:")
     for p in train_case_paths:
         print(f"    {p}")
@@ -3472,6 +3641,10 @@ def main() -> None:
     print("  valid cases:")
     for p in valid_case_paths:
         print(f"    {p}")
+    if guard_case_paths:
+        print("  guard cases:")
+        for p in guard_case_paths:
+            print(f"    {p}")
 
     train_cases = load_cases(
         train_case_paths,
@@ -3488,6 +3661,14 @@ def main() -> None:
         max_steps=cfg.max_steps_per_case,
         cfg=cfg,
     ) if len(valid_case_paths) > 0 else []
+
+    guard_cases = load_cases(
+        guard_case_paths,
+        dtype=dtype_case,
+        device=device,
+        max_steps=cfg.max_steps_per_case,
+        cfg=cfg,
+    ) if len(guard_case_paths) > 0 else []
 
     if len(train_cases) == 0:
         raise RuntimeError("No training cases were loaded.")
@@ -3510,10 +3691,11 @@ def main() -> None:
     if bool(cfg.use_cached_alignment_loss):
         print()
         print("[Alignment Loss Cache]")
-        print("  building teacher-side spectral / peak / lag caches for train+valid cases ...")
+        print("  building teacher-side spectral / peak / lag caches for train+valid+guard cases ...")
         prime_alignment_loss_caches(cases=train_cases, cfg=cfg, x_idx=x_idx, y_idx=y_idx)
         prime_alignment_loss_caches(cases=valid_cases, cfg=cfg, x_idx=x_idx, y_idx=y_idx)
-        print(f"  cached cases = {len(train_cases) + len(valid_cases)}")
+        prime_alignment_loss_caches(cases=guard_cases, cfg=cfg, x_idx=x_idx, y_idx=y_idx)
+        print(f"  cached cases = {len(train_cases) + len(valid_cases) + len(guard_cases)}")
 
     if bool(cfg.use_load_spectral_features):
         if not bool(cfg.use_load_branch):
@@ -3595,6 +3777,8 @@ def main() -> None:
         "cfg": asdict(cfg),
         "train_case_paths": train_case_paths,
         "valid_case_paths": valid_case_paths,
+        "guard_load_files": guard_load_files,
+        "guard_case_paths": guard_case_paths,
         "registry": registry.summary(),
         "geometry_summary": geo_bundle.summary(),
         "model_info": model_info,
@@ -3626,6 +3810,7 @@ def main() -> None:
         train_eval = train_cases_grad_accum(
             model=model,
             cases=train_cases,
+            guard_cases=guard_cases,
             geometry=geometry,
             cfg=cfg,
             x_idx=x_idx,
@@ -3881,6 +4066,8 @@ def main() -> None:
         for guard_key in NO_REGRESSION_LOG_METRIC_KEYS:
             row[f"train_{guard_key}"] = _metric_to_float(train_eval, guard_key)
             row[f"valid_{guard_key}"] = _metric_to_float(valid_eval_for_log, guard_key)
+        for guard_case_key in GUARD_CASE_LOG_METRIC_KEYS:
+            row[f"train_{guard_case_key}"] = _metric_to_float(train_eval, guard_case_key)
         for timing_key in TIMING_LOG_METRIC_KEYS:
             row[f"train_{timing_key}"] = _metric_to_float(train_eval, timing_key)
             row[f"valid_{timing_key}"] = _metric_to_float(valid_eval_for_log, timing_key)

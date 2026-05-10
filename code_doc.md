@@ -222,3 +222,12 @@ python tests/compare_full_corrected_core_vs_student.py --time-series-load-file d
 | 2026-05-09 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 修复训练 loss 返回链路 | 补回 `compute_response_loss(...)` 末尾的 `return result`，保证训练和验证循环拿到完整 loss/diagnostic 字典。 | 训练速度诊断 |
 | 2026-05-09 Asia/Shanghai | `src/student/transformer/dynamic_physical_core_torch.py` | 新增 Newmark 内部细分计时接口 | 新增 `newmark_step_fast_timed(...)`，只在 profiling 路径使用，拆分记录 effective-matrix assembly、RHS build、linear solve、state update 耗时；不改变默认 fast Newmark 数值路径。 | Newmark 瓶颈细分诊断 |
 | 2026-05-09 Asia/Shanghai | `src/student/transformer/transformer_rollout_torch.py`, `scripts/train_transformer_physical_params_torch.py` | 扩展训练计时列 | `training_history.csv` 新增 `train_/valid_timing_newmark_assemble_seconds`、`timing_newmark_rhs_seconds`、`timing_newmark_solve_seconds`、`timing_newmark_update_seconds`，用于判断 Newmark loop 具体瓶颈。 | Newmark 瓶颈细分诊断 |
+
+---
+
+## 16. 2026-05-10 auxiliary guard-only case 更新
+
+| 修改时间 | 涉及脚本/文件 | 需增改说明 | 修改内容 | 所属阶段 |
+|---|---|---|---|---|
+| 2026-05-10 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 新增 simple/low 防退化辅助训练入口 | 新增 `--guard-load-files`、`--guard-case-paths`、`--w-guard-case-loss`。guard cases 可使用 simple/low 载荷，只反传 no-regression guard 与 theta/phase 正则，不进入 high/complex 的 adaptive phase 主目标，从而保护 simple/low 幅值与 x/y response。 | strong phase balanced v2 |
+| 2026-05-10 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 扩展训练记录 | `training_history.csv` 新增 `train_guard_*` 指标，包括 guard case 数量、guard loss、x/y/tip_y/last5_y ratio 与 phase gate 统计，便于判断辅助保护是否真正生效。 | strong phase balanced v2 |

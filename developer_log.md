@@ -869,3 +869,10 @@ alpha_y(t) + response/load + static conditioning 在 240-step 训练中有效。
 | 2026-05-09 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 修复 | 修复计时诊断改动中 `compute_response_loss(...)` 组装 `result` 后未返回的问题，避免训练阶段出现 `loss_dict is None`。 | 训练速度诊断 |
 | 2026-05-09 Asia/Shanghai | `src/student/transformer/dynamic_physical_core_torch.py` | 新增 | 新增 `newmark_step_fast_timed(...)`，仅在 profiling 开启时把 fast Newmark step 拆分计时为 effective-matrix assembly、RHS build、linear solve 和 state update；普通 `newmark_step_fast(...)` 路径不变。 | Newmark 瓶颈细分诊断 |
 | 2026-05-09 Asia/Shanghai | `src/student/transformer/transformer_rollout_torch.py`, `scripts/train_transformer_physical_params_torch.py` | 修改 | rollout 汇总 Newmark 内部细分耗时并写入 metadata；训练脚本新增 `timing_newmark_assemble/rhs/solve/update_seconds` 的 train/valid history 列和控制台摘要。 | Newmark 瓶颈细分诊断 |
+
+# 开发者日志
+
+| 修改时间 | 涉及脚本/文件 | 增改类型 | 修改内容 | 所属阶段 |
+|---|---|---|---|---|
+| 2026-05-10 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 新增 | 新增 auxiliary guard-only cases：`--guard-load-files`、`--guard-case-paths`、`--w-guard-case-loss`。guard case 在训练中只反传 no-regression guard 与 theta/phase 正则，不参与强相位 adaptive/complex 主 loss，用于保护 simple/low 工况不被 high/complex 相位强化牺牲。 | strong phase balanced v2 |
+| 2026-05-10 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 修改 | `--prepare-cases` 时会把 guard load files 一并准备到 train split，但不会加入主 train case 列表；训练 history 新增 `train_guard_*` 指标，用于检查 guard loss、guard case ratio 和 phase gate 激活。 | strong phase balanced v2 |
