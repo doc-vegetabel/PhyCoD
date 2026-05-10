@@ -231,3 +231,12 @@ python tests/compare_full_corrected_core_vs_student.py --time-series-load-file d
 |---|---|---|---|---|
 | 2026-05-10 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 新增 simple/low 防退化辅助训练入口 | 新增 `--guard-load-files`、`--guard-case-paths`、`--w-guard-case-loss`。guard cases 可使用 simple/low 载荷，只反传 no-regression guard 与 theta/phase 正则，不进入 high/complex 的 adaptive phase 主目标，从而保护 simple/low 幅值与 x/y response。 | strong phase balanced v2 |
 | 2026-05-10 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 扩展训练记录 | `training_history.csv` 新增 `train_guard_*` 指标，包括 guard case 数量、guard loss、x/y/tip_y/last5_y ratio 与 phase gate 统计，便于判断辅助保护是否真正生效。 | strong phase balanced v2 |
+
+---
+
+## 17. 2026-05-10 static-quality gate suppression 更新
+
+| 修改时间 | 涉及脚本/文件 | 需增改说明 | 修改内容 | 所属阶段 |
+|---|---|---|---|---|
+| 2026-05-10 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 新增自动 gate 选择性训练项 | 新增 `--use-static-quality-gate-suppression`、`--w-static-good-gate-l1` 和 `--static-quality-*` 参数。训练时对局部窗口计算 static student 相对 teacher 的 corr、best-lag 和 RMS 幅值比；若 static 已经满足 good-window 条件，则对该窗口 `g_phase` 施加 L1 抑制，促使模型自动识别“不需要 fast phase correction”的窗口。 | automatic gate selectivity |
+| 2026-05-10 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 扩展日志指标 | `training_history.csv` 新增 `static_quality_gate_loss`、`static_good_gate_mean`、`static_bad_gate_mean`、`static_gate_selectivity_gap`、`static_good_window_ratio` 等指标，用于检查 gate 是否从 case-name 保护转向基于响应质量的自动选择。 | automatic gate selectivity |

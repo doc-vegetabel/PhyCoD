@@ -487,6 +487,18 @@ class TransformerPhysicalTrainConfig:
     w_complex_amp_guard_x: float = 0.0
     w_complex_amp_guard_y: float = 0.0
     w_phase_gate_align: float = 0.0
+    use_static_quality_gate_suppression: bool = False
+    w_static_good_gate_l1: float = 0.0
+    static_quality_observations: str = "tip,last5"
+    static_quality_last_k: int = 5
+    static_quality_start: float = 0.0
+    static_quality_end: Optional[float] = None
+    static_quality_window_seconds: float = 1.28
+    static_quality_stride_seconds: float = 0.64
+    static_quality_max_lag_seconds: float = 0.20
+    static_quality_good_corr_threshold: float = 0.995
+    static_quality_good_lag_seconds: float = 0.02
+    static_quality_good_amp_log_tol: float = 0.08
 
     # Response-level no-regression guard for cases that should not be harmed
     # while high-frequency / complex phase correction is strengthened.
@@ -1272,6 +1284,16 @@ ADAPTIVE_PHASE_LOG_METRIC_KEYS = [
     "adaptive_y_n_windows",
     "adaptive_x_n_selected_windows",
     "adaptive_y_n_selected_windows",
+    "static_quality_gate_loss",
+    "static_good_gate_mean",
+    "static_bad_gate_mean",
+    "static_gate_selectivity_gap",
+    "static_good_window_ratio",
+    "static_bad_window_ratio",
+    "static_quality_score_mean",
+    "static_quality_score_max",
+    "static_quality_gate_mean",
+    "static_quality_n_windows",
 ]
 
 ADAPTIVE_PHASE_MAX_METRIC_KEYS = {
@@ -1279,6 +1301,7 @@ ADAPTIVE_PHASE_MAX_METRIC_KEYS = {
     "adaptive_y_score_max",
     "adaptive_x_selected_t_start_max",
     "adaptive_y_selected_t_start_max",
+    "static_quality_score_max",
 }
 
 ADAPTIVE_PHASE_MIN_METRIC_KEYS = {
@@ -1573,6 +1596,194 @@ def adaptive_phase_window_training_loss(
     return out
 
 
+def _static_quality_observation_indices(
+        *,
+        dof_indices: torch.Tensor,
+        observations: str,
+        last_k: int,
+) -> list[torch.Tensor]:
+    obs = set(_split_keyword_list(observations))
+    indices: list[torch.Tensor] = []
+    if "tip" in obs and int(dof_indices.numel()) > 0:
+        indices.append(dof_indices[-1:].to(dtype=torch.long))
+    if "last5" in obs and int(dof_indices.numel()) > 0:
+        k = max(1, min(int(last_k), int(dof_indices.numel())))
+        indices.append(dof_indices[-k:].to(dtype=torch.long))
+    if "mean" in obs and int(dof_indices.numel()) > 0:
+        indices.append(dof_indices.to(dtype=torch.long))
+    if not indices and int(dof_indices.numel()) > 0:
+        indices.append(dof_indices[-1:].to(dtype=torch.long))
+    return indices
+
+
+def _best_window_lag_corr_amp(
+        static_signal: torch.Tensor,
+        teacher_signal: torch.Tensor,
+        *,
+        dt: float,
+        max_lag_seconds: float,
+        eps: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    max_lag_steps = max(0, int(round(float(max_lag_seconds) / float(dt))))
+    best_corr: Optional[torch.Tensor] = None
+    best_abs_lag_s = torch.zeros((), dtype=static_signal.dtype, device=static_signal.device)
+    for lag in range(-max_lag_steps, max_lag_steps + 1):
+        if lag < 0:
+            s = static_signal[-lag:]
+            t = teacher_signal[: s.shape[0]]
+        elif lag > 0:
+            s = static_signal[:-lag]
+            t = teacher_signal[lag:]
+        else:
+            s = static_signal
+            t = teacher_signal
+        if int(s.numel()) < 2:
+            continue
+        s0 = s - torch.mean(s)
+        t0 = t - torch.mean(t)
+        denom = torch.sqrt(torch.sum(s0 * s0).clamp_min(eps) * torch.sum(t0 * t0).clamp_min(eps))
+        corr = torch.sum(s0 * t0) / denom.clamp_min(eps)
+        if best_corr is None or bool((corr > best_corr).detach().cpu()):
+            best_corr = corr
+            best_abs_lag_s = torch.as_tensor(abs(lag) * float(dt), dtype=static_signal.dtype, device=static_signal.device)
+
+    if best_corr is None:
+        best_corr = torch.zeros((), dtype=static_signal.dtype, device=static_signal.device)
+
+    static_rms = torch.sqrt(torch.mean((static_signal - torch.mean(static_signal)) ** 2).clamp_min(eps))
+    teacher_rms = torch.sqrt(torch.mean((teacher_signal - torch.mean(teacher_signal)) ** 2).clamp_min(eps))
+    amp_log_abs = torch.abs(torch.log(static_rms.clamp_min(eps) / teacher_rms.clamp_min(eps)))
+    return best_abs_lag_s.detach(), best_corr.detach(), amp_log_abs.detach()
+
+
+def static_quality_gate_suppression_loss(
+        *,
+        static: torch.Tensor,
+        teacher: torch.Tensor,
+        theta_aux: Optional[dict[str, torch.Tensor]],
+        cfg: TransformerPhysicalTrainConfig,
+        x_idx: torch.Tensor,
+        y_idx: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    zero = torch.zeros((), dtype=teacher.dtype, device=teacher.device)
+    empty = {
+        "static_quality_gate_loss": zero,
+        "static_good_gate_mean": zero,
+        "static_bad_gate_mean": zero,
+        "static_gate_selectivity_gap": zero,
+        "static_good_window_ratio": zero,
+        "static_bad_window_ratio": zero,
+        "static_quality_score_mean": zero,
+        "static_quality_score_max": zero,
+        "static_quality_gate_mean": zero,
+        "static_quality_n_windows": zero,
+    }
+    if (
+        not bool(getattr(cfg, "use_static_quality_gate_suppression", False))
+        or theta_aux is None
+        or theta_aux.get("g_phase") is None
+    ):
+        return empty
+
+    gate = theta_aux["g_phase"].to(dtype=teacher.dtype, device=teacher.device)
+    if gate.ndim == 3:
+        gate = gate[0]
+    if gate.ndim == 2:
+        gate = torch.mean(gate, dim=-1)
+    if gate.ndim != 1:
+        return empty
+
+    static = static.to(dtype=teacher.dtype, device=teacher.device).detach()
+    teacher = teacher.detach()
+    T = int(min(static.shape[0], teacher.shape[0], gate.shape[0]))
+    if T < 2:
+        return empty
+    static = static[:T]
+    teacher = teacher[:T]
+    gate = gate[:T]
+
+    dt = float(cfg.dt)
+    start = max(0, int(round(float(cfg.static_quality_start) / dt)))
+    end = T if cfg.static_quality_end is None else min(T, int(round(float(cfg.static_quality_end) / dt)))
+    win = max(2, int(round(float(cfg.static_quality_window_seconds) / dt)))
+    stride = max(1, int(round(float(cfg.static_quality_stride_seconds) / dt)))
+    if end - start < win:
+        return empty
+
+    obs_indices = (
+        _static_quality_observation_indices(
+            dof_indices=x_idx,
+            observations=str(cfg.static_quality_observations),
+            last_k=int(cfg.static_quality_last_k),
+        )
+        + _static_quality_observation_indices(
+            dof_indices=y_idx,
+            observations=str(cfg.static_quality_observations),
+            last_k=int(cfg.static_quality_last_k),
+        )
+    )
+    if not obs_indices:
+        return empty
+
+    scores = []
+    gate_means = []
+    good_weights = []
+    bad_weights = []
+    for s0 in range(start, end - win + 1, stride):
+        s1 = s0 + win
+        signal_scores = []
+        for idx in obs_indices:
+            static_signal = torch.mean(static[s0:s1, idx], dim=-1)
+            teacher_signal = torch.mean(teacher[s0:s1, idx], dim=-1)
+            abs_lag_s, corr, amp_log_abs = _best_window_lag_corr_amp(
+                static_signal,
+                teacher_signal,
+                dt=dt,
+                max_lag_seconds=float(cfg.static_quality_max_lag_seconds),
+                eps=torch.as_tensor(1.0e-12, dtype=teacher.dtype, device=teacher.device),
+            )
+            corr_excess = torch.relu(torch.as_tensor(float(cfg.static_quality_good_corr_threshold), dtype=teacher.dtype, device=teacher.device) - corr)
+            lag_excess = torch.relu(abs_lag_s - float(cfg.static_quality_good_lag_seconds)) / max(float(cfg.static_quality_good_lag_seconds), 1.0e-12)
+            amp_excess = torch.relu(amp_log_abs - float(cfg.static_quality_good_amp_log_tol)) / max(float(cfg.static_quality_good_amp_log_tol), 1.0e-12)
+            signal_scores.append(corr_excess + lag_excess + amp_excess)
+        score = torch.stack(signal_scores).mean().detach()
+        gate_mean = torch.mean(gate[s0:s1])
+        good = (score <= 1.0e-8).to(dtype=teacher.dtype)
+        bad = (score > 1.0e-8).to(dtype=teacher.dtype)
+        scores.append(score)
+        gate_means.append(gate_mean)
+        good_weights.append(good)
+        bad_weights.append(bad)
+
+    if not scores:
+        return empty
+
+    score_t = torch.stack(scores)
+    gate_t = torch.stack(gate_means)
+    good_t = torch.stack(good_weights)
+    bad_t = torch.stack(bad_weights)
+    good_count = torch.sum(good_t).clamp_min(1.0)
+    bad_count = torch.sum(bad_t).clamp_min(1.0)
+    good_gate = torch.sum(gate_t * good_t) / good_count
+    bad_gate = torch.sum(gate_t * bad_t) / bad_count
+    has_good = bool((torch.sum(good_t) > 0).detach().cpu())
+    unweighted_loss = good_gate if has_good else zero
+    weighted_loss = float(cfg.w_static_good_gate_l1) * unweighted_loss
+
+    return {
+        "static_quality_gate_loss": weighted_loss,
+        "static_good_gate_mean": good_gate.detach(),
+        "static_bad_gate_mean": bad_gate.detach(),
+        "static_gate_selectivity_gap": (bad_gate - good_gate).detach(),
+        "static_good_window_ratio": torch.mean(good_t).detach(),
+        "static_bad_window_ratio": torch.mean(bad_t).detach(),
+        "static_quality_score_mean": torch.mean(score_t).detach(),
+        "static_quality_score_max": torch.max(score_t).detach(),
+        "static_quality_gate_mean": torch.mean(gate_t).detach(),
+        "static_quality_n_windows": torch.as_tensor(float(len(scores)), dtype=teacher.dtype, device=teacher.device),
+    }
+
+
 def _demeaned_rms_ratio(
         pred: torch.Tensor,
         target: torch.Tensor,
@@ -1835,6 +2046,14 @@ def compute_response_loss(
         x_idx=x_idx,
         y_idx=y_idx,
     )
+    static_quality_gate = static_quality_gate_suppression_loss(
+        static=case.u_static,
+        teacher=teacher,
+        theta_aux=theta_aux,
+        cfg=cfg,
+        x_idx=x_idx,
+        y_idx=y_idx,
+    )
 
     # freq_loss 现在表示“频率/峰值/相位综合对齐损失”：
     # 全局频谱 + teacher-anchored peak-time + local cross-correlation lag
@@ -1859,7 +2078,7 @@ def compute_response_loss(
         case_name=case_name,
     )
     base_reg_loss = float(cfg.w_theta_amp) * amp + float(cfg.w_theta_smooth) * smooth
-    reg_loss = base_reg_loss + phase_reg["phase_reg_loss"]
+    reg_loss = base_reg_loss + phase_reg["phase_reg_loss"] + static_quality_gate["static_quality_gate_loss"]
 
     if bool(guard_only):
         total_loss = no_regression["no_regression_guard_loss"] + reg_loss
@@ -1936,6 +2155,7 @@ def compute_response_loss(
         "theta_fast_abs_max": phase_reg["theta_fast_abs_max"],
         "theta_gated_fast_rms": phase_reg["theta_gated_fast_rms"],
         "theta_gated_fast_abs_max": phase_reg["theta_gated_fast_abs_max"],
+        **static_quality_gate,
         **{
             key: adaptive_phase[key]
             for key in ADAPTIVE_PHASE_LOG_METRIC_KEYS
@@ -3131,6 +3351,21 @@ def parse_args() -> tuple[
     parser.add_argument("--w-complex-amp-guard-x", type=float, default=d.w_complex_amp_guard_x)
     parser.add_argument("--w-complex-amp-guard-y", type=float, default=d.w_complex_amp_guard_y)
     parser.add_argument("--w-phase-gate-align", type=float, default=d.w_phase_gate_align)
+    parser.add_argument("--use-static-quality-gate-suppression", action="store_true",
+                        default=d.use_static_quality_gate_suppression)
+    parser.add_argument("--no-static-quality-gate-suppression", dest="use_static_quality_gate_suppression",
+                        action="store_false")
+    parser.add_argument("--w-static-good-gate-l1", type=float, default=d.w_static_good_gate_l1)
+    parser.add_argument("--static-quality-observations", type=str, default=d.static_quality_observations)
+    parser.add_argument("--static-quality-last-k", type=int, default=d.static_quality_last_k)
+    parser.add_argument("--static-quality-start", type=float, default=d.static_quality_start)
+    parser.add_argument("--static-quality-end", type=float, default=d.static_quality_end)
+    parser.add_argument("--static-quality-window-seconds", type=float, default=d.static_quality_window_seconds)
+    parser.add_argument("--static-quality-stride-seconds", type=float, default=d.static_quality_stride_seconds)
+    parser.add_argument("--static-quality-max-lag-seconds", type=float, default=d.static_quality_max_lag_seconds)
+    parser.add_argument("--static-quality-good-corr-threshold", type=float, default=d.static_quality_good_corr_threshold)
+    parser.add_argument("--static-quality-good-lag-seconds", type=float, default=d.static_quality_good_lag_seconds)
+    parser.add_argument("--static-quality-good-amp-log-tol", type=float, default=d.static_quality_good_amp_log_tol)
 
     parser.add_argument("--use-no-regression-guard", action="store_true",
                         default=d.use_no_regression_guard)
@@ -3399,6 +3634,18 @@ def parse_args() -> tuple[
         w_complex_amp_guard_x=float(args.w_complex_amp_guard_x),
         w_complex_amp_guard_y=float(args.w_complex_amp_guard_y),
         w_phase_gate_align=float(args.w_phase_gate_align),
+        use_static_quality_gate_suppression=bool(args.use_static_quality_gate_suppression),
+        w_static_good_gate_l1=float(args.w_static_good_gate_l1),
+        static_quality_observations=str(args.static_quality_observations),
+        static_quality_last_k=int(args.static_quality_last_k),
+        static_quality_start=float(args.static_quality_start),
+        static_quality_end=args.static_quality_end,
+        static_quality_window_seconds=float(args.static_quality_window_seconds),
+        static_quality_stride_seconds=float(args.static_quality_stride_seconds),
+        static_quality_max_lag_seconds=float(args.static_quality_max_lag_seconds),
+        static_quality_good_corr_threshold=float(args.static_quality_good_corr_threshold),
+        static_quality_good_lag_seconds=float(args.static_quality_good_lag_seconds),
+        static_quality_good_amp_log_tol=float(args.static_quality_good_amp_log_tol),
         use_no_regression_guard=bool(args.use_no_regression_guard),
         no_regression_guard_case_keywords=str(args.no_regression_guard_case_keywords),
         w_no_regression_response=float(args.w_no_regression_response),
@@ -3503,6 +3750,17 @@ def main() -> None:
             f"top_k={cfg.phase_window_top_k}, "
             f"gate_score_ref={cfg.phase_window_gate_score_ref}, "
             f"freq=[{cfg.phase_window_freq_min}, {cfg.phase_window_freq_max}]"
+        )
+    print(f"  use_static_quality_gate_suppression = {cfg.use_static_quality_gate_suppression}")
+    if bool(cfg.use_static_quality_gate_suppression):
+        print(
+            "  static_quality_gate = "
+            f"w_good_gate={cfg.w_static_good_gate_l1}, "
+            f"obs={cfg.static_quality_observations}, "
+            f"window={cfg.static_quality_window_seconds}, stride={cfg.static_quality_stride_seconds}, "
+            f"good_corr>={cfg.static_quality_good_corr_threshold}, "
+            f"good_lag<={cfg.static_quality_good_lag_seconds}, "
+            f"good_amp_log_tol={cfg.static_quality_good_amp_log_tol}"
         )
     print(f"  use_no_regression_guard = {cfg.use_no_regression_guard}")
     if bool(cfg.use_no_regression_guard):

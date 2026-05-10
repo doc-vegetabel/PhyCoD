@@ -876,3 +876,10 @@ alpha_y(t) + response/load + static conditioning 在 240-step 训练中有效。
 |---|---|---|---|---|
 | 2026-05-10 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 新增 | 新增 auxiliary guard-only cases：`--guard-load-files`、`--guard-case-paths`、`--w-guard-case-loss`。guard case 在训练中只反传 no-regression guard 与 theta/phase 正则，不参与强相位 adaptive/complex 主 loss，用于保护 simple/low 工况不被 high/complex 相位强化牺牲。 | strong phase balanced v2 |
 | 2026-05-10 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 修改 | `--prepare-cases` 时会把 guard load files 一并准备到 train split，但不会加入主 train case 列表；训练 history 新增 `train_guard_*` 指标，用于检查 guard loss、guard case ratio 和 phase gate 激活。 | strong phase balanced v2 |
+
+# 开发者日志
+
+| 修改时间 | 涉及脚本/文件 | 增改类型 | 修改内容 | 所属阶段 |
+|---|---|---|---|---|
+| 2026-05-10 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 新增 | 新增 static-quality gate suppression：`--use-static-quality-gate-suppression`、`--w-static-good-gate-l1` 及 `--static-quality-*` 配置。训练时按局部窗口比较 static student 与 teacher 的 corr/lag/amp，自动识别 static 已经足够好的窗口，并在这些窗口压低 `g_phase`，不依赖 case 名称。 | automatic gate selectivity |
+| 2026-05-10 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 修改 | `training_history.csv` 新增 `static_quality_*`、`static_good_gate_mean`、`static_bad_gate_mean`、`static_gate_selectivity_gap` 等指标，用于判断 gate 是否学会在 static-good 窗口关闭、在 static-bad 窗口保持可用。 | automatic gate selectivity |
