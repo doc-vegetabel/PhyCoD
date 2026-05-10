@@ -889,3 +889,10 @@ alpha_y(t) + response/load + static conditioning 在 240-step 训练中有效。
 | Time | Files | Change Type | Content | Stage |
 |---|---|---|---|---|
 | 2026-05-10 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Add | Add `--init-checkpoint` so a follow-up run can initialize model weights from an existing checkpoint without restoring optimizer state; this keeps LR and phase/gate loss weights adjustable for continuation experiments. | phase-gated fast residual training efficiency |
+
+# 2026-05-10 generalization training update
+
+| Time | Files | Change Type | Content | Stage |
+|---|---|---|---|---|
+| 2026-05-10 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Add | Add state-driven no-regression window guard controlled by `--use-state-window-no-regression-guard` and `--w-state-no-regression-*`; it uses local static-vs-teacher quality to protect already-good windows without relying on case-name keywords. | operating-condition generalization |
+| 2026-05-10 Asia/Shanghai | `scripts/generate_random_continuous_loads.py` | Add | Add random continuous load generator that copies a reference complex-case header and produces train/valid/test `.dat` files with randomized frequency mixtures, phases, amplitudes, spatial profiles, envelopes, and chirp components plus manifest/list files. | operating-condition generalization data |

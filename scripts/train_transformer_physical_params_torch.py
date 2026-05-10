@@ -499,6 +499,13 @@ class TransformerPhysicalTrainConfig:
     static_quality_good_corr_threshold: float = 0.995
     static_quality_good_lag_seconds: float = 0.02
     static_quality_good_amp_log_tol: float = 0.08
+    use_state_window_no_regression_guard: bool = False
+    w_state_no_regression_response: float = 0.0
+    w_state_no_regression_corr: float = 0.0
+    w_state_no_regression_amp: float = 0.0
+    state_no_regression_response_ratio_limit: float = 1.02
+    state_no_regression_corr_drop_tol: float = 0.01
+    state_no_regression_amp_log_tol: float = 0.08
 
     # Response-level no-regression guard for cases that should not be harmed
     # while high-frequency / complex phase correction is strengthened.
@@ -1323,8 +1330,17 @@ NO_REGRESSION_LOG_METRIC_KEYS = [
     "no_regression_x_lag_excess_s",
     "no_regression_y_lag_excess_s",
     "no_regression_x_amp_log_excess",
-        "no_regression_y_amp_log_excess",
-    ]
+    "no_regression_y_amp_log_excess",
+    "state_no_regression_guard_loss",
+    "state_no_regression_response_guard_loss",
+    "state_no_regression_corr_guard_loss",
+    "state_no_regression_amp_guard_loss",
+    "state_no_regression_good_window_ratio",
+    "state_no_regression_response_excess",
+    "state_no_regression_corr_drop_excess",
+    "state_no_regression_amp_log_excess",
+    "state_no_regression_n_windows",
+]
 
 GUARD_CASE_LOG_METRIC_KEYS = [
     "guard_case_count",
@@ -1657,6 +1673,21 @@ def _best_window_lag_corr_amp(
     return best_abs_lag_s.detach(), best_corr.detach(), amp_log_abs.detach()
 
 
+def _window_corr_and_amp_log_abs(
+        signal: torch.Tensor,
+        teacher_signal: torch.Tensor,
+        eps: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    s0 = signal - torch.mean(signal)
+    t0 = teacher_signal - torch.mean(teacher_signal)
+    denom = torch.sqrt(torch.sum(s0 * s0).clamp_min(eps) * torch.sum(t0 * t0).clamp_min(eps))
+    corr = torch.sum(s0 * t0) / denom.clamp_min(eps)
+    signal_rms = torch.sqrt(torch.mean(s0 * s0).clamp_min(eps))
+    teacher_rms = torch.sqrt(torch.mean(t0 * t0).clamp_min(eps))
+    amp_log_abs = torch.abs(torch.log(signal_rms.clamp_min(eps) / teacher_rms.clamp_min(eps)))
+    return corr, amp_log_abs
+
+
 def static_quality_gate_suppression_loss(
         *,
         static: torch.Tensor,
@@ -1782,6 +1813,160 @@ def static_quality_gate_suppression_loss(
         "static_quality_score_max": torch.max(score_t).detach(),
         "static_quality_gate_mean": torch.mean(gate_t).detach(),
         "static_quality_n_windows": torch.as_tensor(float(len(scores)), dtype=teacher.dtype, device=teacher.device),
+    }
+
+
+def state_window_no_regression_guard_loss(
+        *,
+        pred: torch.Tensor,
+        static: torch.Tensor,
+        teacher: torch.Tensor,
+        cfg: TransformerPhysicalTrainConfig,
+        x_idx: torch.Tensor,
+        y_idx: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    zero = torch.zeros((), dtype=pred.dtype, device=pred.device)
+    empty = {
+        "state_no_regression_guard_loss": zero,
+        "state_no_regression_response_guard_loss": zero,
+        "state_no_regression_corr_guard_loss": zero,
+        "state_no_regression_amp_guard_loss": zero,
+        "state_no_regression_good_window_ratio": zero.detach(),
+        "state_no_regression_response_excess": zero.detach(),
+        "state_no_regression_corr_drop_excess": zero.detach(),
+        "state_no_regression_amp_log_excess": zero.detach(),
+        "state_no_regression_n_windows": zero.detach(),
+    }
+    if not bool(getattr(cfg, "use_state_window_no_regression_guard", False)):
+        return empty
+
+    pred = pred.to(dtype=teacher.dtype, device=teacher.device)
+    static = static.to(dtype=teacher.dtype, device=teacher.device).detach()
+    teacher = teacher.to(dtype=pred.dtype, device=pred.device)
+    T = int(min(pred.shape[0], static.shape[0], teacher.shape[0]))
+    if T < 2:
+        return empty
+    pred = pred[:T]
+    static = static[:T]
+    teacher = teacher[:T]
+
+    dt = float(cfg.dt)
+    start = max(0, int(round(float(cfg.static_quality_start) / dt)))
+    end = T if cfg.static_quality_end is None else min(T, int(round(float(cfg.static_quality_end) / dt)))
+    win = max(2, int(round(float(cfg.static_quality_window_seconds) / dt)))
+    stride = max(1, int(round(float(cfg.static_quality_stride_seconds) / dt)))
+    if end - start < win:
+        return empty
+
+    obs_indices = (
+        _static_quality_observation_indices(
+            dof_indices=x_idx,
+            observations=str(cfg.static_quality_observations),
+            last_k=int(cfg.static_quality_last_k),
+        )
+        + _static_quality_observation_indices(
+            dof_indices=y_idx,
+            observations=str(cfg.static_quality_observations),
+            last_k=int(cfg.static_quality_last_k),
+        )
+    )
+    if not obs_indices:
+        return empty
+
+    eps = torch.as_tensor(1.0e-12, dtype=pred.dtype, device=pred.device)
+    response_terms = []
+    corr_terms = []
+    amp_terms = []
+    good_flags = []
+    response_excesses = []
+    corr_excesses = []
+    amp_excesses = []
+
+    for s0 in range(start, end - win + 1, stride):
+        s1 = s0 + win
+        per_signal_response = []
+        per_signal_corr = []
+        per_signal_amp = []
+        per_signal_good = []
+        per_signal_response_excess = []
+        per_signal_corr_excess = []
+        per_signal_amp_excess = []
+
+        for idx in obs_indices:
+            static_signal = torch.mean(static[s0:s1, idx], dim=-1)
+            pred_signal = torch.mean(pred[s0:s1, idx], dim=-1)
+            teacher_signal = torch.mean(teacher[s0:s1, idx], dim=-1)
+
+            abs_lag_s, static_best_corr, static_amp_log_abs = _best_window_lag_corr_amp(
+                static_signal,
+                teacher_signal,
+                dt=dt,
+                max_lag_seconds=float(cfg.static_quality_max_lag_seconds),
+                eps=eps,
+            )
+            static_corr_excess = torch.relu(
+                torch.as_tensor(float(cfg.static_quality_good_corr_threshold), dtype=pred.dtype, device=pred.device)
+                - static_best_corr
+            )
+            static_lag_excess = torch.relu(abs_lag_s - float(cfg.static_quality_good_lag_seconds)) / max(
+                float(cfg.static_quality_good_lag_seconds),
+                1.0e-12,
+            )
+            static_amp_excess = torch.relu(static_amp_log_abs - float(cfg.static_quality_good_amp_log_tol)) / max(
+                float(cfg.static_quality_good_amp_log_tol),
+                1.0e-12,
+            )
+            good = ((static_corr_excess + static_lag_excess + static_amp_excess) <= 1.0e-8).to(dtype=pred.dtype)
+
+            static_mse = torch.mean((static_signal - teacher_signal) ** 2).detach()
+            pred_mse = torch.mean((pred_signal - teacher_signal) ** 2)
+            response_ratio = pred_mse / static_mse.clamp_min(eps)
+            response_excess = torch.relu(response_ratio - float(cfg.state_no_regression_response_ratio_limit))
+
+            static_corr0, _ = _window_corr_and_amp_log_abs(static_signal, teacher_signal, eps)
+            pred_corr0, pred_amp_log_abs = _window_corr_and_amp_log_abs(pred_signal, teacher_signal, eps)
+            corr_drop = static_corr0.detach() - pred_corr0
+            corr_excess = torch.relu(corr_drop - float(cfg.state_no_regression_corr_drop_tol))
+            amp_excess = torch.relu(pred_amp_log_abs - float(cfg.state_no_regression_amp_log_tol))
+
+            per_signal_response.append(good * response_excess ** 2)
+            per_signal_corr.append(good * corr_excess ** 2)
+            per_signal_amp.append(good * amp_excess ** 2)
+            per_signal_good.append(good.detach())
+            per_signal_response_excess.append((good * response_excess).detach())
+            per_signal_corr_excess.append((good * corr_excess).detach())
+            per_signal_amp_excess.append((good * amp_excess).detach())
+
+        response_terms.append(torch.stack(per_signal_response).mean())
+        corr_terms.append(torch.stack(per_signal_corr).mean())
+        amp_terms.append(torch.stack(per_signal_amp).mean())
+        good_flags.append(torch.stack(per_signal_good).mean())
+        response_excesses.append(torch.stack(per_signal_response_excess).mean())
+        corr_excesses.append(torch.stack(per_signal_corr_excess).mean())
+        amp_excesses.append(torch.stack(per_signal_amp_excess).mean())
+
+    if not response_terms:
+        return empty
+
+    response_guard = torch.stack(response_terms).mean()
+    corr_guard = torch.stack(corr_terms).mean()
+    amp_guard = torch.stack(amp_terms).mean()
+    guard_loss = (
+        float(cfg.w_state_no_regression_response) * response_guard
+        + float(cfg.w_state_no_regression_corr) * corr_guard
+        + float(cfg.w_state_no_regression_amp) * amp_guard
+    )
+
+    return {
+        "state_no_regression_guard_loss": guard_loss,
+        "state_no_regression_response_guard_loss": response_guard,
+        "state_no_regression_corr_guard_loss": corr_guard,
+        "state_no_regression_amp_guard_loss": amp_guard,
+        "state_no_regression_good_window_ratio": torch.stack(good_flags).mean().detach(),
+        "state_no_regression_response_excess": torch.stack(response_excesses).mean().detach(),
+        "state_no_regression_corr_drop_excess": torch.stack(corr_excesses).mean().detach(),
+        "state_no_regression_amp_log_excess": torch.stack(amp_excesses).mean().detach(),
+        "state_no_regression_n_windows": torch.as_tensor(float(len(response_terms)), dtype=pred.dtype, device=pred.device),
     }
 
 
@@ -2055,6 +2240,14 @@ def compute_response_loss(
         x_idx=x_idx,
         y_idx=y_idx,
     )
+    state_no_regression = state_window_no_regression_guard_loss(
+        pred=pred,
+        static=case.u_static,
+        teacher=teacher,
+        cfg=cfg,
+        x_idx=x_idx,
+        y_idx=y_idx,
+    )
 
     # freq_loss 现在表示“频率/峰值/相位综合对齐损失”：
     # 全局频谱 + teacher-anchored peak-time + local cross-correlation lag
@@ -2082,9 +2275,19 @@ def compute_response_loss(
     reg_loss = base_reg_loss + phase_reg["phase_reg_loss"] + static_quality_gate["static_quality_gate_loss"]
 
     if bool(guard_only):
-        total_loss = no_regression["no_regression_guard_loss"] + reg_loss
+        total_loss = (
+            no_regression["no_regression_guard_loss"]
+            + state_no_regression["state_no_regression_guard_loss"]
+            + reg_loss
+        )
     else:
-        total_loss = response_loss + freq_loss + reg_loss + no_regression["no_regression_guard_loss"]
+        total_loss = (
+            response_loss
+            + freq_loss
+            + reg_loss
+            + no_regression["no_regression_guard_loss"]
+            + state_no_regression["state_no_regression_guard_loss"]
+        )
 
     result = {
         "total_loss": total_loss,
@@ -2111,6 +2314,15 @@ def compute_response_loss(
         "no_regression_y_lag_excess_s": no_regression["no_regression_y_lag_excess_s"],
         "no_regression_x_amp_log_excess": no_regression["no_regression_x_amp_log_excess"],
         "no_regression_y_amp_log_excess": no_regression["no_regression_y_amp_log_excess"],
+        "state_no_regression_guard_loss": state_no_regression["state_no_regression_guard_loss"],
+        "state_no_regression_response_guard_loss": state_no_regression["state_no_regression_response_guard_loss"],
+        "state_no_regression_corr_guard_loss": state_no_regression["state_no_regression_corr_guard_loss"],
+        "state_no_regression_amp_guard_loss": state_no_regression["state_no_regression_amp_guard_loss"],
+        "state_no_regression_good_window_ratio": state_no_regression["state_no_regression_good_window_ratio"],
+        "state_no_regression_response_excess": state_no_regression["state_no_regression_response_excess"],
+        "state_no_regression_corr_drop_excess": state_no_regression["state_no_regression_corr_drop_excess"],
+        "state_no_regression_amp_log_excess": state_no_regression["state_no_regression_amp_log_excess"],
+        "state_no_regression_n_windows": state_no_regression["state_no_regression_n_windows"],
         "reg_loss": reg_loss,
         "x_mse": x_mse,
         "y_mse": y_mse,
@@ -3367,6 +3579,23 @@ def parse_args() -> tuple[
     parser.add_argument("--static-quality-good-corr-threshold", type=float, default=d.static_quality_good_corr_threshold)
     parser.add_argument("--static-quality-good-lag-seconds", type=float, default=d.static_quality_good_lag_seconds)
     parser.add_argument("--static-quality-good-amp-log-tol", type=float, default=d.static_quality_good_amp_log_tol)
+    parser.add_argument("--use-state-window-no-regression-guard", action="store_true",
+                        default=d.use_state_window_no_regression_guard)
+    parser.add_argument("--no-state-window-no-regression-guard",
+                        dest="use_state_window_no_regression_guard",
+                        action="store_false")
+    parser.add_argument("--w-state-no-regression-response", type=float,
+                        default=d.w_state_no_regression_response)
+    parser.add_argument("--w-state-no-regression-corr", type=float,
+                        default=d.w_state_no_regression_corr)
+    parser.add_argument("--w-state-no-regression-amp", type=float,
+                        default=d.w_state_no_regression_amp)
+    parser.add_argument("--state-no-regression-response-ratio-limit", type=float,
+                        default=d.state_no_regression_response_ratio_limit)
+    parser.add_argument("--state-no-regression-corr-drop-tol", type=float,
+                        default=d.state_no_regression_corr_drop_tol)
+    parser.add_argument("--state-no-regression-amp-log-tol", type=float,
+                        default=d.state_no_regression_amp_log_tol)
 
     parser.add_argument("--use-no-regression-guard", action="store_true",
                         default=d.use_no_regression_guard)
@@ -3658,6 +3887,13 @@ def parse_args() -> tuple[
         static_quality_good_corr_threshold=float(args.static_quality_good_corr_threshold),
         static_quality_good_lag_seconds=float(args.static_quality_good_lag_seconds),
         static_quality_good_amp_log_tol=float(args.static_quality_good_amp_log_tol),
+        use_state_window_no_regression_guard=bool(args.use_state_window_no_regression_guard),
+        w_state_no_regression_response=float(args.w_state_no_regression_response),
+        w_state_no_regression_corr=float(args.w_state_no_regression_corr),
+        w_state_no_regression_amp=float(args.w_state_no_regression_amp),
+        state_no_regression_response_ratio_limit=float(args.state_no_regression_response_ratio_limit),
+        state_no_regression_corr_drop_tol=float(args.state_no_regression_corr_drop_tol),
+        state_no_regression_amp_log_tol=float(args.state_no_regression_amp_log_tol),
         use_no_regression_guard=bool(args.use_no_regression_guard),
         no_regression_guard_case_keywords=str(args.no_regression_guard_case_keywords),
         w_no_regression_response=float(args.w_no_regression_response),
