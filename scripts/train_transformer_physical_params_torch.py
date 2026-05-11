@@ -8,7 +8,7 @@ import os
 import sys
 import subprocess
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -558,6 +558,20 @@ class TransformerPhysicalTrainConfig:
     w_phase_gate_simple_l1: float = 5.0e-3
     phase_gate_active_threshold: float = 0.2
 
+    # Optional from-scratch curriculum. It leaves the model/core unchanged and
+    # only ramps selected loss weights across epochs.
+    use_loss_curriculum: bool = False
+    curriculum_phase_start_epoch: int = 40
+    curriculum_phase_full_epoch: int = 100
+    curriculum_guard_start_epoch: int = 80
+    curriculum_guard_full_epoch: int = 140
+    curriculum_lag_start_scale: float = 0.25
+    curriculum_phase_drift_start_scale: float = 0.0
+    curriculum_adaptive_phase_start_scale: float = 0.0
+    curriculum_gate_reg_start_scale: float = 0.05
+    curriculum_static_good_gate_start_scale: float = 0.0
+    curriculum_state_guard_start_scale: float = 0.0
+
     # best checkpoint selection: response / freq / mixed
     best_score_mode: str = "freq"
 
@@ -679,6 +693,153 @@ def _parse_path_list(value: Optional[str]) -> list[str]:
         return []
 
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _linear_curriculum_scale(
+        *,
+        epoch: int,
+        start_epoch: int,
+        full_epoch: int,
+        start_scale: float,
+) -> float:
+    """Return a clipped linear scale from start_scale to 1.0."""
+    start_epoch = int(start_epoch)
+    full_epoch = int(full_epoch)
+    start_scale = float(start_scale)
+    if full_epoch <= start_epoch:
+        return 1.0 if epoch >= start_epoch else start_scale
+    if epoch <= start_epoch:
+        return start_scale
+    if epoch >= full_epoch:
+        return 1.0
+    frac = float(epoch - start_epoch) / float(full_epoch - start_epoch)
+    return start_scale + frac * (1.0 - start_scale)
+
+
+def make_epoch_curriculum_cfg(
+        cfg: TransformerPhysicalTrainConfig,
+        epoch: int,
+) -> tuple[TransformerPhysicalTrainConfig, dict[str, float]]:
+    """
+    Build an epoch-local config with scheduled loss weights.
+
+    The schedule is intentionally loss-only: model parameters, registry, dynamic
+    physical core, and final theta interface are untouched.
+    """
+    if not bool(getattr(cfg, "use_loss_curriculum", False)):
+        metrics = {
+            "curriculum_enabled": 0.0,
+            "curriculum_phase_scale": 1.0,
+            "curriculum_adaptive_phase_scale": 1.0,
+            "curriculum_lag_scale": 1.0,
+            "curriculum_guard_scale": 1.0,
+            "curriculum_static_good_gate_scale": 1.0,
+            "curriculum_gate_reg_scale": 1.0,
+            "effective_w_lag_x": float(cfg.w_lag_x),
+            "effective_w_lag_y": float(cfg.w_lag_y),
+            "effective_w_peak_time_x": float(cfg.w_peak_time_x),
+            "effective_w_peak_time_y": float(cfg.w_peak_time_y),
+            "effective_w_phase_drift_lag_x": float(cfg.w_phase_drift_lag_x),
+            "effective_w_phase_drift_lag_y": float(cfg.w_phase_drift_lag_y),
+            "effective_w_phase_drift_rate_x": float(cfg.w_phase_drift_rate_x),
+            "effective_w_phase_drift_rate_y": float(cfg.w_phase_drift_rate_y),
+            "effective_w_phase_gate_l1": float(cfg.w_phase_gate_l1),
+            "effective_w_phase_gate_tv": float(cfg.w_phase_gate_tv),
+            "effective_w_phase_gate_simple_l1": float(cfg.w_phase_gate_simple_l1),
+            "effective_w_static_good_gate_l1": float(cfg.w_static_good_gate_l1),
+            "effective_w_state_no_regression_response": float(cfg.w_state_no_regression_response),
+            "effective_w_state_no_regression_corr": float(cfg.w_state_no_regression_corr),
+            "effective_w_state_no_regression_amp": float(cfg.w_state_no_regression_amp),
+        }
+        return cfg, metrics
+
+    phase_scale = _linear_curriculum_scale(
+        epoch=epoch,
+        start_epoch=int(cfg.curriculum_phase_start_epoch),
+        full_epoch=int(cfg.curriculum_phase_full_epoch),
+        start_scale=float(cfg.curriculum_phase_drift_start_scale),
+    )
+    adaptive_phase_scale = _linear_curriculum_scale(
+        epoch=epoch,
+        start_epoch=int(cfg.curriculum_phase_start_epoch),
+        full_epoch=int(cfg.curriculum_phase_full_epoch),
+        start_scale=float(cfg.curriculum_adaptive_phase_start_scale),
+    )
+    lag_scale = _linear_curriculum_scale(
+        epoch=epoch,
+        start_epoch=1,
+        full_epoch=int(cfg.curriculum_phase_full_epoch),
+        start_scale=float(cfg.curriculum_lag_start_scale),
+    )
+    guard_scale = _linear_curriculum_scale(
+        epoch=epoch,
+        start_epoch=int(cfg.curriculum_guard_start_epoch),
+        full_epoch=int(cfg.curriculum_guard_full_epoch),
+        start_scale=float(cfg.curriculum_state_guard_start_scale),
+    )
+    static_good_gate_scale = _linear_curriculum_scale(
+        epoch=epoch,
+        start_epoch=int(cfg.curriculum_guard_start_epoch),
+        full_epoch=int(cfg.curriculum_guard_full_epoch),
+        start_scale=float(cfg.curriculum_static_good_gate_start_scale),
+    )
+    gate_reg_scale = _linear_curriculum_scale(
+        epoch=epoch,
+        start_epoch=1,
+        full_epoch=int(cfg.curriculum_guard_full_epoch),
+        start_scale=float(cfg.curriculum_gate_reg_start_scale),
+    )
+
+    epoch_cfg = replace(
+        cfg,
+        w_peak_time_x=float(cfg.w_peak_time_x) * lag_scale,
+        w_peak_time_y=float(cfg.w_peak_time_y) * lag_scale,
+        w_lag_x=float(cfg.w_lag_x) * lag_scale,
+        w_lag_y=float(cfg.w_lag_y) * lag_scale,
+        w_adaptive_phase_x=float(cfg.w_adaptive_phase_x) * adaptive_phase_scale,
+        w_adaptive_phase_y=float(cfg.w_adaptive_phase_y) * adaptive_phase_scale,
+        w_complex_phase_x=float(cfg.w_complex_phase_x) * adaptive_phase_scale,
+        w_complex_phase_y=float(cfg.w_complex_phase_y) * adaptive_phase_scale,
+        w_complex_amp_guard_x=float(cfg.w_complex_amp_guard_x) * adaptive_phase_scale,
+        w_complex_amp_guard_y=float(cfg.w_complex_amp_guard_y) * adaptive_phase_scale,
+        w_phase_gate_align=float(cfg.w_phase_gate_align) * adaptive_phase_scale,
+        w_phase_drift_lag_x=float(cfg.w_phase_drift_lag_x) * phase_scale,
+        w_phase_drift_lag_y=float(cfg.w_phase_drift_lag_y) * phase_scale,
+        w_phase_drift_rate_x=float(cfg.w_phase_drift_rate_x) * phase_scale,
+        w_phase_drift_rate_y=float(cfg.w_phase_drift_rate_y) * phase_scale,
+        w_phase_gate_l1=float(cfg.w_phase_gate_l1) * gate_reg_scale,
+        w_phase_gate_tv=float(cfg.w_phase_gate_tv) * gate_reg_scale,
+        w_phase_gate_simple_l1=float(cfg.w_phase_gate_simple_l1) * gate_reg_scale,
+        w_static_good_gate_l1=float(cfg.w_static_good_gate_l1) * static_good_gate_scale,
+        w_state_no_regression_response=float(cfg.w_state_no_regression_response) * guard_scale,
+        w_state_no_regression_corr=float(cfg.w_state_no_regression_corr) * guard_scale,
+        w_state_no_regression_amp=float(cfg.w_state_no_regression_amp) * guard_scale,
+    )
+    metrics = {
+        "curriculum_enabled": 1.0,
+        "curriculum_phase_scale": float(phase_scale),
+        "curriculum_adaptive_phase_scale": float(adaptive_phase_scale),
+        "curriculum_lag_scale": float(lag_scale),
+        "curriculum_guard_scale": float(guard_scale),
+        "curriculum_static_good_gate_scale": float(static_good_gate_scale),
+        "curriculum_gate_reg_scale": float(gate_reg_scale),
+        "effective_w_lag_x": float(epoch_cfg.w_lag_x),
+        "effective_w_lag_y": float(epoch_cfg.w_lag_y),
+        "effective_w_peak_time_x": float(epoch_cfg.w_peak_time_x),
+        "effective_w_peak_time_y": float(epoch_cfg.w_peak_time_y),
+        "effective_w_phase_drift_lag_x": float(epoch_cfg.w_phase_drift_lag_x),
+        "effective_w_phase_drift_lag_y": float(epoch_cfg.w_phase_drift_lag_y),
+        "effective_w_phase_drift_rate_x": float(epoch_cfg.w_phase_drift_rate_x),
+        "effective_w_phase_drift_rate_y": float(epoch_cfg.w_phase_drift_rate_y),
+        "effective_w_phase_gate_l1": float(epoch_cfg.w_phase_gate_l1),
+        "effective_w_phase_gate_tv": float(epoch_cfg.w_phase_gate_tv),
+        "effective_w_phase_gate_simple_l1": float(epoch_cfg.w_phase_gate_simple_l1),
+        "effective_w_static_good_gate_l1": float(epoch_cfg.w_static_good_gate_l1),
+        "effective_w_state_no_regression_response": float(epoch_cfg.w_state_no_regression_response),
+        "effective_w_state_no_regression_corr": float(epoch_cfg.w_state_no_regression_corr),
+        "effective_w_state_no_regression_amp": float(epoch_cfg.w_state_no_regression_amp),
+    }
+    return epoch_cfg, metrics
 
 
 def _safe_case_stem(load_file: str | Path) -> str:
@@ -3635,6 +3796,23 @@ def parse_args() -> tuple[
     parser.add_argument("--w-phase-gate-tv", type=float, default=d.w_phase_gate_tv)
     parser.add_argument("--w-phase-gate-simple-l1", type=float, default=d.w_phase_gate_simple_l1)
     parser.add_argument("--phase-gate-active-threshold", type=float, default=d.phase_gate_active_threshold)
+    parser.add_argument("--use-loss-curriculum", action="store_true", default=d.use_loss_curriculum)
+    parser.add_argument("--no-loss-curriculum", dest="use_loss_curriculum", action="store_false")
+    parser.add_argument("--curriculum-phase-start-epoch", type=int, default=d.curriculum_phase_start_epoch)
+    parser.add_argument("--curriculum-phase-full-epoch", type=int, default=d.curriculum_phase_full_epoch)
+    parser.add_argument("--curriculum-guard-start-epoch", type=int, default=d.curriculum_guard_start_epoch)
+    parser.add_argument("--curriculum-guard-full-epoch", type=int, default=d.curriculum_guard_full_epoch)
+    parser.add_argument("--curriculum-lag-start-scale", type=float, default=d.curriculum_lag_start_scale)
+    parser.add_argument("--curriculum-phase-drift-start-scale", type=float,
+                        default=d.curriculum_phase_drift_start_scale)
+    parser.add_argument("--curriculum-adaptive-phase-start-scale", type=float,
+                        default=d.curriculum_adaptive_phase_start_scale)
+    parser.add_argument("--curriculum-gate-reg-start-scale", type=float,
+                        default=d.curriculum_gate_reg_start_scale)
+    parser.add_argument("--curriculum-static-good-gate-start-scale", type=float,
+                        default=d.curriculum_static_good_gate_start_scale)
+    parser.add_argument("--curriculum-state-guard-start-scale", type=float,
+                        default=d.curriculum_state_guard_start_scale)
     parser.add_argument("--w-tip-y", type=float, default=d.w_tip_y)
     parser.add_argument("--w-last5-y", type=float, default=d.w_last5_y)
 
@@ -3977,6 +4155,17 @@ def parse_args() -> tuple[
         w_phase_gate_tv=args.w_phase_gate_tv,
         w_phase_gate_simple_l1=args.w_phase_gate_simple_l1,
         phase_gate_active_threshold=float(args.phase_gate_active_threshold),
+        use_loss_curriculum=bool(args.use_loss_curriculum),
+        curriculum_phase_start_epoch=int(args.curriculum_phase_start_epoch),
+        curriculum_phase_full_epoch=int(args.curriculum_phase_full_epoch),
+        curriculum_guard_start_epoch=int(args.curriculum_guard_start_epoch),
+        curriculum_guard_full_epoch=int(args.curriculum_guard_full_epoch),
+        curriculum_lag_start_scale=float(args.curriculum_lag_start_scale),
+        curriculum_phase_drift_start_scale=float(args.curriculum_phase_drift_start_scale),
+        curriculum_adaptive_phase_start_scale=float(args.curriculum_adaptive_phase_start_scale),
+        curriculum_gate_reg_start_scale=float(args.curriculum_gate_reg_start_scale),
+        curriculum_static_good_gate_start_scale=float(args.curriculum_static_good_gate_start_scale),
+        curriculum_state_guard_start_scale=float(args.curriculum_state_guard_start_scale),
         w_tip_y=args.w_tip_y,
         w_last5_y=args.w_last5_y,
         w_spec_x=args.w_spec_x,
@@ -4150,6 +4339,16 @@ def main() -> None:
     if bool(getattr(cfg, "use_phase_gated_decomposition", False)):
         print(f"  phase_gate_active_threshold = {cfg.phase_gate_active_threshold}")
     print(f"  best_score_mode = {cfg.best_score_mode}")
+    print(f"  use_loss_curriculum = {cfg.use_loss_curriculum}")
+    if bool(cfg.use_loss_curriculum):
+        print(
+            "  loss_curriculum = "
+            f"phase_start/full={cfg.curriculum_phase_start_epoch}/{cfg.curriculum_phase_full_epoch}, "
+            f"guard_start/full={cfg.curriculum_guard_start_epoch}/{cfg.curriculum_guard_full_epoch}, "
+            f"lag_start_scale={cfg.curriculum_lag_start_scale}, "
+            f"phase_drift_start_scale={cfg.curriculum_phase_drift_start_scale}, "
+            f"gate_reg_start_scale={cfg.curriculum_gate_reg_start_scale}"
+        )
     print(
         f"  branches: response={cfg.use_response_branch}, load={cfg.use_load_branch}, geometry={cfg.use_geometry_branch}")
     print(f"  condition_dynamic_branches_on_geometry = {cfg.condition_dynamic_branches_on_geometry}")
@@ -4506,13 +4705,14 @@ def main() -> None:
     last_valid_epoch: int = -1
 
     for epoch in range(1, int(cfg.epochs) + 1):
+        epoch_cfg, curriculum_metrics = make_epoch_curriculum_cfg(cfg, epoch)
 
         train_eval = train_cases_grad_accum(
             model=model,
             cases=train_cases,
             guard_cases=guard_cases,
             geometry=geometry,
-            cfg=cfg,
+            cfg=epoch_cfg,
             x_idx=x_idx,
             y_idx=y_idx,
             tip_y_idx=tip_y_idx,
@@ -4539,7 +4739,7 @@ def main() -> None:
                 model=model,
                 cases=valid_cases,
                 geometry=geometry,
-                cfg=cfg,
+                cfg=epoch_cfg,
                 x_idx=x_idx,
                 y_idx=y_idx,
                 tip_y_idx=tip_y_idx,
@@ -4555,9 +4755,9 @@ def main() -> None:
             if valid_eval is None:
                 score = float("inf")
             else:
-                score = select_best_score(valid_eval, cfg)
+                score = select_best_score(valid_eval, epoch_cfg)
         else:
-            score = select_best_score(train_eval, cfg)
+            score = select_best_score(train_eval, epoch_cfg)
 
         # Construct metrics block for best checkpoint evaluation
         if run_valid_this_epoch and valid_eval is not None:
@@ -4570,7 +4770,7 @@ def main() -> None:
 
             eligible_for_best, best_gate_reason = can_update_best_checkpoint(
                 valid_metrics=valid_metrics_for_best,
-                cfg=cfg,
+                cfg=epoch_cfg,
             )
 
             improved = bool(
@@ -4595,6 +4795,8 @@ def main() -> None:
                     "encoder_state_dict": model.encoder.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "cfg": asdict(cfg),
+                    "effective_cfg": asdict(epoch_cfg),
+                    "curriculum_metrics": curriculum_metrics,
                     "registry": registry.summary(),
                     "best_score": best_score,
                     "best_gate_reason": str(best_gate_reason),
@@ -4681,6 +4883,7 @@ def main() -> None:
             "best_score_mode": str(cfg.best_score_mode),
             "x_best_constraint_max": float(cfg.x_best_constraint_max),
             "use_x_constraint_for_best": int(bool(cfg.use_x_constraint_for_best)),
+            **curriculum_metrics,
 
             "grad_norm": float(grad_norm.detach().cpu()) if torch.is_tensor(grad_norm) else float(grad_norm),
             "valid_ran": int(bool(run_valid_this_epoch)),
@@ -4786,6 +4989,17 @@ def main() -> None:
                 f"theta_max={row['train_theta_abs_max']:.4e} "
                 f"lr={current_lr:.3e}"
             )
+            if bool(cfg.use_loss_curriculum):
+                print(
+                    "          "
+                    f"curriculum phase={row['curriculum_phase_scale']:.3f} "
+                    f"lag={row['curriculum_lag_scale']:.3f} "
+                    f"guard={row['curriculum_guard_scale']:.3f} "
+                    f"gate_reg={row['curriculum_gate_reg_scale']:.3f} "
+                    f"w_drift_y=({row['effective_w_phase_drift_lag_y']:.3e},"
+                    f"{row['effective_w_phase_drift_rate_y']:.3e}) "
+                    f"w_gate_l1={row['effective_w_phase_gate_l1']:.3e}"
+                )
             if bool(cfg.profile_train_timing):
                 print(
                     "          "
@@ -4810,6 +5024,8 @@ def main() -> None:
                     "encoder_state_dict": model.encoder.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "cfg": asdict(cfg),
+                    "effective_cfg": asdict(epoch_cfg),
+                    "curriculum_metrics": curriculum_metrics,
                     "registry": registry.summary(),
                     "score": score,
                 },
@@ -4839,6 +5055,10 @@ def main() -> None:
     print()
     print("[5/6] Save final artifacts")
 
+    final_epoch_cfg, final_curriculum_metrics = make_epoch_curriculum_cfg(
+        cfg,
+        int(history[-1]["epoch"]) if history else 0,
+    )
     torch.save(
         {
             "epoch": history[-1]["epoch"] if history else 0,
@@ -4846,6 +5066,8 @@ def main() -> None:
             "encoder_state_dict": model.encoder.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "cfg": asdict(cfg),
+            "effective_cfg": asdict(final_epoch_cfg),
+            "curriculum_metrics": final_curriculum_metrics,
             "registry": registry.summary(),
             "best_score": best_score,
             "best_epoch": best_epoch,

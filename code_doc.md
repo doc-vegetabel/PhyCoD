@@ -261,3 +261,11 @@ python tests/compare_full_corrected_core_vs_student.py --time-series-load-file d
 |---|---|---|---|---|
 | 2026-05-10 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 新增自动 gate 选择性训练项 | 新增 `--use-static-quality-gate-suppression`、`--w-static-good-gate-l1` 和 `--static-quality-*` 参数。训练时对局部窗口计算 static student 相对 teacher 的 corr、best-lag 和 RMS 幅值比；若 static 已经满足 good-window 条件，则对该窗口 `g_phase` 施加 L1 抑制，促使模型自动识别“不需要 fast phase correction”的窗口。 | automatic gate selectivity |
 | 2026-05-10 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 扩展日志指标 | `training_history.csv` 新增 `static_quality_gate_loss`、`static_good_gate_mean`、`static_bad_gate_mean`、`static_gate_selectivity_gap`、`static_good_window_ratio` 等指标，用于检查 gate 是否从 case-name 保护转向基于响应质量的自动选择。 | automatic gate selectivity |
+---
+
+## 18. 2026-05-11 from-scratch loss curriculum update
+
+| Time | Files | Required Note | Content | Stage |
+|---|---|---|---|---|
+| 2026-05-11 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Add configurable from-scratch curriculum | Add `--use-loss-curriculum` and `--curriculum-*` options. When enabled, the training loop builds an epoch-local config that ramps local lag/peak-time loss, adaptive/complex phase loss, high-frequency phase-drift loss, phase-gate regularization, static-quality gate suppression, and state-window no-regression weights without changing the model architecture, physical registry, or `theta=[alpha_x_total, alpha_xy_total]` core interface. | from-scratch frequency/phase curriculum |
+| 2026-05-11 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Add curriculum diagnostics | `training_history.csv` now records curriculum scales and effective epoch weights such as `curriculum_phase_scale`, `curriculum_lag_scale`, `curriculum_guard_scale`, `effective_w_phase_drift_*`, `effective_w_phase_gate_l1`, and `effective_w_state_no_regression_*`; checkpoints also store the base config, effective epoch config, and curriculum metrics. | from-scratch frequency/phase curriculum |

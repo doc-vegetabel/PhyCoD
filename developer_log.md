@@ -904,3 +904,9 @@ alpha_y(t) + response/load + static conditioning 在 240-step 训练中有效。
 | 2026-05-11 Asia/Shanghai | `src/student/transformer/frequency_losses.py` | Add | Add `phase_drift_rate_loss(...)`, a high-frequency-window weighted loss that penalizes both local soft lag and consecutive-window lag drift, targeting accumulated late-time phase error under sustained high-frequency excitation. | high-frequency phase retention |
 | 2026-05-11 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Add | Expose `--use-phase-drift-rate-loss`, `--w-phase-drift-*`, and `--phase-drift-*` CLI/config fields; include `phase_drift_*` diagnostics in training history and add the weighted drift loss to `freq_loss`. | high-frequency phase retention |
 | 2026-05-11 Asia/Shanghai | `scripts/generate_random_continuous_loads.py` | Modify | Add `--families`, `--chirp-weight-max`, and `--burst-weight-max` so the same generator can create sustained high-periodic replay families without burst/chirp dilution. | high-frequency replay data |
+# 2026-05-11 from-scratch loss curriculum update
+
+| Time | Files | Change Type | Content | Stage |
+|---|---|---|---|---|
+| 2026-05-11 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Add | Add optional `--use-loss-curriculum` training mode with epoch-local loss-weight scheduling for lag/peak-time, adaptive/complex phase, high-frequency phase-drift, phase-gate regularization, static-quality gate suppression, and state-window no-regression terms. Defaults remain disabled, so existing commands keep the same behavior. | from-scratch frequency/phase curriculum |
+| 2026-05-11 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Modify | Train/valid evaluation now uses the scheduled epoch config when curriculum mode is enabled, and history/checkpoints record curriculum scales plus effective weights to diagnose whether phase/gate/guard ramps are active. | from-scratch frequency/phase curriculum |
