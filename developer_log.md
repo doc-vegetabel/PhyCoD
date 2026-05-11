@@ -896,3 +896,11 @@ alpha_y(t) + response/load + static conditioning 在 240-step 训练中有效。
 |---|---|---|---|---|
 | 2026-05-10 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Add | Add state-driven no-regression window guard controlled by `--use-state-window-no-regression-guard` and `--w-state-no-regression-*`; it uses local static-vs-teacher quality to protect already-good windows without relying on case-name keywords. | operating-condition generalization |
 | 2026-05-10 Asia/Shanghai | `scripts/generate_random_continuous_loads.py` | Add | Add random continuous load generator that copies a reference complex-case header and produces train/valid/test `.dat` files with randomized frequency mixtures, phases, amplitudes, spatial profiles, envelopes, and chirp components plus manifest/list files. | operating-condition generalization data |
+
+# 2026-05-11 high-frequency phase-drift update
+
+| Time | Files | Change Type | Content | Stage |
+|---|---|---|---|---|
+| 2026-05-11 Asia/Shanghai | `src/student/transformer/frequency_losses.py` | Add | Add `phase_drift_rate_loss(...)`, a high-frequency-window weighted loss that penalizes both local soft lag and consecutive-window lag drift, targeting accumulated late-time phase error under sustained high-frequency excitation. | high-frequency phase retention |
+| 2026-05-11 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Add | Expose `--use-phase-drift-rate-loss`, `--w-phase-drift-*`, and `--phase-drift-*` CLI/config fields; include `phase_drift_*` diagnostics in training history and add the weighted drift loss to `freq_loss`. | high-frequency phase retention |
+| 2026-05-11 Asia/Shanghai | `scripts/generate_random_continuous_loads.py` | Modify | Add `--families`, `--chirp-weight-max`, and `--burst-weight-max` so the same generator can create sustained high-periodic replay families without burst/chirp dilution. | high-frequency replay data |

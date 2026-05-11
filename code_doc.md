@@ -15,6 +15,14 @@
 | 2026-05-10 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 新增状态驱动 no-regression window guard | 新增 `--use-state-window-no-regression-guard` 及 `--w-state-no-regression-*` 参数；训练时不依赖 case name，而是使用 static-vs-teacher 局部窗口质量自动识别 static-good 窗口，并约束 pred 在这些窗口内的响应误差、相关性和幅值不要相对 static 退化。 | 工况泛化训练 |
 | 2026-05-10 Asia/Shanghai | `scripts/generate_random_continuous_loads.py` | 新增随机连续载荷生成脚本 | 新脚本读取参考 complex case 的前三行表头格式，生成随机连续频率、相位、幅值、空间分布、多频/包络/chirp 混合的 train/valid/test dat 载荷组，并输出 manifest 与 load file list。 | 工况泛化数据构造 |
 
+## 2026-05-11 high-frequency phase-drift update
+
+| 修改时间 | 涉及脚本/文件 | 需增改说明 | 修改内容 | 所属阶段 |
+|---|---|---|---|---|
+| 2026-05-11 Asia/Shanghai | `src/student/transformer/frequency_losses.py` | 新增高频相位漂移率损失 | 新增 `phase_drift_rate_loss(...)`，在局部窗口上按 teacher 高频频带能量自动加权，惩罚 soft lag 及相邻窗口 lag 增量，用于约束高频持续激励下的后期相位累积漂移。 | high-frequency phase retention |
+| 2026-05-11 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | 接入 phase drift-rate loss | 新增 `--use-phase-drift-rate-loss`、`--w-phase-drift-*` 和 `--phase-drift-*` 参数，并将 `phase_drift_loss` 及相关诊断指标写入 `training_history.csv`。 | high-frequency phase retention |
+| 2026-05-11 Asia/Shanghai | `scripts/generate_random_continuous_loads.py` | 扩展高频持续周期数据生成能力 | 新增 `--families`、`--chirp-weight-max`、`--burst-weight-max` 参数，可生成仅包含 single/multi 的持续高频周期载荷族；已用于构造 `data/load/high_periodic_alpha_v1`，该数据目录不纳入 git。 | high-frequency replay data |
+
 本说明书仅涵盖当前项目的主线代码、核心脚本、叶片参数文件及验证规划。旧版的 `physics_difference` / 模态 (modal) / 缩减阶 (reduced) 相关脚本已移出主线，不在此列。
 
 ---

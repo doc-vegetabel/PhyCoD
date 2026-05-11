@@ -635,6 +635,231 @@ def _soft_lag_loss_and_score_from_window(
     }
 
 
+def _high_band_power_weight_from_window(
+    target_win: torch.Tensor,
+    *,
+    dt: float,
+    freq_min: float = 0.50,
+    freq_max: float | None = 1.20,
+    threshold: float = 0.20,
+    temperature: float = 0.08,
+    eps: float = 1.0e-12,
+) -> torch.Tensor:
+    """Detached soft weight for windows dominated by sustained high-frequency content."""
+    if target_win.numel() < 8:
+        return torch.zeros((), device=target_win.device, dtype=target_win.dtype)
+
+    y = target_win.detach() - target_win.detach().mean()
+    spec = torch.fft.rfft(y, dim=0)
+    power = spec.real.square() + spec.imag.square()
+    freqs = torch.fft.rfftfreq(y.numel(), d=float(dt), device=y.device).to(dtype=y.dtype)
+    mask = freqs >= float(freq_min)
+    if freq_max is not None:
+        mask = mask & (freqs <= float(freq_max))
+    total = power.sum().clamp_min(eps)
+    high_ratio = torch.where(mask.any(), power[mask].sum() / total, torch.zeros_like(total))
+    tau = max(float(temperature), 1.0e-8)
+    return torch.sigmoid((high_ratio - float(threshold)) / tau).detach()
+
+
+def _soft_lag_steps_from_window(
+    pred_win: torch.Tensor,
+    target_win: torch.Tensor,
+    *,
+    dt: float,
+    max_lag_seconds: float = 0.50,
+    temperature: float = 0.04,
+    eps: float = 1.0e-12,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Differentiable soft lag plus detached hard-lag/corr diagnostics for one window."""
+    p = (pred_win - pred_win.mean()) / pred_win.std().clamp_min(eps)
+    t = (target_win - target_win.mean()) / target_win.std().clamp_min(eps)
+    max_lag_steps = max(1, int(round(float(max_lag_seconds) / float(dt))))
+    tau = max(float(temperature), 1.0e-8)
+
+    corrs: list[torch.Tensor] = []
+    valid_lags: list[int] = []
+    for lag in range(-max_lag_steps, max_lag_steps + 1):
+        if lag < 0:
+            p_l = p[:lag]
+            t_l = t[-lag:]
+        elif lag > 0:
+            p_l = p[lag:]
+            t_l = t[:-lag]
+        else:
+            p_l = p
+            t_l = t
+        if p_l.numel() < 8:
+            continue
+        corrs.append(torch.mean(p_l * t_l))
+        valid_lags.append(int(lag))
+
+    if not corrs:
+        zero = pred_win.sum() * 0.0
+        return zero, zero.detach(), zero.detach()
+
+    corr_tensor = torch.stack(corrs)
+    lag_tensor = torch.tensor(valid_lags, device=pred_win.device, dtype=pred_win.dtype)
+    weights = torch.softmax(corr_tensor / tau, dim=0)
+    soft_lag_steps = torch.sum(weights * lag_tensor)
+
+    with torch.no_grad():
+        best_idx = int(torch.argmax(corr_tensor.detach()).item())
+        best_abs_lag_s = torch.as_tensor(
+            abs(float(valid_lags[best_idx])) * float(dt),
+            device=pred_win.device,
+            dtype=pred_win.dtype,
+        )
+        best_corr = corr_tensor.detach()[best_idx].to(device=pred_win.device, dtype=pred_win.dtype)
+
+    return soft_lag_steps, best_abs_lag_s, best_corr
+
+
+def phase_drift_rate_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    dt: float,
+    dof_indices: torch.Tensor,
+    observations: str | Sequence[str] = "tip,last5",
+    last_k: int = 5,
+    start_time: float = 0.0,
+    end_time: float | None = None,
+    window_seconds: float = 1.54,
+    stride_seconds: float = 0.32,
+    max_lag_seconds: float = 0.50,
+    lag_temperature: float = 0.04,
+    freq_min: float = 0.50,
+    freq_max: float | None = 1.20,
+    high_power_threshold: float = 0.20,
+    high_power_temperature: float = 0.08,
+    eps: float = 1.0e-12,
+) -> dict[str, torch.Tensor]:
+    """
+    Penalize accumulated phase drift in high-frequency local windows.
+
+    The loss first computes a soft lag for consecutive windows, then penalizes:
+      1. non-zero lag in high-frequency windows;
+      2. changes in lag between consecutive high-frequency windows.
+
+    High-frequency windows are selected by target-window spectral content, not
+    by case name. This directly targets late high-frequency phase drift.
+    """
+    pred_btd = _as_btd(pred)
+    target_btd = _as_btd(target)
+    if pred_btd.shape != target_btd.shape:
+        raise ValueError(f"pred/target shape mismatch: {tuple(pred_btd.shape)} vs {tuple(target_btd.shape)}")
+
+    B, T, _ = pred_btd.shape
+    obs_list = _parse_observations(observations)
+    idx = dof_indices.to(device=pred_btd.device, dtype=torch.long)
+
+    start_idx = max(0, int(round(float(start_time) / float(dt))))
+    end_idx = T if end_time is None else min(T, int(round(float(end_time) / float(dt))) + 1)
+    win_steps = max(8, int(round(float(window_seconds) / float(dt))))
+    stride_steps = max(1, int(round(float(stride_seconds) / float(dt))))
+    max_lag_steps = max(1, int(round(float(max_lag_seconds) / float(dt))))
+    zero = _zero_like_signal_loss(pred_btd)
+
+    if end_idx - start_idx < win_steps:
+        return {
+            "loss": zero,
+            "lag_loss": zero,
+            "drift_loss": zero,
+            "mean_abs_lag_s": zero.detach(),
+            "mean_abs_dlag_s": zero.detach(),
+            "high_weight_mean": zero.detach(),
+            "n_windows": torch.as_tensor(0.0, device=pred_btd.device, dtype=pred_btd.dtype),
+        }
+
+    lag_loss_terms: list[torch.Tensor] = []
+    drift_loss_terms: list[torch.Tensor] = []
+    abs_lag_terms: list[torch.Tensor] = []
+    abs_dlag_terms: list[torch.Tensor] = []
+    high_weights_all: list[torch.Tensor] = []
+    n_windows = 0
+
+    for obs in obs_list:
+        pred_sig = direction_observation_signal(
+            pred_btd,
+            dof_indices=idx,
+            observation=obs,
+            last_k=last_k,
+        )
+        target_sig = direction_observation_signal(
+            target_btd,
+            dof_indices=idx,
+            observation=obs,
+            last_k=last_k,
+        )
+        for b in range(B):
+            window_lags: list[torch.Tensor] = []
+            window_weights: list[torch.Tensor] = []
+            for lo in range(start_idx, end_idx - win_steps + 1, stride_steps):
+                hi = lo + win_steps
+                p = pred_sig[b, lo:hi]
+                t = target_sig[b, lo:hi]
+                soft_lag_steps, hard_abs_lag_s, _ = _soft_lag_steps_from_window(
+                    p,
+                    t,
+                    dt=dt,
+                    max_lag_seconds=max_lag_seconds,
+                    temperature=lag_temperature,
+                    eps=eps,
+                )
+                weight = _high_band_power_weight_from_window(
+                    t,
+                    dt=dt,
+                    freq_min=freq_min,
+                    freq_max=freq_max,
+                    threshold=high_power_threshold,
+                    temperature=high_power_temperature,
+                    eps=eps,
+                )
+                lag_loss_terms.append(weight * (soft_lag_steps / float(max_lag_steps)) ** 2)
+                abs_lag_terms.append(weight * hard_abs_lag_s)
+                high_weights_all.append(weight)
+                window_lags.append(soft_lag_steps)
+                window_weights.append(weight)
+                n_windows += 1
+
+            if len(window_lags) >= 2:
+                lag_t = torch.stack(window_lags)
+                weight_t = torch.stack(window_weights)
+                dlag = lag_t[1:] - lag_t[:-1]
+                pair_weight = torch.minimum(weight_t[1:], weight_t[:-1]).detach()
+                drift_loss_terms.append(torch.mean(pair_weight * (dlag / float(max_lag_steps)) ** 2))
+                abs_dlag_terms.append(torch.mean(pair_weight * torch.abs(dlag) * float(dt)))
+
+    if not lag_loss_terms:
+        return {
+            "loss": zero,
+            "lag_loss": zero,
+            "drift_loss": zero,
+            "mean_abs_lag_s": zero.detach(),
+            "mean_abs_dlag_s": zero.detach(),
+            "high_weight_mean": zero.detach(),
+            "n_windows": torch.as_tensor(0.0, device=pred_btd.device, dtype=pred_btd.dtype),
+        }
+
+    lag_loss = torch.stack(lag_loss_terms).mean()
+    drift_loss = torch.stack(drift_loss_terms).mean() if drift_loss_terms else zero
+    loss = lag_loss + drift_loss
+    mean_abs_lag_s = torch.stack(abs_lag_terms).mean().detach()
+    mean_abs_dlag_s = torch.stack(abs_dlag_terms).mean().detach() if abs_dlag_terms else zero.detach()
+    high_weight_mean = torch.stack(high_weights_all).mean().detach()
+
+    return {
+        "loss": loss,
+        "lag_loss": lag_loss,
+        "drift_loss": drift_loss,
+        "mean_abs_lag_s": mean_abs_lag_s,
+        "mean_abs_dlag_s": mean_abs_dlag_s,
+        "high_weight_mean": high_weight_mean,
+        "n_windows": torch.as_tensor(float(n_windows), device=pred_btd.device, dtype=pred_btd.dtype),
+    }
+
+
 def adaptive_phase_window_loss(
     pred: torch.Tensor,
     target: torch.Tensor,

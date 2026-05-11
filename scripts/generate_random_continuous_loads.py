@@ -194,9 +194,12 @@ def sample_spec(
         freq_max: float,
         max_components: int,
         profile_names: list[str],
+        family_names: list[str],
+        chirp_weight_max: float,
+        burst_weight_max: float,
         rng: np.random.Generator,
 ) -> RandomLoadSpec:
-    family = str(rng.choice(["single", "multi", "burst", "chirp_mix"]))
+    family = str(rng.choice(family_names))
     n_components = 1 if family == "single" else int(rng.integers(2, max_components + 1))
     profile = str(rng.choice(profile_names))
     fx_scale = float(rng.uniform(0.25, 1.0))
@@ -205,8 +208,10 @@ def sample_spec(
         fx_scale *= 0.25
     if rng.random() < 0.2:
         fy_scale *= 0.25
-    chirp_weight = float(rng.uniform(0.0, 0.45 if family == "chirp_mix" else 0.20))
-    burst_weight = float(rng.uniform(0.0, 1.0 if family == "burst" else 0.35))
+    chirp_cap = float(chirp_weight_max) if family == "chirp_mix" else min(float(chirp_weight_max), 0.20)
+    burst_cap = float(burst_weight_max) if family == "burst" else min(float(burst_weight_max), 0.35)
+    chirp_weight = float(rng.uniform(0.0, max(0.0, chirp_cap)))
+    burst_weight = float(rng.uniform(0.0, max(0.0, burst_cap)))
     name = f"rand_{split}_{case_id:04d}_{family}_{profile}".replace(".", "p")
     return RandomLoadSpec(
         split=split,
@@ -346,6 +351,17 @@ def parse_profiles(value: str) -> list[str]:
     return profiles
 
 
+def parse_families(value: str) -> list[str]:
+    families = [v.strip() for v in value.split(",") if v.strip()]
+    allowed = {"single", "multi", "burst", "chirp_mix"}
+    bad = [v for v in families if v not in allowed]
+    if bad:
+        raise ValueError(f"Unsupported families {bad}; allowed: {sorted(allowed)}")
+    if not families:
+        raise ValueError("at least one family is required")
+    return families
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-root", type=Path, default=Path("data/load/random_continuous_alpha_v1"))
@@ -366,6 +382,14 @@ def main() -> None:
     parser.add_argument("--precision", type=int, default=4)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument(
+        "--families",
+        type=str,
+        default="single,multi,burst,chirp_mix",
+        help="Comma-separated load families: single,multi,burst,chirp_mix.",
+    )
+    parser.add_argument("--chirp-weight-max", type=float, default=0.45)
+    parser.add_argument("--burst-weight-max", type=float, default=1.0)
+    parser.add_argument(
         "--spatial-profiles",
         type=str,
         default="tip,last5,last10,fullspan_linear,fullspan_smooth,fullspan_quadratic,midspan_gaussian,random_smooth",
@@ -383,6 +407,7 @@ def main() -> None:
     output_root = args.output_root
     output_root.mkdir(parents=True, exist_ok=True)
     profiles = parse_profiles(args.spatial_profiles)
+    families = parse_families(args.families)
     counts = split_counts(args.n_train, args.n_valid, args.n_test)
     root_rng = np.random.default_rng(int(args.seed))
     rows: list[dict[str, object]] = []
@@ -393,6 +418,7 @@ def main() -> None:
     print(f"  n_nodes     = {n_nodes}")
     print(f"  counts      = train {args.n_train}, valid {args.n_valid}, test {args.n_test}")
     print(f"  freq_range  = [{args.freq_min}, {args.freq_max}] Hz")
+    print(f"  families    = {','.join(families)}")
 
     for split, count in counts.items():
         for i in range(1, count + 1):
@@ -406,6 +432,9 @@ def main() -> None:
                 freq_max=float(args.freq_max),
                 max_components=int(args.max_components),
                 profile_names=profiles,
+                family_names=families,
+                chirp_weight_max=float(args.chirp_weight_max),
+                burst_weight_max=float(args.burst_weight_max),
                 rng=rng,
             )
             out_path = output_root / split / f"{spec.case_name}.dat"
