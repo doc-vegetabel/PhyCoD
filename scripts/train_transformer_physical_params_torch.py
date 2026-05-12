@@ -521,6 +521,14 @@ class TransformerPhysicalTrainConfig:
     phase_drift_amplitude_max_weight: float = 4.0
     phase_drift_static_failure_weight: float = 0.0
     phase_drift_static_failure_max_weight: float = 4.0
+    use_slow_only_branch_diagnosis: bool = False
+    w_slow_good_no_regression: float = 0.0
+    w_slow_good_fast_suppress: float = 0.0
+    w_slow_bad_phase: float = 0.0
+    slow_good_response_ratio_limit: float = 1.02
+    slow_good_corr_drop_tol: float = 0.01
+    slow_good_amp_log_tol: float = 0.08
+    slow_bad_weight_max: float = 3.0
     use_static_quality_gate_suppression: bool = False
     w_static_good_gate_l1: float = 0.0
     static_quality_observations: str = "tip,last5"
@@ -1514,6 +1522,18 @@ ADAPTIVE_PHASE_LOG_METRIC_KEYS = [
     "phase_drift_y_combined_weight_mean",
     "phase_drift_x_n_windows",
     "phase_drift_y_n_windows",
+    "slow_only_diagnosis_loss",
+    "slow_good_no_regression_loss",
+    "slow_good_fast_suppress_loss",
+    "slow_bad_phase_loss",
+    "slow_good_window_ratio",
+    "slow_bad_window_ratio",
+    "slow_quality_score_mean",
+    "slow_quality_score_max",
+    "slow_good_gate_mean",
+    "slow_bad_gate_mean",
+    "slow_bad_phase_mean_abs_lag_s",
+    "slow_only_n_windows",
     "static_quality_gate_loss",
     "static_good_gate_mean",
     "static_bad_gate_mean",
@@ -1533,6 +1553,7 @@ ADAPTIVE_PHASE_MAX_METRIC_KEYS = {
     "adaptive_y_amplitude_weight_max",
     "adaptive_x_static_failure_weight_max",
     "adaptive_y_static_failure_weight_max",
+    "slow_quality_score_max",
     "adaptive_x_selected_t_start_max",
     "adaptive_y_selected_t_start_max",
     "static_quality_score_max",
@@ -2341,6 +2362,244 @@ def state_window_no_regression_guard_loss(
     }
 
 
+def _soft_lag_loss_single_window(
+        pred_signal: torch.Tensor,
+        teacher_signal: torch.Tensor,
+        *,
+        dt: float,
+        max_lag_seconds: float,
+        temperature: float,
+        eps: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    p = (pred_signal - pred_signal.mean()) / pred_signal.std().clamp_min(eps)
+    t = (teacher_signal - teacher_signal.mean()) / teacher_signal.std().clamp_min(eps)
+    max_lag_steps = max(1, int(round(float(max_lag_seconds) / float(dt))))
+    tau = max(float(temperature), 1.0e-8)
+    corrs: list[torch.Tensor] = []
+    valid_lags: list[int] = []
+    for lag in range(-max_lag_steps, max_lag_steps + 1):
+        if lag < 0:
+            p_l = p[:lag]
+            t_l = t[-lag:]
+        elif lag > 0:
+            p_l = p[lag:]
+            t_l = t[:-lag]
+        else:
+            p_l = p
+            t_l = t
+        if p_l.numel() < 8:
+            continue
+        corrs.append(torch.mean(p_l * t_l))
+        valid_lags.append(lag)
+    if not corrs:
+        zero = pred_signal.sum() * 0.0
+        return zero, zero.detach()
+    corr_tensor = torch.stack(corrs)
+    lag_tensor = torch.as_tensor(valid_lags, dtype=pred_signal.dtype, device=pred_signal.device)
+    weights = torch.softmax(corr_tensor / tau, dim=0)
+    soft_lag_steps = torch.sum(weights * lag_tensor)
+    loss = (soft_lag_steps / float(max_lag_steps)) ** 2
+    return loss, (torch.abs(soft_lag_steps) * float(dt)).detach()
+
+
+def slow_only_branch_diagnosis_loss(
+        *,
+        pred: torch.Tensor,
+        slow: Optional[torch.Tensor],
+        teacher: torch.Tensor,
+        theta_aux: Optional[dict[str, torch.Tensor]],
+        cfg: TransformerPhysicalTrainConfig,
+        x_idx: torch.Tensor,
+        y_idx: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    zero = torch.zeros((), dtype=pred.dtype, device=pred.device)
+    empty = {
+        "slow_only_diagnosis_loss": zero,
+        "slow_good_no_regression_loss": zero,
+        "slow_good_fast_suppress_loss": zero,
+        "slow_bad_phase_loss": zero,
+        "slow_good_window_ratio": zero.detach(),
+        "slow_bad_window_ratio": zero.detach(),
+        "slow_quality_score_mean": zero.detach(),
+        "slow_quality_score_max": zero.detach(),
+        "slow_good_gate_mean": zero.detach(),
+        "slow_bad_gate_mean": zero.detach(),
+        "slow_bad_phase_mean_abs_lag_s": zero.detach(),
+        "slow_only_n_windows": zero.detach(),
+    }
+    if (
+        not bool(getattr(cfg, "use_slow_only_branch_diagnosis", False))
+        or slow is None
+        or theta_aux is None
+    ):
+        return empty
+
+    gate = theta_aux.get("g_phase")
+    gated_fast = theta_aux.get("theta_gated_fast")
+    if gate is None or gated_fast is None:
+        return empty
+
+    pred = pred.to(dtype=teacher.dtype, device=teacher.device)
+    slow = slow.to(dtype=teacher.dtype, device=teacher.device).detach()
+    teacher = teacher.to(dtype=pred.dtype, device=pred.device)
+    gate = gate.to(dtype=pred.dtype, device=pred.device)
+    gated_fast = gated_fast.to(dtype=pred.dtype, device=pred.device)
+    if gate.ndim == 3:
+        gate = gate[0]
+    if gate.ndim == 2:
+        gate = torch.mean(gate, dim=-1)
+    if gated_fast.ndim == 3:
+        gated_fast = gated_fast[0]
+    if gate.ndim != 1 or gated_fast.ndim != 2:
+        return empty
+
+    T = int(min(pred.shape[0], slow.shape[0], teacher.shape[0], gate.shape[0], gated_fast.shape[0]))
+    if T < 2:
+        return empty
+    pred = pred[:T]
+    slow = slow[:T]
+    teacher = teacher[:T]
+    gate = gate[:T]
+    gated_fast = gated_fast[:T]
+
+    dt = float(cfg.dt)
+    start = max(0, int(round(float(cfg.static_quality_start) / dt)))
+    end = T if cfg.static_quality_end is None else min(T, int(round(float(cfg.static_quality_end) / dt)))
+    win = max(8, int(round(float(cfg.static_quality_window_seconds) / dt)))
+    stride = max(1, int(round(float(cfg.static_quality_stride_seconds) / dt)))
+    if end - start < win:
+        return empty
+
+    obs_indices = (
+        _static_quality_observation_indices(
+            dof_indices=x_idx,
+            observations=str(cfg.static_quality_observations),
+            last_k=int(cfg.static_quality_last_k),
+        )
+        + _static_quality_observation_indices(
+            dof_indices=y_idx,
+            observations=str(cfg.static_quality_observations),
+            last_k=int(cfg.static_quality_last_k),
+        )
+    )
+    if not obs_indices:
+        return empty
+
+    eps = torch.as_tensor(1.0e-12, dtype=pred.dtype, device=pred.device)
+    no_reg_terms: list[torch.Tensor] = []
+    suppress_terms: list[torch.Tensor] = []
+    bad_phase_terms: list[torch.Tensor] = []
+    bad_abs_lags: list[torch.Tensor] = []
+    good_flags: list[torch.Tensor] = []
+    bad_flags: list[torch.Tensor] = []
+    scores: list[torch.Tensor] = []
+    gate_means: list[torch.Tensor] = []
+
+    for s0 in range(start, end - win + 1, stride):
+        s1 = s0 + win
+        gate_mean = torch.mean(gate[s0:s1])
+        fast_rms = torch.sqrt(torch.mean(gated_fast[s0:s1, :] ** 2).clamp_min(eps))
+        window_scores = []
+        window_no_reg = []
+        window_bad_phase = []
+        window_bad_abs_lag = []
+
+        for idx in obs_indices:
+            slow_signal = torch.mean(slow[s0:s1, idx], dim=-1)
+            pred_signal = torch.mean(pred[s0:s1, idx], dim=-1)
+            teacher_signal = torch.mean(teacher[s0:s1, idx], dim=-1)
+
+            abs_lag_s, slow_best_corr, slow_amp_log_abs = _best_window_lag_corr_amp(
+                slow_signal,
+                teacher_signal,
+                dt=dt,
+                max_lag_seconds=float(cfg.static_quality_max_lag_seconds),
+                eps=eps,
+            )
+            corr_excess = torch.relu(
+                torch.as_tensor(float(cfg.static_quality_good_corr_threshold), dtype=pred.dtype, device=pred.device)
+                - slow_best_corr
+            ) / max(1.0 - float(cfg.static_quality_good_corr_threshold), 1.0e-6)
+            lag_excess = torch.relu(abs_lag_s - float(cfg.static_quality_good_lag_seconds)) / max(
+                float(cfg.static_quality_good_lag_seconds),
+                1.0e-6,
+            )
+            amp_excess = torch.relu(slow_amp_log_abs - float(cfg.static_quality_good_amp_log_tol)) / max(
+                float(cfg.static_quality_good_amp_log_tol),
+                1.0e-6,
+            )
+            score = (corr_excess + lag_excess + amp_excess).detach()
+            window_scores.append(score)
+
+            slow_mse = torch.mean((slow_signal - teacher_signal) ** 2).detach()
+            pred_mse = torch.mean((pred_signal - teacher_signal) ** 2)
+            response_excess = torch.relu(
+                pred_mse / slow_mse.clamp_min(eps) - float(cfg.slow_good_response_ratio_limit)
+            )
+            slow_corr0, _ = _window_corr_and_amp_log_abs(slow_signal, teacher_signal, eps)
+            pred_corr0, pred_amp_log_abs = _window_corr_and_amp_log_abs(pred_signal, teacher_signal, eps)
+            corr_drop = slow_corr0.detach() - pred_corr0
+            corr_drop_excess = torch.relu(corr_drop - float(cfg.slow_good_corr_drop_tol))
+            amp_excess_pred = torch.relu(pred_amp_log_abs - float(cfg.slow_good_amp_log_tol))
+            window_no_reg.append(response_excess ** 2 + corr_drop_excess ** 2 + amp_excess_pred ** 2)
+
+            lag_loss, abs_pred_lag_s = _soft_lag_loss_single_window(
+                pred_signal,
+                teacher_signal,
+                dt=dt,
+                max_lag_seconds=float(cfg.phase_window_max_lag_seconds),
+                temperature=float(cfg.phase_window_lag_temperature),
+                eps=eps,
+            )
+            bad_weight = torch.clamp(score, min=0.0, max=float(cfg.slow_bad_weight_max))
+            window_bad_phase.append(bad_weight * lag_loss)
+            window_bad_abs_lag.append(bad_weight * abs_pred_lag_s)
+
+        score_window = torch.stack(window_scores).mean().detach()
+        good = (score_window <= 1.0e-8).to(dtype=pred.dtype)
+        bad = (score_window > 1.0e-8).to(dtype=pred.dtype)
+        no_reg_terms.append(good * torch.stack(window_no_reg).mean())
+        suppress_terms.append(good * (gate_mean ** 2 + fast_rms ** 2))
+        bad_phase_terms.append(bad * torch.stack(window_bad_phase).mean())
+        bad_abs_lags.append(bad * torch.stack(window_bad_abs_lag).mean().detach())
+        good_flags.append(good.detach())
+        bad_flags.append(bad.detach())
+        scores.append(score_window)
+        gate_means.append(gate_mean.detach())
+
+    if not scores:
+        return empty
+
+    no_reg_loss = torch.stack(no_reg_terms).mean()
+    suppress_loss = torch.stack(suppress_terms).mean()
+    bad_phase_loss = torch.stack(bad_phase_terms).mean()
+    total = (
+        float(cfg.w_slow_good_no_regression) * no_reg_loss
+        + float(cfg.w_slow_good_fast_suppress) * suppress_loss
+        + float(cfg.w_slow_bad_phase) * bad_phase_loss
+    )
+
+    good_t = torch.stack(good_flags)
+    bad_t = torch.stack(bad_flags)
+    gate_t = torch.stack(gate_means)
+    good_count = torch.sum(good_t).clamp_min(1.0)
+    bad_count = torch.sum(bad_t).clamp_min(1.0)
+    return {
+        "slow_only_diagnosis_loss": total,
+        "slow_good_no_regression_loss": no_reg_loss,
+        "slow_good_fast_suppress_loss": suppress_loss,
+        "slow_bad_phase_loss": bad_phase_loss,
+        "slow_good_window_ratio": torch.mean(good_t).detach(),
+        "slow_bad_window_ratio": torch.mean(bad_t).detach(),
+        "slow_quality_score_mean": torch.stack(scores).mean().detach(),
+        "slow_quality_score_max": torch.stack(scores).max().detach(),
+        "slow_good_gate_mean": (torch.sum(gate_t * good_t) / good_count).detach(),
+        "slow_bad_gate_mean": (torch.sum(gate_t * bad_t) / bad_count).detach(),
+        "slow_bad_phase_mean_abs_lag_s": torch.stack(bad_abs_lags).mean().detach(),
+        "slow_only_n_windows": torch.as_tensor(float(len(scores)), dtype=pred.dtype, device=pred.device),
+    }
+
+
 def _demeaned_rms_ratio(
         pred: torch.Tensor,
         target: torch.Tensor,
@@ -2450,6 +2709,7 @@ def compute_response_loss(
         last5_y_idx: torch.Tensor,
         theta: torch.Tensor,
         theta_aux: Optional[dict[str, torch.Tensor]] = None,
+        u_slow: Optional[torch.Tensor] = None,
         case_name: str = "",
         guard_only: bool = False,
 ) -> dict[str, torch.Tensor]:
@@ -2628,6 +2888,15 @@ def compute_response_loss(
         x_idx=x_idx,
         y_idx=y_idx,
     )
+    slow_only_diag = slow_only_branch_diagnosis_loss(
+        pred=pred,
+        slow=None if u_slow is None else u_slow[0],
+        teacher=teacher,
+        theta_aux=theta_aux,
+        cfg=cfg,
+        x_idx=x_idx,
+        y_idx=y_idx,
+    )
 
     # freq_loss 现在表示“频率/峰值/相位综合对齐损失”：
     # 全局频谱 + teacher-anchored peak-time + local cross-correlation lag
@@ -2641,6 +2910,7 @@ def compute_response_loss(
         + adaptive_phase["complex_amp_guard_loss"]
         + adaptive_phase["phase_gate_align_loss"]
         + phase_drift["phase_drift_loss"]
+        + slow_only_diag["slow_only_diagnosis_loss"]
     )
 
     amp = theta_amplitude_loss(theta.to(dtype=u_pred.dtype))
@@ -2701,6 +2971,18 @@ def compute_response_loss(
         "phase_drift_y_combined_weight_mean": phase_drift["phase_drift_y_combined_weight_mean"],
         "phase_drift_x_n_windows": phase_drift["phase_drift_x_n_windows"],
         "phase_drift_y_n_windows": phase_drift["phase_drift_y_n_windows"],
+        "slow_only_diagnosis_loss": slow_only_diag["slow_only_diagnosis_loss"],
+        "slow_good_no_regression_loss": slow_only_diag["slow_good_no_regression_loss"],
+        "slow_good_fast_suppress_loss": slow_only_diag["slow_good_fast_suppress_loss"],
+        "slow_bad_phase_loss": slow_only_diag["slow_bad_phase_loss"],
+        "slow_good_window_ratio": slow_only_diag["slow_good_window_ratio"],
+        "slow_bad_window_ratio": slow_only_diag["slow_bad_window_ratio"],
+        "slow_quality_score_mean": slow_only_diag["slow_quality_score_mean"],
+        "slow_quality_score_max": slow_only_diag["slow_quality_score_max"],
+        "slow_good_gate_mean": slow_only_diag["slow_good_gate_mean"],
+        "slow_bad_gate_mean": slow_only_diag["slow_bad_gate_mean"],
+        "slow_bad_phase_mean_abs_lag_s": slow_only_diag["slow_bad_phase_mean_abs_lag_s"],
+        "slow_only_n_windows": slow_only_diag["slow_only_n_windows"],
         "no_regression_guard_loss": no_regression["no_regression_guard_loss"],
         "no_regression_response_guard_loss": no_regression["no_regression_response_guard_loss"],
         "no_regression_lag_guard_loss": no_regression["no_regression_lag_guard_loss"],
@@ -2781,6 +3063,38 @@ def compute_response_loss(
         },
     }
     return result
+
+
+def compute_slow_only_rollout_for_diagnosis(
+        *,
+        model: TransformerPhysicalRolloutTorch,
+        out_theta_aux: Optional[dict[str, torch.Tensor]],
+        cfg: TransformerPhysicalTrainConfig,
+        u_static: torch.Tensor,
+        v_static: torch.Tensor,
+        a_static: torch.Tensor,
+        F: torch.Tensor,
+        u0: torch.Tensor,
+        v0: torch.Tensor,
+        a0: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    if not bool(getattr(cfg, "use_slow_only_branch_diagnosis", False)):
+        return None
+    if out_theta_aux is None or out_theta_aux.get("theta_slow") is None:
+        return None
+    theta_slow = out_theta_aux["theta_slow"].detach()
+    with torch.no_grad():
+        u_slow, _, _ = model.rollout_with_theta_sequence(
+            theta_seq=theta_slow,
+            u_static=u_static,
+            v_static=v_static,
+            a_static=a_static,
+            F=F,
+            u0=u0,
+            v0=v0,
+            a0=a0,
+        )
+    return u_slow
 
 def evaluate_cases(
         *,
@@ -2901,6 +3215,18 @@ def evaluate_cases(
                     timing_sums[dst_key] += float(out.metadata.get(src_key, 0.0))
 
             t0 = _time_now(cfg, next(model.parameters()).device) if profile_timing else 0.0
+            u_slow = compute_slow_only_rollout_for_diagnosis(
+                model=model,
+                out_theta_aux=out.theta_aux,
+                cfg=cfg,
+                u_static=u_static,
+                v_static=v_static,
+                a_static=a_static,
+                F=F,
+                u0=u0,
+                v0=v0,
+                a0=a0,
+            )
             loss_dict = compute_response_loss(
                 u_pred=out.u_pred,
                 case=case,
@@ -2911,6 +3237,7 @@ def evaluate_cases(
                 last5_y_idx=last5_y_idx,
                 theta=out.theta,
                 theta_aux=out.theta_aux,
+                u_slow=u_slow,
                 case_name=case.name,
             )
             if profile_timing:
@@ -3228,6 +3555,18 @@ def train_cases_grad_accum(
                 timing_sums[dst_key] += float(out.metadata.get(src_key, 0.0))
 
         t0 = _time_now(cfg, timing_device) if profile_timing else 0.0
+        u_slow = compute_slow_only_rollout_for_diagnosis(
+            model=model,
+            out_theta_aux=out.theta_aux,
+            cfg=cfg,
+            u_static=u_static,
+            v_static=v_static,
+            a_static=a_static,
+            F=F,
+            u0=u0,
+            v0=v0,
+            a0=a0,
+        )
         loss_dict = compute_response_loss(
             u_pred=out.u_pred,
             case=case,
@@ -3238,6 +3577,7 @@ def train_cases_grad_accum(
             last5_y_idx=last5_y_idx,
             theta=out.theta,
             theta_aux=out.theta_aux,
+            u_slow=u_slow,
             case_name=case.name,
         )
 
@@ -3297,6 +3637,7 @@ def train_cases_grad_accum(
             timing_sums["timing_metric_accum_seconds"] += _time_now(cfg, timing_device) - t0
 
         del out
+        del u_slow
         del loss_dict
         del scaled_loss
 
@@ -4045,6 +4386,17 @@ def parse_args() -> tuple[
                         default=d.phase_drift_static_failure_weight)
     parser.add_argument("--phase-drift-static-failure-max-weight", type=float,
                         default=d.phase_drift_static_failure_max_weight)
+    parser.add_argument("--use-slow-only-branch-diagnosis", action="store_true",
+                        default=d.use_slow_only_branch_diagnosis)
+    parser.add_argument("--no-slow-only-branch-diagnosis", dest="use_slow_only_branch_diagnosis",
+                        action="store_false")
+    parser.add_argument("--w-slow-good-no-regression", type=float, default=d.w_slow_good_no_regression)
+    parser.add_argument("--w-slow-good-fast-suppress", type=float, default=d.w_slow_good_fast_suppress)
+    parser.add_argument("--w-slow-bad-phase", type=float, default=d.w_slow_bad_phase)
+    parser.add_argument("--slow-good-response-ratio-limit", type=float, default=d.slow_good_response_ratio_limit)
+    parser.add_argument("--slow-good-corr-drop-tol", type=float, default=d.slow_good_corr_drop_tol)
+    parser.add_argument("--slow-good-amp-log-tol", type=float, default=d.slow_good_amp_log_tol)
+    parser.add_argument("--slow-bad-weight-max", type=float, default=d.slow_bad_weight_max)
     parser.add_argument("--use-static-quality-gate-suppression", action="store_true",
                         default=d.use_static_quality_gate_suppression)
     parser.add_argument("--no-static-quality-gate-suppression", dest="use_static_quality_gate_suppression",
@@ -4400,6 +4752,14 @@ def parse_args() -> tuple[
         phase_drift_amplitude_max_weight=float(args.phase_drift_amplitude_max_weight),
         phase_drift_static_failure_weight=float(args.phase_drift_static_failure_weight),
         phase_drift_static_failure_max_weight=float(args.phase_drift_static_failure_max_weight),
+        use_slow_only_branch_diagnosis=bool(args.use_slow_only_branch_diagnosis),
+        w_slow_good_no_regression=float(args.w_slow_good_no_regression),
+        w_slow_good_fast_suppress=float(args.w_slow_good_fast_suppress),
+        w_slow_bad_phase=float(args.w_slow_bad_phase),
+        slow_good_response_ratio_limit=float(args.slow_good_response_ratio_limit),
+        slow_good_corr_drop_tol=float(args.slow_good_corr_drop_tol),
+        slow_good_amp_log_tol=float(args.slow_good_amp_log_tol),
+        slow_bad_weight_max=float(args.slow_bad_weight_max),
         use_static_quality_gate_suppression=bool(args.use_static_quality_gate_suppression),
         w_static_good_gate_l1=float(args.w_static_good_gate_l1),
         static_quality_observations=str(args.static_quality_observations),
@@ -4552,6 +4912,18 @@ def main() -> None:
             f"amp_max_weight={cfg.phase_drift_amplitude_max_weight}, "
             f"static_failure_weight={cfg.phase_drift_static_failure_weight}, "
             f"static_failure_max_weight={cfg.phase_drift_static_failure_max_weight}"
+        )
+    print(f"  use_slow_only_branch_diagnosis = {cfg.use_slow_only_branch_diagnosis}")
+    if bool(cfg.use_slow_only_branch_diagnosis):
+        print(
+            "  slow_only_diagnosis = "
+            f"w_good_no_reg={cfg.w_slow_good_no_regression}, "
+            f"w_good_fast={cfg.w_slow_good_fast_suppress}, "
+            f"w_bad_phase={cfg.w_slow_bad_phase}, "
+            f"good_ratio_limit={cfg.slow_good_response_ratio_limit}, "
+            f"good_corr_drop_tol={cfg.slow_good_corr_drop_tol}, "
+            f"good_amp_log_tol={cfg.slow_good_amp_log_tol}, "
+            f"bad_weight_max={cfg.slow_bad_weight_max}"
         )
     print(f"  use_static_quality_gate_suppression = {cfg.use_static_quality_gate_suppression}")
     if bool(cfg.use_static_quality_gate_suppression):

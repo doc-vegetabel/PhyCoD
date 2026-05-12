@@ -405,6 +405,82 @@ class TransformerPhysicalRolloutTorch(nn.Module):
             },
         )
 
+    def rollout_with_theta_sequence(
+        self,
+        *,
+        theta_seq: torch.Tensor,
+        u_static: torch.Tensor,
+        v_static: torch.Tensor,
+        a_static: torch.Tensor,
+        F: torch.Tensor,
+        u0: torch.Tensor | None = None,
+        v0: torch.Tensor | None = None,
+        a0: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Roll out the physical core with an externally supplied theta sequence.
+
+        This is used for training diagnostics such as slow-only branch rollout.
+        It does not change the dynamic core interface: theta still has shape
+        (B,T,P), and theta[:,t,:] drives the Newmark step t -> t+1.
+        """
+        B, T, D = self._check_btd_tensor(
+            u_static,
+            name="u_static",
+            expected_d=self.physical_core.n_dofs,
+        )
+        for name, x in {
+            "v_static": v_static,
+            "a_static": a_static,
+            "F": F,
+        }.items():
+            self._check_btd_tensor(x, name=name, expected_d=D)
+            if tuple(x.shape[:2]) != (B, T):
+                raise ValueError(
+                    f"{name} prefix shape mismatch: expected {(B,T)}, got {tuple(x.shape[:2])}."
+                )
+        if theta_seq.ndim != 3 or tuple(theta_seq.shape[:2]) != (B, T):
+            raise ValueError(
+                f"theta_seq must have shape {(B,T,'P')}, got {tuple(theta_seq.shape)}."
+            )
+
+        core_dtype = self.config.core_dtype
+        core_device = self.physical_core.K0.device
+        F_core = F.to(device=core_device, dtype=core_dtype)
+        theta_core = theta_seq.to(device=core_device, dtype=core_dtype)
+
+        u_t, v_t, a_t = self._prepare_initial_state(
+            u_static=u_static,
+            v_static=v_static,
+            a_static=a_static,
+            u0=u0,
+            v0=v0,
+            a0=a0,
+        )
+
+        u_list = [u_t]
+        v_list = [v_t]
+        a_list = [a_t]
+        for t in range(T - 1):
+            theta_t = theta_core[:, t, :]
+            u_next, v_next, a_next = self.physical_core.newmark_step_fast(
+                u_t=u_t,
+                v_t=v_t,
+                a_t=a_t,
+                F_t1=F_core[:, t + 1, :],
+                theta_t=theta_t,
+            )
+            u_list.append(u_next)
+            v_list.append(v_next)
+            a_list.append(a_next)
+            u_t, v_t, a_t = u_next, v_next, a_next
+
+        return (
+            torch.stack(u_list, dim=1),
+            torch.stack(v_list, dim=1),
+            torch.stack(a_list, dim=1),
+        )
+
     def forward(
         self,
         *,

@@ -924,3 +924,10 @@ alpha_y(t) + response/load + static conditioning 在 240-step 训练中有效。
 |---|---|---|---|---|
 | 2026-05-12 Asia/Shanghai | `src/student/transformer/frequency_losses.py` | Add | Add detached static-baseline failure weighting for local phase losses. The weight is computed from static-vs-teacher local lag, correlation drop, and RMS amplitude mismatch, then multiplies adaptive phase hard-mining scores and phase-drift high-frequency weights only when enabled. | static-failure-driven phase correction |
 | 2026-05-12 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Modify | Add CLI/config controls for phase-window and phase-drift static-failure weighting, pass `case.u_static` into the phase losses, print the new settings at startup, and log static-failure weight diagnostics in `training_history.csv`. Defaults remain disabled, so prior commands are numerically compatible. | static-failure-driven phase correction |
+
+# 2026-05-12 slow-only branch diagnosis update
+
+| Time | Files | Change Type | Content | Stage |
+|---|---|---|---|---|
+| 2026-05-12 Asia/Shanghai | `src/student/transformer/transformer_rollout_torch.py` | Add | Add `rollout_with_theta_sequence(...)`, a supplied-theta physical rollout helper used by training diagnostics to evaluate `theta_slow` without changing the dynamic core or final total-theta interface. | slow/fast phase-gate separation |
+| 2026-05-12 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Add | Add optional slow-only branch diagnosis controlled by `--use-slow-only-branch-diagnosis` and `--w-slow-*` weights. It runs a detached slow-only rollout, treats slow-good windows as places to suppress `g_phase * alpha_fast`, treats slow-bad windows as places to boost local phase loss, and records `slow_*` diagnostics in training history. | slow/fast phase-gate separation |

@@ -287,3 +287,12 @@ python tests/compare_full_corrected_core_vs_student.py --time-series-load-file d
 |---|---|---|---|---|
 | 2026-05-12 Asia/Shanghai | `src/student/transformer/frequency_losses.py` | Add static-failure-aware phase weighting | Add a detached local-window weight based on whether the static corrected student fails against teacher in lag, correlation, or RMS amplitude. `adaptive_phase_window_loss(...)` and `phase_drift_rate_loss(...)` can now emphasize phase correction only where the static baseline is locally bad, instead of relying only on teacher response amplitude. Defaults preserve previous behavior. | static-failure-driven phase correction |
 | 2026-05-12 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Expose static-failure-aware controls | Add `--phase-window-static-failure-weight`, `--phase-window-static-failure-max-weight`, `--phase-drift-static-failure-weight`, and `--phase-drift-static-failure-max-weight`. The thresholds reuse `static_quality_*` settings and history now records `adaptive_*_static_failure_weight_*` and `phase_drift_*_static_failure_weight_mean`. The model architecture and `theta=[alpha_x_total, alpha_xy_total]` interface are unchanged. | static-failure-driven phase correction |
+
+---
+
+## 21. 2026-05-12 slow-only branch diagnosis update
+
+| Time | Files | Required Note | Content | Stage |
+|---|---|---|---|---|
+| 2026-05-12 Asia/Shanghai | `src/student/transformer/transformer_rollout_torch.py` | Add supplied-theta rollout helper | Add `rollout_with_theta_sequence(...)` so training diagnostics can run the physical Newmark core with an externally supplied theta sequence such as `theta_slow`. This keeps the dynamic core interface unchanged and still uses `theta[:,t,:]` for each Newmark step. | slow/fast phase-gate separation |
+| 2026-05-12 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Add slow-only branch diagnosis loss | Add optional `--use-slow-only-branch-diagnosis`. When enabled, training runs a detached slow-only rollout with `theta_slow`, uses slow-vs-teacher local lag/corr/amplitude quality to decide whether the fast branch should be suppressed or allowed, and logs `slow_*` diagnostics. The total physical theta passed to the main rollout remains `[alpha_x_total, alpha_xy_total]`. | slow/fast phase-gate separation |
