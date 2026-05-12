@@ -662,6 +662,27 @@ def _high_band_power_weight_from_window(
     return torch.sigmoid((high_ratio - float(threshold)) / tau).detach()
 
 
+def _amplitude_weight_from_window(
+    target_win: torch.Tensor,
+    *,
+    reference: float = 0.0,
+    strength: float = 0.0,
+    power: float = 1.0,
+    max_weight: float = 4.0,
+    eps: float = 1.0e-12,
+) -> torch.Tensor:
+    """Detached multiplicative emphasis for unusually large response windows."""
+    if float(strength) <= 0.0 or float(reference) <= 0.0:
+        return torch.ones((), device=target_win.device, dtype=target_win.dtype)
+
+    y = target_win.detach() - target_win.detach().mean()
+    rms = torch.sqrt(torch.mean(y * y).clamp_min(eps))
+    ratio = rms / max(float(reference), eps)
+    raw = torch.pow(ratio.clamp_min(eps), float(power))
+    emphasized = torch.clamp(raw, min=1.0, max=max(float(max_weight), 1.0))
+    return (1.0 + float(strength) * (emphasized - 1.0)).detach()
+
+
 def _soft_lag_steps_from_window(
     pred_win: torch.Tensor,
     target_win: torch.Tensor,
@@ -733,6 +754,10 @@ def phase_drift_rate_loss(
     freq_max: float | None = 1.20,
     high_power_threshold: float = 0.20,
     high_power_temperature: float = 0.08,
+    amplitude_reference: float = 0.0,
+    amplitude_weight: float = 0.0,
+    amplitude_power: float = 1.0,
+    amplitude_max_weight: float = 4.0,
     eps: float = 1.0e-12,
 ) -> dict[str, torch.Tensor]:
     """
@@ -769,6 +794,8 @@ def phase_drift_rate_loss(
             "mean_abs_lag_s": zero.detach(),
             "mean_abs_dlag_s": zero.detach(),
             "high_weight_mean": zero.detach(),
+            "amplitude_weight_mean": zero.detach(),
+            "combined_weight_mean": zero.detach(),
             "n_windows": torch.as_tensor(0.0, device=pred_btd.device, dtype=pred_btd.dtype),
         }
 
@@ -777,6 +804,8 @@ def phase_drift_rate_loss(
     abs_lag_terms: list[torch.Tensor] = []
     abs_dlag_terms: list[torch.Tensor] = []
     high_weights_all: list[torch.Tensor] = []
+    amplitude_weights_all: list[torch.Tensor] = []
+    combined_weights_all: list[torch.Tensor] = []
     n_windows = 0
 
     for obs in obs_list:
@@ -816,11 +845,22 @@ def phase_drift_rate_loss(
                     temperature=high_power_temperature,
                     eps=eps,
                 )
-                lag_loss_terms.append(weight * (soft_lag_steps / float(max_lag_steps)) ** 2)
-                abs_lag_terms.append(weight * hard_abs_lag_s)
+                amp_weight = _amplitude_weight_from_window(
+                    t,
+                    reference=amplitude_reference,
+                    strength=amplitude_weight,
+                    power=amplitude_power,
+                    max_weight=amplitude_max_weight,
+                    eps=eps,
+                )
+                combined_weight = (weight * amp_weight).detach()
+                lag_loss_terms.append(combined_weight * (soft_lag_steps / float(max_lag_steps)) ** 2)
+                abs_lag_terms.append(combined_weight * hard_abs_lag_s)
                 high_weights_all.append(weight)
+                amplitude_weights_all.append(amp_weight)
+                combined_weights_all.append(combined_weight)
                 window_lags.append(soft_lag_steps)
-                window_weights.append(weight)
+                window_weights.append(combined_weight)
                 n_windows += 1
 
             if len(window_lags) >= 2:
@@ -839,6 +879,8 @@ def phase_drift_rate_loss(
             "mean_abs_lag_s": zero.detach(),
             "mean_abs_dlag_s": zero.detach(),
             "high_weight_mean": zero.detach(),
+            "amplitude_weight_mean": zero.detach(),
+            "combined_weight_mean": zero.detach(),
             "n_windows": torch.as_tensor(0.0, device=pred_btd.device, dtype=pred_btd.dtype),
         }
 
@@ -848,6 +890,8 @@ def phase_drift_rate_loss(
     mean_abs_lag_s = torch.stack(abs_lag_terms).mean().detach()
     mean_abs_dlag_s = torch.stack(abs_dlag_terms).mean().detach() if abs_dlag_terms else zero.detach()
     high_weight_mean = torch.stack(high_weights_all).mean().detach()
+    amplitude_weight_mean = torch.stack(amplitude_weights_all).mean().detach()
+    combined_weight_mean = torch.stack(combined_weights_all).mean().detach()
 
     return {
         "loss": loss,
@@ -856,6 +900,8 @@ def phase_drift_rate_loss(
         "mean_abs_lag_s": mean_abs_lag_s,
         "mean_abs_dlag_s": mean_abs_dlag_s,
         "high_weight_mean": high_weight_mean,
+        "amplitude_weight_mean": amplitude_weight_mean,
+        "combined_weight_mean": combined_weight_mean,
         "n_windows": torch.as_tensor(float(n_windows), device=pred_btd.device, dtype=pred_btd.dtype),
     }
 
@@ -880,6 +926,10 @@ def adaptive_phase_window_loss(
     lag_temperature: float = 0.04,
     freq_min: float = 0.05,
     freq_max: float | None = 5.0,
+    amplitude_reference: float = 0.0,
+    amplitude_weight: float = 0.0,
+    amplitude_power: float = 1.0,
+    amplitude_max_weight: float = 4.0,
     eps: float = 1.0e-12,
 ) -> dict[str, torch.Tensor]:
     """
@@ -918,6 +968,8 @@ def adaptive_phase_window_loss(
             "gate_align_loss": zero,
             "score_mean": zero.detach(),
             "score_max": zero.detach(),
+            "amplitude_weight_mean": zero.detach(),
+            "amplitude_weight_max": zero.detach(),
             "best_abs_lag_s_mean": zero.detach(),
             "best_corr_mean": zero.detach(),
             "corr0_mean": zero.detach(),
@@ -952,6 +1004,7 @@ def adaptive_phase_window_loss(
     corr0s: list[torch.Tensor] = []
     starts: list[float] = []
     gate_means: list[torch.Tensor] = []
+    amp_weights: list[torch.Tensor] = []
 
     for obs in obs_list:
         pred_sig = direction_observation_signal(
@@ -989,15 +1042,24 @@ def adaptive_phase_window_loss(
                     freq_max=freq_max,
                     eps=eps,
                 )
+                amp_weight = _amplitude_weight_from_window(
+                    t,
+                    reference=amplitude_reference,
+                    strength=amplitude_weight,
+                    power=amplitude_power,
+                    max_weight=amplitude_max_weight,
+                    eps=eps,
+                )
 
                 lag_losses.append(lag["lag_loss"])
                 phase_losses.append(complex_loss["phase_loss"])
                 amp_losses.append(complex_loss["amp_guard_loss"])
-                scores.append(lag["score"])
+                scores.append(lag["score"] * amp_weight)
                 best_abs_lags.append(lag["best_abs_lag_s"].detach())
                 best_corrs.append(lag["best_corr"].detach())
                 corr0s.append(lag["corr0"].detach())
                 starts.append(float(lo) * float(dt))
+                amp_weights.append(amp_weight)
                 if gate_btg is not None:
                     gate_means.append(gate_btg[b, lo:hi, :].mean())
 
@@ -1010,6 +1072,8 @@ def adaptive_phase_window_loss(
             "gate_align_loss": zero,
             "score_mean": zero.detach(),
             "score_max": zero.detach(),
+            "amplitude_weight_mean": zero.detach(),
+            "amplitude_weight_max": zero.detach(),
             "best_abs_lag_s_mean": zero.detach(),
             "best_corr_mean": zero.detach(),
             "corr0_mean": zero.detach(),
@@ -1027,6 +1091,7 @@ def adaptive_phase_window_loss(
     amp_tensor = torch.stack(amp_losses)
     score_tensor = torch.stack(scores).detach()
     start_tensor = torch.as_tensor(starts, device=pred_btd.device, dtype=pred_btd.dtype)
+    amp_weight_tensor = torch.stack(amp_weights).detach()
 
     n_windows = int(score_tensor.numel())
     if int(top_k) > 0:
@@ -1064,6 +1129,8 @@ def adaptive_phase_window_loss(
         "gate_align_loss": gate_align_loss,
         "score_mean": score_tensor.mean().detach(),
         "score_max": score_tensor.max().detach(),
+        "amplitude_weight_mean": amp_weight_tensor.mean().detach(),
+        "amplitude_weight_max": amp_weight_tensor.max().detach(),
         "best_abs_lag_s_mean": torch.stack(best_abs_lags).mean().detach(),
         "best_corr_mean": torch.stack(best_corrs).mean().detach(),
         "corr0_mean": torch.stack(corr0s).mean().detach(),

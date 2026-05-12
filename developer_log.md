@@ -910,3 +910,9 @@ alpha_y(t) + response/load + static conditioning 在 240-step 训练中有效。
 |---|---|---|---|---|
 | 2026-05-11 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Add | Add optional `--use-loss-curriculum` training mode with epoch-local loss-weight scheduling for lag/peak-time, adaptive/complex phase, high-frequency phase-drift, phase-gate regularization, static-quality gate suppression, and state-window no-regression terms. Defaults remain disabled, so existing commands keep the same behavior. | from-scratch frequency/phase curriculum |
 | 2026-05-11 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Modify | Train/valid evaluation now uses the scheduled epoch config when curriculum mode is enabled, and history/checkpoints record curriculum scales plus effective weights to diagnose whether phase/gate/guard ramps are active. | from-scratch frequency/phase curriculum |
+# 2026-05-12 amplitude-aware high-frequency phase update
+
+| Time | Files | Change Type | Content | Stage |
+|---|---|---|---|---|
+| 2026-05-12 Asia/Shanghai | `src/student/transformer/frequency_losses.py` | Add | Add amplitude-aware detached window weighting for high-frequency phase losses. High-frequency phase drift windows can now be emphasized when teacher response amplitude exceeds a configurable reference; adaptive phase hard-mining can also rank large-amplitude phase-drift windows higher. | high-amplitude high-frequency phase correction |
+| 2026-05-12 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Modify | Add CLI/config fields `--phase-window-amplitude-reference/weight/power/max-weight` and `--phase-drift-amplitude-reference/weight/power/max-weight`, plus x/y-specific reference overrides; pass them into phase losses, print them at startup, and log amplitude/combined window weights in `training_history.csv`. | high-amplitude high-frequency phase correction |
