@@ -2653,6 +2653,10 @@ def compute_response_loss(
         "phase_drift_y_mean_abs_dlag_s": phase_drift["phase_drift_y_mean_abs_dlag_s"],
         "phase_drift_x_high_weight_mean": phase_drift["phase_drift_x_high_weight_mean"],
         "phase_drift_y_high_weight_mean": phase_drift["phase_drift_y_high_weight_mean"],
+        "phase_drift_x_amplitude_weight_mean": phase_drift["phase_drift_x_amplitude_weight_mean"],
+        "phase_drift_y_amplitude_weight_mean": phase_drift["phase_drift_y_amplitude_weight_mean"],
+        "phase_drift_x_combined_weight_mean": phase_drift["phase_drift_x_combined_weight_mean"],
+        "phase_drift_y_combined_weight_mean": phase_drift["phase_drift_y_combined_weight_mean"],
         "phase_drift_x_n_windows": phase_drift["phase_drift_x_n_windows"],
         "phase_drift_y_n_windows": phase_drift["phase_drift_y_n_windows"],
         "no_regression_guard_loss": no_regression["no_regression_guard_loss"],
@@ -2905,12 +2909,17 @@ def evaluate_cases(
             last5_y_ratios.append(loss_dict["last5_y_ratio"])
             x_guards.append(loss_dict["x_guard"])
             theta_abs_max_values.append(torch.max(torch.abs(out.theta.to(dtype=loss_dict["total_loss"].dtype))))
+            missing_metric_default = torch.zeros(
+                (),
+                dtype=loss_dict["total_loss"].dtype,
+                device=loss_dict["total_loss"].device,
+            )
             for k in PHASE_GATED_LOG_METRIC_KEYS:
-                phase_metric_values[k].append(loss_dict[k])
+                phase_metric_values[k].append(loss_dict.get(k, missing_metric_default))
             for k in ADAPTIVE_PHASE_LOG_METRIC_KEYS:
-                adaptive_metric_values[k].append(loss_dict[k])
+                adaptive_metric_values[k].append(loss_dict.get(k, missing_metric_default))
             for k in NO_REGRESSION_LOG_METRIC_KEYS:
-                no_regression_metric_values[k].append(loss_dict[k])
+                no_regression_metric_values[k].append(loss_dict.get(k, missing_metric_default))
             if profile_timing:
                 timing_sums["timing_metric_accum_seconds"] += _time_now(cfg, next(model.parameters()).device) - t0
 
@@ -3201,28 +3210,33 @@ def train_cases_grad_accum(
             timing_sums["timing_backward_seconds"] += _time_now(cfg, timing_device) - t0
 
         t0 = _time_now(cfg, timing_device) if profile_timing else 0.0
+        missing_metric_default = torch.zeros(
+            (),
+            dtype=loss_dict["total_loss"].dtype,
+            device=loss_dict["total_loss"].device,
+        )
         for k in metric_keys:
-            value = loss_dict[k].detach().to(dtype=torch.float64)
+            value = loss_dict.get(k, missing_metric_default).detach().to(dtype=torch.float64)
             if metric_sums[k] is None:
                 metric_sums[k] = value.clone()
             else:
                 metric_sums[k] = metric_sums[k] + value
         for k in phase_metric_max_keys:
-            value = loss_dict[k].detach().to(dtype=torch.float64)
+            value = loss_dict.get(k, missing_metric_default).detach().to(dtype=torch.float64)
             phase_metric_max_values[k] = (
                 value.clone()
                 if phase_metric_max_values[k] is None
                 else torch.maximum(phase_metric_max_values[k], value)
             )
         for k in adaptive_metric_max_keys:
-            value = loss_dict[k].detach().to(dtype=torch.float64)
+            value = loss_dict.get(k, missing_metric_default).detach().to(dtype=torch.float64)
             adaptive_metric_max_values[k] = (
                 value.clone()
                 if adaptive_metric_max_values[k] is None
                 else torch.maximum(adaptive_metric_max_values[k], value)
             )
         for k in adaptive_metric_min_keys:
-            value = loss_dict[k].detach().to(dtype=torch.float64)
+            value = loss_dict.get(k, missing_metric_default).detach().to(dtype=torch.float64)
             adaptive_metric_min_values[k] = (
                 value.clone()
                 if adaptive_metric_min_values[k] is None
