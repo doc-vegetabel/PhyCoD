@@ -683,6 +683,52 @@ def _amplitude_weight_from_window(
     return (1.0 + float(strength) * (emphasized - 1.0)).detach()
 
 
+def _static_failure_weight_from_window(
+    static_win: torch.Tensor | None,
+    target_win: torch.Tensor,
+    *,
+    dt: float,
+    strength: float = 0.0,
+    max_weight: float = 4.0,
+    corr_threshold: float = 0.995,
+    lag_seconds: float = 0.02,
+    amp_log_tol: float = 0.08,
+    max_lag_seconds: float = 0.20,
+    lag_temperature: float = 0.04,
+    eps: float = 1.0e-12,
+) -> torch.Tensor:
+    """Detached emphasis for windows where the static baseline already fails."""
+    if static_win is None or float(strength) <= 0.0:
+        return torch.ones((), device=target_win.device, dtype=target_win.dtype)
+
+    s = static_win.detach().to(device=target_win.device, dtype=target_win.dtype)
+    t = target_win.detach()
+    _, best_abs_lag_s, best_corr = _soft_lag_steps_from_window(
+        s,
+        t,
+        dt=dt,
+        max_lag_seconds=max_lag_seconds,
+        temperature=lag_temperature,
+        eps=eps,
+    )
+
+    s0 = s - s.mean()
+    t0 = t - t.mean()
+    static_rms = torch.sqrt(torch.mean(s0 * s0).clamp_min(eps))
+    teacher_rms = torch.sqrt(torch.mean(t0 * t0).clamp_min(eps))
+    amp_log_abs = torch.abs(torch.log(static_rms.clamp_min(eps) / teacher_rms.clamp_min(eps)))
+
+    corr_scale = max(1.0 - float(corr_threshold), 1.0e-6)
+    lag_scale = max(float(lag_seconds), 1.0e-6)
+    amp_scale = max(float(amp_log_tol), 1.0e-6)
+    corr_excess = torch.relu(torch.as_tensor(float(corr_threshold), device=t.device, dtype=t.dtype) - best_corr) / corr_scale
+    lag_excess = torch.relu(best_abs_lag_s - float(lag_seconds)) / lag_scale
+    amp_excess = torch.relu(amp_log_abs - float(amp_log_tol)) / amp_scale
+    failure_score = corr_excess + lag_excess + amp_excess
+    emphasized = torch.clamp(1.0 + failure_score, min=1.0, max=max(float(max_weight), 1.0))
+    return (1.0 + float(strength) * (emphasized - 1.0)).detach()
+
+
 def _soft_lag_steps_from_window(
     pred_win: torch.Tensor,
     target_win: torch.Tensor,
@@ -742,6 +788,7 @@ def phase_drift_rate_loss(
     *,
     dt: float,
     dof_indices: torch.Tensor,
+    static_reference: torch.Tensor | None = None,
     observations: str | Sequence[str] = "tip,last5",
     last_k: int = 5,
     start_time: float = 0.0,
@@ -758,6 +805,12 @@ def phase_drift_rate_loss(
     amplitude_weight: float = 0.0,
     amplitude_power: float = 1.0,
     amplitude_max_weight: float = 4.0,
+    static_failure_weight: float = 0.0,
+    static_failure_max_weight: float = 4.0,
+    static_failure_corr_threshold: float = 0.995,
+    static_failure_lag_seconds: float = 0.02,
+    static_failure_amp_log_tol: float = 0.08,
+    static_failure_max_lag_seconds: float = 0.20,
     eps: float = 1.0e-12,
 ) -> dict[str, torch.Tensor]:
     """
@@ -774,6 +827,14 @@ def phase_drift_rate_loss(
     target_btd = _as_btd(target)
     if pred_btd.shape != target_btd.shape:
         raise ValueError(f"pred/target shape mismatch: {tuple(pred_btd.shape)} vs {tuple(target_btd.shape)}")
+    static_btd = None
+    if static_reference is not None:
+        static_btd = _as_btd(static_reference)
+        if static_btd.shape != target_btd.shape:
+            raise ValueError(
+                f"static_reference/target shape mismatch: {tuple(static_btd.shape)} vs {tuple(target_btd.shape)}"
+            )
+        static_btd = static_btd.to(device=target_btd.device, dtype=target_btd.dtype).detach()
 
     B, T, _ = pred_btd.shape
     obs_list = _parse_observations(observations)
@@ -795,6 +856,7 @@ def phase_drift_rate_loss(
             "mean_abs_dlag_s": zero.detach(),
             "high_weight_mean": zero.detach(),
             "amplitude_weight_mean": zero.detach(),
+            "static_failure_weight_mean": zero.detach(),
             "combined_weight_mean": zero.detach(),
             "n_windows": torch.as_tensor(0.0, device=pred_btd.device, dtype=pred_btd.dtype),
         }
@@ -805,6 +867,7 @@ def phase_drift_rate_loss(
     abs_dlag_terms: list[torch.Tensor] = []
     high_weights_all: list[torch.Tensor] = []
     amplitude_weights_all: list[torch.Tensor] = []
+    static_failure_weights_all: list[torch.Tensor] = []
     combined_weights_all: list[torch.Tensor] = []
     n_windows = 0
 
@@ -821,6 +884,14 @@ def phase_drift_rate_loss(
             observation=obs,
             last_k=last_k,
         )
+        static_sig = None
+        if static_btd is not None:
+            static_sig = direction_observation_signal(
+                static_btd,
+                dof_indices=idx,
+                observation=obs,
+                last_k=last_k,
+            )
         for b in range(B):
             window_lags: list[torch.Tensor] = []
             window_weights: list[torch.Tensor] = []
@@ -853,11 +924,25 @@ def phase_drift_rate_loss(
                     max_weight=amplitude_max_weight,
                     eps=eps,
                 )
-                combined_weight = (weight * amp_weight).detach()
+                static_weight = _static_failure_weight_from_window(
+                    None if static_sig is None else static_sig[b, lo:hi],
+                    t,
+                    dt=dt,
+                    strength=static_failure_weight,
+                    max_weight=static_failure_max_weight,
+                    corr_threshold=static_failure_corr_threshold,
+                    lag_seconds=static_failure_lag_seconds,
+                    amp_log_tol=static_failure_amp_log_tol,
+                    max_lag_seconds=static_failure_max_lag_seconds,
+                    lag_temperature=lag_temperature,
+                    eps=eps,
+                )
+                combined_weight = (weight * amp_weight * static_weight).detach()
                 lag_loss_terms.append(combined_weight * (soft_lag_steps / float(max_lag_steps)) ** 2)
                 abs_lag_terms.append(combined_weight * hard_abs_lag_s)
                 high_weights_all.append(weight)
                 amplitude_weights_all.append(amp_weight)
+                static_failure_weights_all.append(static_weight)
                 combined_weights_all.append(combined_weight)
                 window_lags.append(soft_lag_steps)
                 window_weights.append(combined_weight)
@@ -880,6 +965,7 @@ def phase_drift_rate_loss(
             "mean_abs_dlag_s": zero.detach(),
             "high_weight_mean": zero.detach(),
             "amplitude_weight_mean": zero.detach(),
+            "static_failure_weight_mean": zero.detach(),
             "combined_weight_mean": zero.detach(),
             "n_windows": torch.as_tensor(0.0, device=pred_btd.device, dtype=pred_btd.dtype),
         }
@@ -891,6 +977,7 @@ def phase_drift_rate_loss(
     mean_abs_dlag_s = torch.stack(abs_dlag_terms).mean().detach() if abs_dlag_terms else zero.detach()
     high_weight_mean = torch.stack(high_weights_all).mean().detach()
     amplitude_weight_mean = torch.stack(amplitude_weights_all).mean().detach()
+    static_failure_weight_mean = torch.stack(static_failure_weights_all).mean().detach()
     combined_weight_mean = torch.stack(combined_weights_all).mean().detach()
 
     return {
@@ -901,6 +988,7 @@ def phase_drift_rate_loss(
         "mean_abs_dlag_s": mean_abs_dlag_s,
         "high_weight_mean": high_weight_mean,
         "amplitude_weight_mean": amplitude_weight_mean,
+        "static_failure_weight_mean": static_failure_weight_mean,
         "combined_weight_mean": combined_weight_mean,
         "n_windows": torch.as_tensor(float(n_windows), device=pred_btd.device, dtype=pred_btd.dtype),
     }
@@ -912,6 +1000,7 @@ def adaptive_phase_window_loss(
     *,
     dt: float,
     dof_indices: torch.Tensor,
+    static_reference: torch.Tensor | None = None,
     observations: str | Sequence[str] = "tip,last5",
     last_k: int = 5,
     gate: torch.Tensor | None = None,
@@ -930,6 +1019,12 @@ def adaptive_phase_window_loss(
     amplitude_weight: float = 0.0,
     amplitude_power: float = 1.0,
     amplitude_max_weight: float = 4.0,
+    static_failure_weight: float = 0.0,
+    static_failure_max_weight: float = 4.0,
+    static_failure_corr_threshold: float = 0.995,
+    static_failure_lag_seconds: float = 0.02,
+    static_failure_amp_log_tol: float = 0.08,
+    static_failure_max_lag_seconds: float = 0.20,
     eps: float = 1.0e-12,
 ) -> dict[str, torch.Tensor]:
     """
@@ -948,6 +1043,14 @@ def adaptive_phase_window_loss(
     target_btd = _as_btd(target)
     if pred_btd.shape != target_btd.shape:
         raise ValueError(f"pred/target shape mismatch: {tuple(pred_btd.shape)} vs {tuple(target_btd.shape)}")
+    static_btd = None
+    if static_reference is not None:
+        static_btd = _as_btd(static_reference)
+        if static_btd.shape != target_btd.shape:
+            raise ValueError(
+                f"static_reference/target shape mismatch: {tuple(static_btd.shape)} vs {tuple(target_btd.shape)}"
+            )
+        static_btd = static_btd.to(device=target_btd.device, dtype=target_btd.dtype).detach()
 
     B, T, _ = pred_btd.shape
     obs_list = _parse_observations(observations)
@@ -970,6 +1073,8 @@ def adaptive_phase_window_loss(
             "score_max": zero.detach(),
             "amplitude_weight_mean": zero.detach(),
             "amplitude_weight_max": zero.detach(),
+            "static_failure_weight_mean": zero.detach(),
+            "static_failure_weight_max": zero.detach(),
             "best_abs_lag_s_mean": zero.detach(),
             "best_corr_mean": zero.detach(),
             "corr0_mean": zero.detach(),
@@ -1005,6 +1110,7 @@ def adaptive_phase_window_loss(
     starts: list[float] = []
     gate_means: list[torch.Tensor] = []
     amp_weights: list[torch.Tensor] = []
+    static_failure_weights: list[torch.Tensor] = []
 
     for obs in obs_list:
         pred_sig = direction_observation_signal(
@@ -1019,6 +1125,14 @@ def adaptive_phase_window_loss(
             observation=obs,
             last_k=last_k,
         )
+        static_sig = None
+        if static_btd is not None:
+            static_sig = direction_observation_signal(
+                static_btd,
+                dof_indices=idx,
+                observation=obs,
+                last_k=last_k,
+            )
 
         for b in range(B):
             for lo in range(start_idx, end_idx - win_steps + 1, stride_steps):
@@ -1050,16 +1164,31 @@ def adaptive_phase_window_loss(
                     max_weight=amplitude_max_weight,
                     eps=eps,
                 )
+                static_weight = _static_failure_weight_from_window(
+                    None if static_sig is None else static_sig[b, lo:hi],
+                    t,
+                    dt=dt,
+                    strength=static_failure_weight,
+                    max_weight=static_failure_max_weight,
+                    corr_threshold=static_failure_corr_threshold,
+                    lag_seconds=static_failure_lag_seconds,
+                    amp_log_tol=static_failure_amp_log_tol,
+                    max_lag_seconds=static_failure_max_lag_seconds,
+                    lag_temperature=lag_temperature,
+                    eps=eps,
+                )
+                mining_weight = (amp_weight * static_weight).detach()
 
                 lag_losses.append(lag["lag_loss"])
                 phase_losses.append(complex_loss["phase_loss"])
                 amp_losses.append(complex_loss["amp_guard_loss"])
-                scores.append(lag["score"] * amp_weight)
+                scores.append(lag["score"] * mining_weight)
                 best_abs_lags.append(lag["best_abs_lag_s"].detach())
                 best_corrs.append(lag["best_corr"].detach())
                 corr0s.append(lag["corr0"].detach())
                 starts.append(float(lo) * float(dt))
                 amp_weights.append(amp_weight)
+                static_failure_weights.append(static_weight)
                 if gate_btg is not None:
                     gate_means.append(gate_btg[b, lo:hi, :].mean())
 
@@ -1074,6 +1203,8 @@ def adaptive_phase_window_loss(
             "score_max": zero.detach(),
             "amplitude_weight_mean": zero.detach(),
             "amplitude_weight_max": zero.detach(),
+            "static_failure_weight_mean": zero.detach(),
+            "static_failure_weight_max": zero.detach(),
             "best_abs_lag_s_mean": zero.detach(),
             "best_corr_mean": zero.detach(),
             "corr0_mean": zero.detach(),
@@ -1092,6 +1223,7 @@ def adaptive_phase_window_loss(
     score_tensor = torch.stack(scores).detach()
     start_tensor = torch.as_tensor(starts, device=pred_btd.device, dtype=pred_btd.dtype)
     amp_weight_tensor = torch.stack(amp_weights).detach()
+    static_failure_weight_tensor = torch.stack(static_failure_weights).detach()
 
     n_windows = int(score_tensor.numel())
     if int(top_k) > 0:
@@ -1131,6 +1263,8 @@ def adaptive_phase_window_loss(
         "score_max": score_tensor.max().detach(),
         "amplitude_weight_mean": amp_weight_tensor.mean().detach(),
         "amplitude_weight_max": amp_weight_tensor.max().detach(),
+        "static_failure_weight_mean": static_failure_weight_tensor.mean().detach(),
+        "static_failure_weight_max": static_failure_weight_tensor.max().detach(),
         "best_abs_lag_s_mean": torch.stack(best_abs_lags).mean().detach(),
         "best_corr_mean": torch.stack(best_corrs).mean().detach(),
         "corr0_mean": torch.stack(corr0s).mean().detach(),

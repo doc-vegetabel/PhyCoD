@@ -487,6 +487,8 @@ class TransformerPhysicalTrainConfig:
     phase_window_amplitude_weight: float = 0.0
     phase_window_amplitude_power: float = 1.0
     phase_window_amplitude_max_weight: float = 4.0
+    phase_window_static_failure_weight: float = 0.0
+    phase_window_static_failure_max_weight: float = 4.0
     w_adaptive_phase_x: float = 0.0
     w_adaptive_phase_y: float = 0.0
     w_complex_phase_x: float = 0.0
@@ -517,6 +519,8 @@ class TransformerPhysicalTrainConfig:
     phase_drift_amplitude_weight: float = 0.0
     phase_drift_amplitude_power: float = 1.0
     phase_drift_amplitude_max_weight: float = 4.0
+    phase_drift_static_failure_weight: float = 0.0
+    phase_drift_static_failure_max_weight: float = 4.0
     use_static_quality_gate_suppression: bool = False
     w_static_good_gate_l1: float = 0.0
     static_quality_observations: str = "tip,last5"
@@ -1467,6 +1471,10 @@ ADAPTIVE_PHASE_LOG_METRIC_KEYS = [
     "adaptive_y_amplitude_weight_mean",
     "adaptive_x_amplitude_weight_max",
     "adaptive_y_amplitude_weight_max",
+    "adaptive_x_static_failure_weight_mean",
+    "adaptive_y_static_failure_weight_mean",
+    "adaptive_x_static_failure_weight_max",
+    "adaptive_y_static_failure_weight_max",
     "adaptive_x_best_abs_lag_s_mean",
     "adaptive_y_best_abs_lag_s_mean",
     "adaptive_x_best_corr_mean",
@@ -1500,6 +1508,8 @@ ADAPTIVE_PHASE_LOG_METRIC_KEYS = [
     "phase_drift_y_high_weight_mean",
     "phase_drift_x_amplitude_weight_mean",
     "phase_drift_y_amplitude_weight_mean",
+    "phase_drift_x_static_failure_weight_mean",
+    "phase_drift_y_static_failure_weight_mean",
     "phase_drift_x_combined_weight_mean",
     "phase_drift_y_combined_weight_mean",
     "phase_drift_x_n_windows",
@@ -1521,6 +1531,8 @@ ADAPTIVE_PHASE_MAX_METRIC_KEYS = {
     "adaptive_y_score_max",
     "adaptive_x_amplitude_weight_max",
     "adaptive_y_amplitude_weight_max",
+    "adaptive_x_static_failure_weight_max",
+    "adaptive_y_static_failure_weight_max",
     "adaptive_x_selected_t_start_max",
     "adaptive_y_selected_t_start_max",
     "static_quality_score_max",
@@ -1709,6 +1721,7 @@ def adaptive_phase_window_training_loss(
         *,
         pred: torch.Tensor,
         teacher: torch.Tensor,
+        static: torch.Tensor,
         theta_aux: Optional[dict[str, torch.Tensor]],
         cfg: TransformerPhysicalTrainConfig,
         x_idx: torch.Tensor,
@@ -1731,6 +1744,8 @@ def adaptive_phase_window_training_loss(
             "score_max",
             "amplitude_weight_mean",
             "amplitude_weight_max",
+            "static_failure_weight_mean",
+            "static_failure_weight_max",
             "best_abs_lag_s_mean",
             "best_corr_mean",
             "corr0_mean",
@@ -1770,6 +1785,12 @@ def adaptive_phase_window_training_loss(
         amplitude_weight=float(cfg.phase_window_amplitude_weight),
         amplitude_power=float(cfg.phase_window_amplitude_power),
         amplitude_max_weight=float(cfg.phase_window_amplitude_max_weight),
+        static_failure_weight=float(cfg.phase_window_static_failure_weight),
+        static_failure_max_weight=float(cfg.phase_window_static_failure_max_weight),
+        static_failure_corr_threshold=float(cfg.static_quality_good_corr_threshold),
+        static_failure_lag_seconds=float(cfg.static_quality_good_lag_seconds),
+        static_failure_amp_log_tol=float(cfg.static_quality_good_amp_log_tol),
+        static_failure_max_lag_seconds=float(cfg.static_quality_max_lag_seconds),
     )
     amp_ref_x = (
         float(cfg.phase_window_amplitude_reference_x)
@@ -1786,6 +1807,7 @@ def adaptive_phase_window_training_loss(
         pred,
         teacher,
         dof_indices=x_idx,
+        static_reference=static,
         amplitude_reference=amp_ref_x,
         **common_kwargs,
     )
@@ -1793,6 +1815,7 @@ def adaptive_phase_window_training_loss(
         pred,
         teacher,
         dof_indices=y_idx,
+        static_reference=static,
         amplitude_reference=amp_ref_y,
         **common_kwargs,
     )
@@ -1830,6 +1853,8 @@ def adaptive_phase_window_training_loss(
             "score_max",
             "amplitude_weight_mean",
             "amplitude_weight_max",
+            "static_failure_weight_mean",
+            "static_failure_weight_max",
             "best_abs_lag_s_mean",
             "best_corr_mean",
             "corr0_mean",
@@ -1850,6 +1875,7 @@ def phase_drift_rate_training_loss(
         *,
         pred: torch.Tensor,
         teacher: torch.Tensor,
+        static: torch.Tensor,
         cfg: TransformerPhysicalTrainConfig,
         x_idx: torch.Tensor,
         y_idx: torch.Tensor,
@@ -1869,6 +1895,8 @@ def phase_drift_rate_training_loss(
         "phase_drift_y_high_weight_mean": zero.detach(),
         "phase_drift_x_amplitude_weight_mean": zero.detach(),
         "phase_drift_y_amplitude_weight_mean": zero.detach(),
+        "phase_drift_x_static_failure_weight_mean": zero.detach(),
+        "phase_drift_y_static_failure_weight_mean": zero.detach(),
         "phase_drift_x_combined_weight_mean": zero.detach(),
         "phase_drift_y_combined_weight_mean": zero.detach(),
         "phase_drift_x_n_windows": zero.detach(),
@@ -1894,6 +1922,12 @@ def phase_drift_rate_training_loss(
         amplitude_weight=float(cfg.phase_drift_amplitude_weight),
         amplitude_power=float(cfg.phase_drift_amplitude_power),
         amplitude_max_weight=float(cfg.phase_drift_amplitude_max_weight),
+        static_failure_weight=float(cfg.phase_drift_static_failure_weight),
+        static_failure_max_weight=float(cfg.phase_drift_static_failure_max_weight),
+        static_failure_corr_threshold=float(cfg.static_quality_good_corr_threshold),
+        static_failure_lag_seconds=float(cfg.static_quality_good_lag_seconds),
+        static_failure_amp_log_tol=float(cfg.static_quality_good_amp_log_tol),
+        static_failure_max_lag_seconds=float(cfg.static_quality_max_lag_seconds),
     )
     amp_ref_x = (
         float(cfg.phase_drift_amplitude_reference_x)
@@ -1909,6 +1943,7 @@ def phase_drift_rate_training_loss(
         pred,
         teacher,
         dof_indices=x_idx,
+        static_reference=static,
         amplitude_reference=amp_ref_x,
         **common_kwargs,
     )
@@ -1916,6 +1951,7 @@ def phase_drift_rate_training_loss(
         pred,
         teacher,
         dof_indices=y_idx,
+        static_reference=static,
         amplitude_reference=amp_ref_y,
         **common_kwargs,
     )
@@ -1939,6 +1975,8 @@ def phase_drift_rate_training_loss(
         "phase_drift_y_high_weight_mean": drift_y["high_weight_mean"],
         "phase_drift_x_amplitude_weight_mean": drift_x["amplitude_weight_mean"],
         "phase_drift_y_amplitude_weight_mean": drift_y["amplitude_weight_mean"],
+        "phase_drift_x_static_failure_weight_mean": drift_x["static_failure_weight_mean"],
+        "phase_drift_y_static_failure_weight_mean": drift_y["static_failure_weight_mean"],
         "phase_drift_x_combined_weight_mean": drift_x["combined_weight_mean"],
         "phase_drift_y_combined_weight_mean": drift_y["combined_weight_mean"],
         "phase_drift_x_n_windows": drift_x["n_windows"],
@@ -2560,6 +2598,7 @@ def compute_response_loss(
     adaptive_phase = adaptive_phase_window_training_loss(
         pred=pred,
         teacher=teacher,
+        static=case.u_static.to(device=u_pred.device, dtype=u_pred.dtype),
         theta_aux=theta_aux,
         cfg=cfg,
         x_idx=x_idx,
@@ -2568,6 +2607,7 @@ def compute_response_loss(
     phase_drift = phase_drift_rate_training_loss(
         pred=pred,
         teacher=teacher,
+        static=case.u_static.to(device=u_pred.device, dtype=u_pred.dtype),
         cfg=cfg,
         x_idx=x_idx,
         y_idx=y_idx,
@@ -2655,6 +2695,8 @@ def compute_response_loss(
         "phase_drift_y_high_weight_mean": phase_drift["phase_drift_y_high_weight_mean"],
         "phase_drift_x_amplitude_weight_mean": phase_drift["phase_drift_x_amplitude_weight_mean"],
         "phase_drift_y_amplitude_weight_mean": phase_drift["phase_drift_y_amplitude_weight_mean"],
+        "phase_drift_x_static_failure_weight_mean": phase_drift["phase_drift_x_static_failure_weight_mean"],
+        "phase_drift_y_static_failure_weight_mean": phase_drift["phase_drift_y_static_failure_weight_mean"],
         "phase_drift_x_combined_weight_mean": phase_drift["phase_drift_x_combined_weight_mean"],
         "phase_drift_y_combined_weight_mean": phase_drift["phase_drift_y_combined_weight_mean"],
         "phase_drift_x_n_windows": phase_drift["phase_drift_x_n_windows"],
@@ -3954,6 +3996,10 @@ def parse_args() -> tuple[
                         default=d.phase_window_amplitude_power)
     parser.add_argument("--phase-window-amplitude-max-weight", type=float,
                         default=d.phase_window_amplitude_max_weight)
+    parser.add_argument("--phase-window-static-failure-weight", type=float,
+                        default=d.phase_window_static_failure_weight)
+    parser.add_argument("--phase-window-static-failure-max-weight", type=float,
+                        default=d.phase_window_static_failure_max_weight)
     parser.add_argument("--w-adaptive-phase-x", type=float, default=d.w_adaptive_phase_x)
     parser.add_argument("--w-adaptive-phase-y", type=float, default=d.w_adaptive_phase_y)
     parser.add_argument("--w-complex-phase-x", type=float, default=d.w_complex_phase_x)
@@ -3995,6 +4041,10 @@ def parse_args() -> tuple[
                         default=d.phase_drift_amplitude_power)
     parser.add_argument("--phase-drift-amplitude-max-weight", type=float,
                         default=d.phase_drift_amplitude_max_weight)
+    parser.add_argument("--phase-drift-static-failure-weight", type=float,
+                        default=d.phase_drift_static_failure_weight)
+    parser.add_argument("--phase-drift-static-failure-max-weight", type=float,
+                        default=d.phase_drift_static_failure_max_weight)
     parser.add_argument("--use-static-quality-gate-suppression", action="store_true",
                         default=d.use_static_quality_gate_suppression)
     parser.add_argument("--no-static-quality-gate-suppression", dest="use_static_quality_gate_suppression",
@@ -4316,6 +4366,8 @@ def parse_args() -> tuple[
         phase_window_amplitude_weight=float(args.phase_window_amplitude_weight),
         phase_window_amplitude_power=float(args.phase_window_amplitude_power),
         phase_window_amplitude_max_weight=float(args.phase_window_amplitude_max_weight),
+        phase_window_static_failure_weight=float(args.phase_window_static_failure_weight),
+        phase_window_static_failure_max_weight=float(args.phase_window_static_failure_max_weight),
         w_adaptive_phase_x=float(args.w_adaptive_phase_x),
         w_adaptive_phase_y=float(args.w_adaptive_phase_y),
         w_complex_phase_x=float(args.w_complex_phase_x),
@@ -4346,6 +4398,8 @@ def parse_args() -> tuple[
         phase_drift_amplitude_weight=float(args.phase_drift_amplitude_weight),
         phase_drift_amplitude_power=float(args.phase_drift_amplitude_power),
         phase_drift_amplitude_max_weight=float(args.phase_drift_amplitude_max_weight),
+        phase_drift_static_failure_weight=float(args.phase_drift_static_failure_weight),
+        phase_drift_static_failure_max_weight=float(args.phase_drift_static_failure_max_weight),
         use_static_quality_gate_suppression=bool(args.use_static_quality_gate_suppression),
         w_static_good_gate_l1=float(args.w_static_good_gate_l1),
         static_quality_observations=str(args.static_quality_observations),
@@ -4482,7 +4536,9 @@ def main() -> None:
             f"freq=[{cfg.phase_window_freq_min}, {cfg.phase_window_freq_max}], "
             f"amp_ref={cfg.phase_window_amplitude_reference}, "
             f"amp_ref_xy=({cfg.phase_window_amplitude_reference_x}, {cfg.phase_window_amplitude_reference_y}), "
-            f"amp_weight={cfg.phase_window_amplitude_weight}"
+            f"amp_weight={cfg.phase_window_amplitude_weight}, "
+            f"static_failure_weight={cfg.phase_window_static_failure_weight}, "
+            f"static_failure_max_weight={cfg.phase_window_static_failure_max_weight}"
         )
     print(f"  use_phase_drift_rate_loss = {cfg.use_phase_drift_rate_loss}")
     if bool(cfg.use_phase_drift_rate_loss):
@@ -4493,7 +4549,9 @@ def main() -> None:
             f"amp_ref={cfg.phase_drift_amplitude_reference}, "
             f"amp_ref_xy=({cfg.phase_drift_amplitude_reference_x}, {cfg.phase_drift_amplitude_reference_y}), "
             f"amp_weight={cfg.phase_drift_amplitude_weight}, "
-            f"amp_max_weight={cfg.phase_drift_amplitude_max_weight}"
+            f"amp_max_weight={cfg.phase_drift_amplitude_max_weight}, "
+            f"static_failure_weight={cfg.phase_drift_static_failure_weight}, "
+            f"static_failure_max_weight={cfg.phase_drift_static_failure_max_weight}"
         )
     print(f"  use_static_quality_gate_suppression = {cfg.use_static_quality_gate_suppression}")
     if bool(cfg.use_static_quality_gate_suppression):
