@@ -296,3 +296,12 @@ python tests/compare_full_corrected_core_vs_student.py --time-series-load-file d
 |---|---|---|---|---|
 | 2026-05-12 Asia/Shanghai | `src/student/transformer/transformer_rollout_torch.py` | Add supplied-theta rollout helper | Add `rollout_with_theta_sequence(...)` so training diagnostics can run the physical Newmark core with an externally supplied theta sequence such as `theta_slow`. This keeps the dynamic core interface unchanged and still uses `theta[:,t,:]` for each Newmark step. | slow/fast phase-gate separation |
 | 2026-05-12 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Add slow-only branch diagnosis loss | Add optional `--use-slow-only-branch-diagnosis`. When enabled, training runs a detached slow-only rollout with `theta_slow`, uses slow-vs-teacher local lag/corr/amplitude quality to decide whether the fast branch should be suppressed or allowed, and logs `slow_*` diagnostics. The total physical theta passed to the main rollout remains `[alpha_x_total, alpha_xy_total]`. | slow/fast phase-gate separation |
+
+---
+
+## 22. 2026-05-13 remove case-name guard paths
+
+| Time | Files | Required Note | Content | Stage |
+|---|---|---|---|---|
+| 2026-05-13 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Remove case-name/manual guard controls | Remove the case-name keyword no-regression guard, explicit guard-only case inputs, and simple-case gate L1 regularizer. Deleted CLI/config entries include `--use-no-regression-guard`, `--no-regression-guard-case-keywords`, `--w-no-regression-*`, `--guard-load-files`, `--guard-case-paths`, `--w-guard-case-loss`, and `--w-phase-gate-simple-l1`. | state-driven phase/frequency generalization |
+| 2026-05-13 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Preserve automatic protection mechanisms | Keep state-window no-regression, static-quality gate suppression, and slow-only branch diagnosis. `guarded_freq` checkpoint scoring now uses `state_no_regression_guard_loss`, so protection is driven by local response quality rather than case names or manually selected guard cases. | state-driven phase/frequency generalization |

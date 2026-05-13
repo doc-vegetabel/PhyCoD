@@ -314,10 +314,6 @@ class TransformerPhysicalTrainConfig:
 
     load_suffix: str = DEFAULT_LOAD_SUFFIX
     load_case_start_index: int = DEFAULT_LOAD_CASE_START_INDEX
-    guard_load_files: Optional[str] = None
-    guard_case_paths: Optional[str] = None
-    w_guard_case_loss: float = 1.0
-
     n_train_cases: int = DEFAULT_N_TRAIN_CASES
     n_valid_cases: int = DEFAULT_N_VALID_CASES
     n_test_cases: int = DEFAULT_N_TEST_CASES
@@ -549,19 +545,6 @@ class TransformerPhysicalTrainConfig:
     state_no_regression_corr_drop_tol: float = 0.01
     state_no_regression_amp_log_tol: float = 0.08
 
-    # Response-level no-regression guard for cases that should not be harmed
-    # while high-frequency / complex phase correction is strengthened.
-    use_no_regression_guard: bool = False
-    no_regression_guard_case_keywords: str = "simple,tip_fx,tip_fy,freq_low,f0p150,low"
-    w_no_regression_response: float = 0.0
-    w_no_regression_lag: float = 0.0
-    w_no_regression_amp: float = 0.0
-    no_regression_x_ratio_limit: float = 1.0
-    no_regression_y_ratio_limit: float = 1.0
-    no_regression_tip_y_ratio_limit: float = 1.02
-    no_regression_last5_y_ratio_limit: float = 1.02
-    no_regression_lag_tol_seconds: float = 0.02
-    no_regression_amp_log_tol: float = 0.08
     best_score_guard_weight: float = 1.0
 
     # Optional slow + phase-gated fast decomposition for alpha_x / alpha_xy.
@@ -579,7 +562,6 @@ class TransformerPhysicalTrainConfig:
     w_theta_fast_smooth: float = 1.0e-4
     w_phase_gate_l1: float = 1.0e-3
     w_phase_gate_tv: float = 1.0e-3
-    w_phase_gate_simple_l1: float = 5.0e-3
     phase_gate_active_threshold: float = 0.2
 
     # Optional from-scratch curriculum. It leaves the model/core unchanged and
@@ -769,7 +751,6 @@ def make_epoch_curriculum_cfg(
             "effective_w_phase_drift_rate_y": float(cfg.w_phase_drift_rate_y),
             "effective_w_phase_gate_l1": float(cfg.w_phase_gate_l1),
             "effective_w_phase_gate_tv": float(cfg.w_phase_gate_tv),
-            "effective_w_phase_gate_simple_l1": float(cfg.w_phase_gate_simple_l1),
             "effective_w_static_good_gate_l1": float(cfg.w_static_good_gate_l1),
             "effective_w_state_no_regression_response": float(cfg.w_state_no_regression_response),
             "effective_w_state_no_regression_corr": float(cfg.w_state_no_regression_corr),
@@ -833,7 +814,6 @@ def make_epoch_curriculum_cfg(
         w_phase_drift_rate_y=float(cfg.w_phase_drift_rate_y) * phase_scale,
         w_phase_gate_l1=float(cfg.w_phase_gate_l1) * gate_reg_scale,
         w_phase_gate_tv=float(cfg.w_phase_gate_tv) * gate_reg_scale,
-        w_phase_gate_simple_l1=float(cfg.w_phase_gate_simple_l1) * gate_reg_scale,
         w_static_good_gate_l1=float(cfg.w_static_good_gate_l1) * static_good_gate_scale,
         w_state_no_regression_response=float(cfg.w_state_no_regression_response) * guard_scale,
         w_state_no_regression_corr=float(cfg.w_state_no_regression_corr) * guard_scale,
@@ -857,7 +837,6 @@ def make_epoch_curriculum_cfg(
         "effective_w_phase_drift_rate_y": float(epoch_cfg.w_phase_drift_rate_y),
         "effective_w_phase_gate_l1": float(epoch_cfg.w_phase_gate_l1),
         "effective_w_phase_gate_tv": float(epoch_cfg.w_phase_gate_tv),
-        "effective_w_phase_gate_simple_l1": float(epoch_cfg.w_phase_gate_simple_l1),
         "effective_w_static_good_gate_l1": float(epoch_cfg.w_static_good_gate_l1),
         "effective_w_state_no_regression_response": float(epoch_cfg.w_state_no_regression_response),
         "effective_w_state_no_regression_corr": float(epoch_cfg.w_state_no_regression_corr),
@@ -1409,32 +1388,12 @@ def prime_alignment_loss_caches(
 # ============================================================
 
 
-def _is_simple_training_case_name(case_name: str) -> bool:
-    name = str(case_name).lower()
-    return (
-        "simple" in name
-        or "tip_fx" in name
-        or "tip_fy" in name
-        or "tip-fx" in name
-        or "tip-fy" in name
-    )
-
-
 def _split_keyword_list(value: str) -> list[str]:
     return [
         item.strip().lower()
         for item in str(value).replace(";", ",").split(",")
         if item.strip()
     ]
-
-
-def _is_no_regression_guard_case_name(case_name: str, cfg: TransformerPhysicalTrainConfig) -> bool:
-    if not bool(getattr(cfg, "use_no_regression_guard", False)):
-        return False
-    name = str(case_name).lower()
-    keywords = _split_keyword_list(str(cfg.no_regression_guard_case_keywords))
-    return any(keyword in name for keyword in keywords)
-
 
 PHASE_GATED_LOG_METRIC_KEYS = [
     "phase_reg_loss",
@@ -1443,7 +1402,6 @@ PHASE_GATED_LOG_METRIC_KEYS = [
     "theta_fast_smooth",
     "phase_gate_l1",
     "phase_gate_tv",
-    "phase_gate_simple_l1",
     "phase_gate_mean",
     "phase_gate_max",
     "phase_gate_active_ratio",
@@ -1565,19 +1523,6 @@ ADAPTIVE_PHASE_MIN_METRIC_KEYS = {
 }
 
 NO_REGRESSION_LOG_METRIC_KEYS = [
-    "no_regression_guard_loss",
-    "no_regression_response_guard_loss",
-    "no_regression_lag_guard_loss",
-    "no_regression_amp_guard_loss",
-    "no_regression_guard_active",
-    "no_regression_x_ratio_excess",
-    "no_regression_y_ratio_excess",
-    "no_regression_tip_y_ratio_excess",
-    "no_regression_last5_y_ratio_excess",
-    "no_regression_x_lag_excess_s",
-    "no_regression_y_lag_excess_s",
-    "no_regression_x_amp_log_excess",
-    "no_regression_y_amp_log_excess",
     "state_no_regression_guard_loss",
     "state_no_regression_response_guard_loss",
     "state_no_regression_corr_guard_loss",
@@ -1587,19 +1532,6 @@ NO_REGRESSION_LOG_METRIC_KEYS = [
     "state_no_regression_corr_drop_excess",
     "state_no_regression_amp_log_excess",
     "state_no_regression_n_windows",
-]
-
-GUARD_CASE_LOG_METRIC_KEYS = [
-    "guard_case_count",
-    "guard_total_loss",
-    "guard_no_regression_guard_loss",
-    "guard_x_ratio",
-    "guard_y_ratio",
-    "guard_tip_y_ratio",
-    "guard_last5_y_ratio",
-    "guard_phase_gate_mean",
-    "guard_phase_gate_max",
-    "guard_phase_gate_active_ratio",
 ]
 
 TIMING_LOG_METRIC_KEYS = [
@@ -1651,7 +1583,6 @@ def phase_gated_decomposition_regularization_loss(
         cfg: TransformerPhysicalTrainConfig,
         dtype: torch.dtype,
         device: torch.device,
-        case_name: str,
 ) -> dict[str, torch.Tensor]:
     """
     Regularize slow + phase-gated fast decomposition without changing K_eff interface.
@@ -1660,8 +1591,7 @@ def phase_gated_decomposition_regularization_loss(
     internal decomposition:
       - slow branch: stronger smoothness;
       - fast branch: bounded amplitude and weak smoothness;
-      - phase gate: sparse and temporally stable;
-      - simple cases: stronger gate sparsity to avoid unnecessary fast correction.
+      - phase gate: sparse and temporally stable.
     """
     zero = torch.zeros((), dtype=dtype, device=device)
     if not bool(getattr(cfg, "use_phase_gated_decomposition", False)) or theta_aux is None:
@@ -1672,7 +1602,6 @@ def phase_gated_decomposition_regularization_loss(
             "theta_fast_smooth": zero,
             "phase_gate_l1": zero,
             "phase_gate_tv": zero,
-            "phase_gate_simple_l1": zero,
             "phase_gate_mean": zero,
             "phase_gate_max": zero,
             "phase_gate_active_ratio": zero,
@@ -1708,7 +1637,6 @@ def phase_gated_decomposition_regularization_loss(
         gate_tv = torch.mean(torch.abs(g_phase[:, 1:, :] - g_phase[:, :-1, :]))
     else:
         gate_tv = zero
-    simple_gate_l1 = gate_l1 if _is_simple_training_case_name(case_name) else zero
 
     phase_reg_loss = (
         float(cfg.w_theta_slow_smooth) * slow_smooth
@@ -1716,7 +1644,6 @@ def phase_gated_decomposition_regularization_loss(
         + float(cfg.w_theta_fast_smooth) * fast_smooth
         + float(cfg.w_phase_gate_l1) * gate_l1
         + float(cfg.w_phase_gate_tv) * gate_tv
-        + float(cfg.w_phase_gate_simple_l1) * simple_gate_l1
     )
 
     return {
@@ -1726,7 +1653,6 @@ def phase_gated_decomposition_regularization_loss(
         "theta_fast_smooth": fast_smooth,
         "phase_gate_l1": gate_l1,
         "phase_gate_tv": gate_tv,
-        "phase_gate_simple_l1": simple_gate_l1,
         "phase_gate_mean": torch.mean(g_phase),
         "phase_gate_max": torch.max(g_phase),
         "phase_gate_active_ratio": torch.mean(
@@ -2615,89 +2541,6 @@ def _demeaned_rms_ratio(
     return p_rms / t_rms.clamp_min(eps)
 
 
-def no_regression_guard_loss(
-        *,
-        pred: torch.Tensor,
-        teacher: torch.Tensor,
-        cfg: TransformerPhysicalTrainConfig,
-        case_name: str,
-        x_idx: torch.Tensor,
-        y_idx: torch.Tensor,
-        x_ratio: torch.Tensor,
-        y_ratio: torch.Tensor,
-        tip_y_ratio: torch.Tensor,
-        last5_y_ratio: torch.Tensor,
-        align_x: dict[str, torch.Tensor],
-        align_y: dict[str, torch.Tensor],
-        eps: torch.Tensor,
-) -> dict[str, torch.Tensor]:
-    zero = torch.zeros((), dtype=pred.dtype, device=pred.device)
-    active = _is_no_regression_guard_case_name(case_name, cfg)
-    if not active:
-        return {
-            "no_regression_guard_loss": zero,
-            "no_regression_response_guard_loss": zero,
-            "no_regression_lag_guard_loss": zero,
-            "no_regression_amp_guard_loss": zero,
-            "no_regression_guard_active": zero.detach(),
-            "no_regression_x_ratio_excess": zero.detach(),
-            "no_regression_y_ratio_excess": zero.detach(),
-            "no_regression_tip_y_ratio_excess": zero.detach(),
-            "no_regression_last5_y_ratio_excess": zero.detach(),
-            "no_regression_x_lag_excess_s": zero.detach(),
-            "no_regression_y_lag_excess_s": zero.detach(),
-            "no_regression_x_amp_log_excess": zero.detach(),
-            "no_regression_y_amp_log_excess": zero.detach(),
-        }
-
-    x_ratio_excess = torch.relu(x_ratio - float(cfg.no_regression_x_ratio_limit))
-    y_ratio_excess = torch.relu(y_ratio - float(cfg.no_regression_y_ratio_limit))
-    tip_y_ratio_excess = torch.relu(tip_y_ratio - float(cfg.no_regression_tip_y_ratio_limit))
-    last5_y_ratio_excess = torch.relu(last5_y_ratio - float(cfg.no_regression_last5_y_ratio_limit))
-    response_guard = (
-        x_ratio_excess ** 2
-        + y_ratio_excess ** 2
-        + tip_y_ratio_excess ** 2
-        + last5_y_ratio_excess ** 2
-    )
-
-    lag_tol = float(cfg.no_regression_lag_tol_seconds)
-    x_lag_excess = torch.relu(align_x["mean_abs_lag_s"].to(dtype=pred.dtype, device=pred.device) - lag_tol)
-    y_lag_excess = torch.relu(align_y["mean_abs_lag_s"].to(dtype=pred.dtype, device=pred.device) - lag_tol)
-    x_lag_gate = (x_lag_excess.detach() > 0).to(dtype=pred.dtype)
-    y_lag_gate = (y_lag_excess.detach() > 0).to(dtype=pred.dtype)
-    lag_guard = x_lag_gate * align_x["lag_loss"] + y_lag_gate * align_y["lag_loss"]
-
-    amp_tol = float(cfg.no_regression_amp_log_tol)
-    x_amp_ratio = _demeaned_rms_ratio(pred, teacher, x_idx, eps)
-    y_amp_ratio = _demeaned_rms_ratio(pred, teacher, y_idx, eps)
-    x_amp_log_excess = torch.relu(torch.abs(torch.log(x_amp_ratio.clamp_min(eps))) - amp_tol)
-    y_amp_log_excess = torch.relu(torch.abs(torch.log(y_amp_ratio.clamp_min(eps))) - amp_tol)
-    amp_guard = x_amp_log_excess ** 2 + y_amp_log_excess ** 2
-
-    guard_loss = (
-        float(cfg.w_no_regression_response) * response_guard
-        + float(cfg.w_no_regression_lag) * lag_guard
-        + float(cfg.w_no_regression_amp) * amp_guard
-    )
-
-    return {
-        "no_regression_guard_loss": guard_loss,
-        "no_regression_response_guard_loss": response_guard,
-        "no_regression_lag_guard_loss": lag_guard,
-        "no_regression_amp_guard_loss": amp_guard,
-        "no_regression_guard_active": torch.as_tensor(1.0, dtype=pred.dtype, device=pred.device),
-        "no_regression_x_ratio_excess": x_ratio_excess.detach(),
-        "no_regression_y_ratio_excess": y_ratio_excess.detach(),
-        "no_regression_tip_y_ratio_excess": tip_y_ratio_excess.detach(),
-        "no_regression_last5_y_ratio_excess": last5_y_ratio_excess.detach(),
-        "no_regression_x_lag_excess_s": x_lag_excess.detach(),
-        "no_regression_y_lag_excess_s": y_lag_excess.detach(),
-        "no_regression_x_amp_log_excess": x_amp_log_excess.detach(),
-        "no_regression_y_amp_log_excess": y_amp_log_excess.detach(),
-    }
-
-
 def compute_response_loss(
         *,
         u_pred: torch.Tensor,
@@ -2710,8 +2553,6 @@ def compute_response_loss(
         theta: torch.Tensor,
         theta_aux: Optional[dict[str, torch.Tensor]] = None,
         u_slow: Optional[torch.Tensor] = None,
-        case_name: str = "",
-        guard_only: bool = False,
 ) -> dict[str, torch.Tensor]:
     """
     alpha_x / alpha_xy training loss.
@@ -2839,22 +2680,6 @@ def compute_response_loss(
             + float(cfg.w_lag_y) * align_y["lag_loss"]
     )
 
-    no_regression = no_regression_guard_loss(
-        pred=pred,
-        teacher=teacher,
-        cfg=cfg,
-        case_name=case_name,
-        x_idx=x_idx,
-        y_idx=y_idx,
-        x_ratio=x_ratio,
-        y_ratio=y_ratio,
-        tip_y_ratio=tip_y_ratio,
-        last5_y_ratio=last5_y_ratio,
-        align_x=align_x,
-        align_y=align_y,
-        eps=eps,
-    )
-
     adaptive_phase = adaptive_phase_window_training_loss(
         pred=pred,
         teacher=teacher,
@@ -2920,25 +2745,16 @@ def compute_response_loss(
         cfg=cfg,
         dtype=u_pred.dtype,
         device=u_pred.device,
-        case_name=case_name,
     )
     base_reg_loss = float(cfg.w_theta_amp) * amp + float(cfg.w_theta_smooth) * smooth
     reg_loss = base_reg_loss + phase_reg["phase_reg_loss"] + static_quality_gate["static_quality_gate_loss"]
 
-    if bool(guard_only):
-        total_loss = (
-            no_regression["no_regression_guard_loss"]
-            + state_no_regression["state_no_regression_guard_loss"]
-            + reg_loss
-        )
-    else:
-        total_loss = (
-            response_loss
-            + freq_loss
-            + reg_loss
-            + no_regression["no_regression_guard_loss"]
-            + state_no_regression["state_no_regression_guard_loss"]
-        )
+    total_loss = (
+        response_loss
+        + freq_loss
+        + reg_loss
+        + state_no_regression["state_no_regression_guard_loss"]
+    )
 
     result = {
         "total_loss": total_loss,
@@ -2983,19 +2799,6 @@ def compute_response_loss(
         "slow_bad_gate_mean": slow_only_diag["slow_bad_gate_mean"],
         "slow_bad_phase_mean_abs_lag_s": slow_only_diag["slow_bad_phase_mean_abs_lag_s"],
         "slow_only_n_windows": slow_only_diag["slow_only_n_windows"],
-        "no_regression_guard_loss": no_regression["no_regression_guard_loss"],
-        "no_regression_response_guard_loss": no_regression["no_regression_response_guard_loss"],
-        "no_regression_lag_guard_loss": no_regression["no_regression_lag_guard_loss"],
-        "no_regression_amp_guard_loss": no_regression["no_regression_amp_guard_loss"],
-        "no_regression_guard_active": no_regression["no_regression_guard_active"],
-        "no_regression_x_ratio_excess": no_regression["no_regression_x_ratio_excess"],
-        "no_regression_y_ratio_excess": no_regression["no_regression_y_ratio_excess"],
-        "no_regression_tip_y_ratio_excess": no_regression["no_regression_tip_y_ratio_excess"],
-        "no_regression_last5_y_ratio_excess": no_regression["no_regression_last5_y_ratio_excess"],
-        "no_regression_x_lag_excess_s": no_regression["no_regression_x_lag_excess_s"],
-        "no_regression_y_lag_excess_s": no_regression["no_regression_y_lag_excess_s"],
-        "no_regression_x_amp_log_excess": no_regression["no_regression_x_amp_log_excess"],
-        "no_regression_y_amp_log_excess": no_regression["no_regression_y_amp_log_excess"],
         "state_no_regression_guard_loss": state_no_regression["state_no_regression_guard_loss"],
         "state_no_regression_response_guard_loss": state_no_regression["state_no_regression_response_guard_loss"],
         "state_no_regression_corr_guard_loss": state_no_regression["state_no_regression_corr_guard_loss"],
@@ -3043,7 +2846,6 @@ def compute_response_loss(
         "theta_fast_smooth": phase_reg["theta_fast_smooth"],
         "phase_gate_l1": phase_reg["phase_gate_l1"],
         "phase_gate_tv": phase_reg["phase_gate_tv"],
-        "phase_gate_simple_l1": phase_reg["phase_gate_simple_l1"],
         "phase_gate_mean": phase_reg["phase_gate_mean"],
         "phase_gate_max": phase_reg["phase_gate_max"],
         "phase_gate_active_ratio": phase_reg["phase_gate_active_ratio"],
@@ -3238,7 +3040,6 @@ def evaluate_cases(
                 theta=out.theta,
                 theta_aux=out.theta_aux,
                 u_slow=u_slow,
-                case_name=case.name,
             )
             if profile_timing:
                 timing_sums["timing_loss_seconds"] += _time_now(cfg, next(model.parameters()).device) - t0
@@ -3397,7 +3198,6 @@ def train_cases_grad_accum(
         *,
         model: TransformerPhysicalRolloutTorch,
         cases: list[TransformerTrainingCase],
-        guard_cases: Optional[list[TransformerTrainingCase]] = None,
         geometry: torch.Tensor,
         cfg: TransformerPhysicalTrainConfig,
         x_idx: torch.Tensor,
@@ -3503,20 +3303,6 @@ def train_cases_grad_accum(
     adaptive_metric_max_values: dict[str, Optional[torch.Tensor]] = {k: None for k in adaptive_metric_max_keys}
     adaptive_metric_min_values: dict[str, Optional[torch.Tensor]] = {k: None for k in adaptive_metric_min_keys}
     theta_abs_max_value: Optional[torch.Tensor] = None
-    guard_metric_keys = [
-        "total_loss",
-        "no_regression_guard_loss",
-        "x_ratio",
-        "y_ratio",
-        "tip_y_ratio",
-        "last5_y_ratio",
-        "phase_gate_mean",
-        "phase_gate_max",
-        "phase_gate_active_ratio",
-    ]
-    guard_metric_sums: dict[str, Optional[torch.Tensor]] = {k: None for k in guard_metric_keys}
-    guard_cases = list(guard_cases or [])
-
     for case in cases:
         u_static = case.u_static.unsqueeze(0)
         v_static = case.v_static.unsqueeze(0)
@@ -3575,11 +3361,10 @@ def train_cases_grad_accum(
             y_idx=y_idx,
             tip_y_idx=tip_y_idx,
             last5_y_idx=last5_y_idx,
-            theta=out.theta,
-            theta_aux=out.theta_aux,
-            u_slow=u_slow,
-            case_name=case.name,
-        )
+                theta=out.theta,
+                theta_aux=out.theta_aux,
+                u_slow=u_slow,
+            )
 
         # 关键：除以 n_cases，保证等价于 mean loss 再 backward。
         if profile_timing:
@@ -3641,64 +3426,6 @@ def train_cases_grad_accum(
         del loss_dict
         del scaled_loss
 
-    if guard_cases:
-        n_guard_cases = len(guard_cases)
-        for case in guard_cases:
-            u_static = case.u_static.unsqueeze(0)
-            v_static = case.v_static.unsqueeze(0)
-            a_static = case.a_static.unsqueeze(0)
-            F = case.F_raw.unsqueeze(0)
-            F_spectral = case.F_spectral.unsqueeze(0) if case.F_spectral is not None else None
-
-            u0 = case.u_static[:1, :].to(dtype=torch.float32)
-            v0 = case.v_static[:1, :].to(dtype=torch.float32)
-            a0 = case.a_static[:1, :].to(dtype=torch.float32)
-
-            out = model(
-                u_static=u_static,
-                v_static=v_static,
-                a_static=a_static,
-                F=F,
-                geometry_features=geometry,
-                load_spectral_features=F_spectral,
-                u0=u0,
-                v0=v0,
-                a0=a0,
-            )
-            loss_dict = compute_response_loss(
-                u_pred=out.u_pred,
-                case=case,
-                cfg=cfg,
-                x_idx=x_idx,
-                y_idx=y_idx,
-                tip_y_idx=tip_y_idx,
-                last5_y_idx=last5_y_idx,
-                theta=out.theta,
-                theta_aux=out.theta_aux,
-                case_name=case.name,
-                guard_only=True,
-            )
-            scaled_guard_loss = (
-                float(cfg.w_guard_case_loss)
-                * loss_dict["total_loss"]
-                / float(n_guard_cases)
-            )
-            t0 = _time_now(cfg, timing_device) if profile_timing else 0.0
-            scaled_guard_loss.backward()
-            if profile_timing:
-                timing_sums["timing_backward_seconds"] += _time_now(cfg, timing_device) - t0
-
-            for k in guard_metric_keys:
-                value = loss_dict[k].detach().to(dtype=torch.float64)
-                if guard_metric_sums[k] is None:
-                    guard_metric_sums[k] = value.clone()
-                else:
-                    guard_metric_sums[k] = guard_metric_sums[k] + value
-
-            del out
-            del loss_dict
-            del scaled_guard_loss
-
     t0 = _time_now(cfg, timing_device) if profile_timing else 0.0
     grad_norm = torch.nn.utils.clip_grad_norm_(
         model.encoder.parameters(),
@@ -3752,13 +3479,6 @@ def train_cases_grad_accum(
         if torch.is_tensor(grad_norm)
         else float(grad_norm)
     )
-    result["guard_case_count"] = float(len(guard_cases))
-    for k, value in guard_metric_sums.items():
-        result[f"guard_{k}"] = (
-            torch.zeros((), dtype=dtype_out)
-            if value is None
-            else (value / float(max(1, len(guard_cases)))).to(dtype=dtype_out)
-        )
     for k, value in timing_sums.items():
         result[k] = float(value)
     if profile_timing:
@@ -3781,7 +3501,7 @@ def select_best_score(metrics: dict[str, Any], cfg: TransformerPhysicalTrainConf
         value = metrics[key]
     elif mode == "guarded_freq":
         freq_value = metrics["freq_loss"]
-        guard_value = metrics.get("no_regression_guard_loss", 0.0)
+        guard_value = metrics.get("state_no_regression_guard_loss", 0.0)
         if torch.is_tensor(freq_value) or torch.is_tensor(guard_value):
             if not torch.is_tensor(freq_value):
                 freq_value = torch.as_tensor(float(freq_value))
@@ -4056,8 +3776,6 @@ def parse_args() -> tuple[
     list[str],
     list[str],
     list[str],
-    list[str],
-    list[str],
 ]:
     d = TransformerPhysicalTrainConfig()
 
@@ -4084,24 +3802,9 @@ def parse_args() -> tuple[
     parser.add_argument("--train-load-files", type=str, default=None)
     parser.add_argument("--valid-load-files", type=str, default=None)
     parser.add_argument("--test-load-files", type=str, default=None)
-    parser.add_argument(
-        "--guard-load-files",
-        type=str,
-        default=d.guard_load_files,
-        help=(
-            "Comma-separated auxiliary load files used only for guard-only training loss. "
-            "These cases are prepared under the train split when --prepare-cases is used."
-        ),
-    )
 
     parser.add_argument("--train-case-paths", type=str, default=None)
     parser.add_argument("--valid-case-paths", type=str, default=None)
-    parser.add_argument(
-        "--guard-case-paths",
-        type=str,
-        default=d.guard_case_paths,
-        help="Optional explicit .npz paths for auxiliary guard-only cases.",
-    )
 
     parser.add_argument("--t-initial", type=float, default=d.t_initial)
     parser.add_argument("--t-final", type=float, default=d.t_final)
@@ -4255,7 +3958,6 @@ def parse_args() -> tuple[
     parser.add_argument("--w-theta-fast-smooth", type=float, default=d.w_theta_fast_smooth)
     parser.add_argument("--w-phase-gate-l1", type=float, default=d.w_phase_gate_l1)
     parser.add_argument("--w-phase-gate-tv", type=float, default=d.w_phase_gate_tv)
-    parser.add_argument("--w-phase-gate-simple-l1", type=float, default=d.w_phase_gate_simple_l1)
     parser.add_argument("--phase-gate-active-threshold", type=float, default=d.phase_gate_active_threshold)
     parser.add_argument("--use-loss-curriculum", action="store_true", default=d.use_loss_curriculum)
     parser.add_argument("--no-loss-curriculum", dest="use_loss_curriculum", action="store_false")
@@ -4430,22 +4132,6 @@ def parse_args() -> tuple[
     parser.add_argument("--state-no-regression-amp-log-tol", type=float,
                         default=d.state_no_regression_amp_log_tol)
 
-    parser.add_argument("--use-no-regression-guard", action="store_true",
-                        default=d.use_no_regression_guard)
-    parser.add_argument("--no-no-regression-guard", dest="use_no_regression_guard",
-                        action="store_false")
-    parser.add_argument("--no-regression-guard-case-keywords", type=str,
-                        default=d.no_regression_guard_case_keywords)
-    parser.add_argument("--w-no-regression-response", type=float, default=d.w_no_regression_response)
-    parser.add_argument("--w-no-regression-lag", type=float, default=d.w_no_regression_lag)
-    parser.add_argument("--w-no-regression-amp", type=float, default=d.w_no_regression_amp)
-    parser.add_argument("--w-guard-case-loss", type=float, default=d.w_guard_case_loss)
-    parser.add_argument("--no-regression-x-ratio-limit", type=float, default=d.no_regression_x_ratio_limit)
-    parser.add_argument("--no-regression-y-ratio-limit", type=float, default=d.no_regression_y_ratio_limit)
-    parser.add_argument("--no-regression-tip-y-ratio-limit", type=float, default=d.no_regression_tip_y_ratio_limit)
-    parser.add_argument("--no-regression-last5-y-ratio-limit", type=float, default=d.no_regression_last5_y_ratio_limit)
-    parser.add_argument("--no-regression-lag-tol-seconds", type=float, default=d.no_regression_lag_tol_seconds)
-    parser.add_argument("--no-regression-amp-log-tol", type=float, default=d.no_regression_amp_log_tol)
     parser.add_argument("--best-score-guard-weight", type=float, default=d.best_score_guard_weight)
 
     parser.add_argument("--best-score-mode", type=str, default=d.best_score_mode,
@@ -4570,9 +4256,6 @@ def parse_args() -> tuple[
         train_load_dir=str(TRAIN_LOAD_DIR),
         valid_load_dir=str(VALID_LOAD_DIR),
         test_load_dir=str(TEST_LOAD_DIR),
-        guard_load_files=args.guard_load_files,
-        guard_case_paths=args.guard_case_paths,
-        w_guard_case_loss=float(args.w_guard_case_loss),
         train_load_prefix=DEFAULT_TRAIN_LOAD_PREFIX,
         valid_load_prefix=DEFAULT_VALID_LOAD_PREFIX,
         test_load_prefix=DEFAULT_TEST_LOAD_PREFIX,
@@ -4657,7 +4340,6 @@ def parse_args() -> tuple[
         w_theta_fast_smooth=args.w_theta_fast_smooth,
         w_phase_gate_l1=args.w_phase_gate_l1,
         w_phase_gate_tv=args.w_phase_gate_tv,
-        w_phase_gate_simple_l1=args.w_phase_gate_simple_l1,
         phase_gate_active_threshold=float(args.phase_gate_active_threshold),
         use_loss_curriculum=bool(args.use_loss_curriculum),
         curriculum_phase_start_epoch=int(args.curriculum_phase_start_epoch),
@@ -4779,17 +4461,6 @@ def parse_args() -> tuple[
         state_no_regression_response_ratio_limit=float(args.state_no_regression_response_ratio_limit),
         state_no_regression_corr_drop_tol=float(args.state_no_regression_corr_drop_tol),
         state_no_regression_amp_log_tol=float(args.state_no_regression_amp_log_tol),
-        use_no_regression_guard=bool(args.use_no_regression_guard),
-        no_regression_guard_case_keywords=str(args.no_regression_guard_case_keywords),
-        w_no_regression_response=float(args.w_no_regression_response),
-        w_no_regression_lag=float(args.w_no_regression_lag),
-        w_no_regression_amp=float(args.w_no_regression_amp),
-        no_regression_x_ratio_limit=float(args.no_regression_x_ratio_limit),
-        no_regression_y_ratio_limit=float(args.no_regression_y_ratio_limit),
-        no_regression_tip_y_ratio_limit=float(args.no_regression_tip_y_ratio_limit),
-        no_regression_last5_y_ratio_limit=float(args.no_regression_last5_y_ratio_limit),
-        no_regression_lag_tol_seconds=float(args.no_regression_lag_tol_seconds),
-        no_regression_amp_log_tol=float(args.no_regression_amp_log_tol),
         best_score_guard_weight=float(args.best_score_guard_weight),
         best_score_mode=args.best_score_mode,
         init_checkpoint=args.init_checkpoint,
@@ -4814,11 +4485,9 @@ def parse_args() -> tuple[
     train_load_files = _parse_file_list(args.train_load_files, default_train_load_files)
     valid_load_files = _parse_file_list(args.valid_load_files, default_valid_load_files)
     test_load_files = _parse_file_list(args.test_load_files, default_test_load_files)
-    guard_load_files = _parse_file_list(args.guard_load_files, [])
 
     train_case_paths = _parse_path_list(args.train_case_paths)
     valid_case_paths = _parse_path_list(args.valid_case_paths)
-    guard_case_paths = _parse_path_list(args.guard_case_paths)
 
     return (
         cfg,
@@ -4827,8 +4496,6 @@ def parse_args() -> tuple[
         test_load_files,
         train_case_paths,
         valid_case_paths,
-        guard_load_files,
-        guard_case_paths,
     )
 
 
@@ -4844,8 +4511,6 @@ def main() -> None:
         test_load_files,
         train_case_paths,
         valid_case_paths,
-        guard_load_files,
-        guard_case_paths,
     ) = parse_args()
 
     torch.manual_seed(int(cfg.seed))
@@ -4936,20 +4601,6 @@ def main() -> None:
             f"good_lag<={cfg.static_quality_good_lag_seconds}, "
             f"good_amp_log_tol={cfg.static_quality_good_amp_log_tol}"
         )
-    print(f"  use_no_regression_guard = {cfg.use_no_regression_guard}")
-    if bool(cfg.use_no_regression_guard):
-        print(
-            "  no_regression_guard = "
-            f"keywords={cfg.no_regression_guard_case_keywords}, "
-            f"w_response={cfg.w_no_regression_response}, "
-            f"w_lag={cfg.w_no_regression_lag}, "
-            f"w_amp={cfg.w_no_regression_amp}, "
-            f"w_guard_case={cfg.w_guard_case_loss}, "
-            f"ratio_limits=({cfg.no_regression_x_ratio_limit}, {cfg.no_regression_y_ratio_limit}), "
-            f"lag_tol={cfg.no_regression_lag_tol_seconds}, "
-            f"amp_log_tol={cfg.no_regression_amp_log_tol}, "
-            f"best_guard_weight={cfg.best_score_guard_weight}"
-        )
     print(f"  fast_core_precompute_newmark = {cfg.fast_core_precompute_newmark}")
     print(f"  linear_solve_mode = {cfg.linear_solve_mode}")
     print(f"  output_dir = {output_dir}")
@@ -4978,11 +4629,6 @@ def main() -> None:
     print("  test load files:")
     for p in test_load_files:
         print(f"    {p}")
-    if guard_load_files:
-        print("  guard load files:")
-        for p in guard_load_files:
-            print(f"    {p}")
-
     if bool(cfg.prepare_cases):
         prep_cfg = PhysicalTrainingCasePrepConfig(
             teacher_exe=str(cfg.teacher_exe),
@@ -5005,14 +4651,9 @@ def main() -> None:
             rebuild_cases=bool(cfg.rebuild_cases),
         )
 
-        prep_train_load_files = list(train_load_files)
-        for p in guard_load_files:
-            if p not in prep_train_load_files:
-                prep_train_load_files.append(p)
-
         prepared = prepare_physical_training_cases(
             cfg=prep_cfg,
-            train_load_files=prep_train_load_files,
+            train_load_files=train_load_files,
             valid_load_files=valid_load_files,
             rebuild=bool(cfg.rebuild_cases),
         )
@@ -5026,15 +4667,6 @@ def main() -> None:
             for p in train_load_files
         ]
         valid_case_paths = [str(p) for p in prepared["valid"]]
-        if guard_load_files and not guard_case_paths:
-            guard_case_paths = [
-                str(_expected_case_path(
-                    training_case_dir=cfg.training_case_dir,
-                    split="train",
-                    load_file=p,
-                ))
-                for p in guard_load_files
-            ]
 
     if not train_case_paths:
         train_case_paths = [
@@ -5056,16 +4688,6 @@ def main() -> None:
             for p in valid_load_files
         ]
 
-    if guard_load_files and not guard_case_paths:
-        guard_case_paths = [
-            str(_expected_case_path(
-                training_case_dir=cfg.training_case_dir,
-                split="train",
-                load_file=p,
-            ))
-            for p in guard_load_files
-        ]
-
     print("  train cases:")
     for p in train_case_paths:
         print(f"    {p}")
@@ -5073,10 +4695,6 @@ def main() -> None:
     print("  valid cases:")
     for p in valid_case_paths:
         print(f"    {p}")
-    if guard_case_paths:
-        print("  guard cases:")
-        for p in guard_case_paths:
-            print(f"    {p}")
 
     train_cases = load_cases(
         train_case_paths,
@@ -5093,14 +4711,6 @@ def main() -> None:
         max_steps=cfg.max_steps_per_case,
         cfg=cfg,
     ) if len(valid_case_paths) > 0 else []
-
-    guard_cases = load_cases(
-        guard_case_paths,
-        dtype=dtype_case,
-        device=device,
-        max_steps=cfg.max_steps_per_case,
-        cfg=cfg,
-    ) if len(guard_case_paths) > 0 else []
 
     if len(train_cases) == 0:
         raise RuntimeError("No training cases were loaded.")
@@ -5123,11 +4733,10 @@ def main() -> None:
     if bool(cfg.use_cached_alignment_loss):
         print()
         print("[Alignment Loss Cache]")
-        print("  building teacher-side spectral / peak / lag caches for train+valid+guard cases ...")
+        print("  building teacher-side spectral / peak / lag caches for train+valid cases ...")
         prime_alignment_loss_caches(cases=train_cases, cfg=cfg, x_idx=x_idx, y_idx=y_idx)
         prime_alignment_loss_caches(cases=valid_cases, cfg=cfg, x_idx=x_idx, y_idx=y_idx)
-        prime_alignment_loss_caches(cases=guard_cases, cfg=cfg, x_idx=x_idx, y_idx=y_idx)
-        print(f"  cached cases = {len(train_cases) + len(valid_cases) + len(guard_cases)}")
+        print(f"  cached cases = {len(train_cases) + len(valid_cases)}")
 
     if bool(cfg.use_load_spectral_features):
         if not bool(cfg.use_load_branch):
@@ -5234,8 +4843,6 @@ def main() -> None:
         "cfg": asdict(cfg),
         "train_case_paths": train_case_paths,
         "valid_case_paths": valid_case_paths,
-        "guard_load_files": guard_load_files,
-        "guard_case_paths": guard_case_paths,
         "registry": registry.summary(),
         "geometry_summary": geo_bundle.summary(),
         "model_info": model_info,
@@ -5268,7 +4875,6 @@ def main() -> None:
         train_eval = train_cases_grad_accum(
             model=model,
             cases=train_cases,
-            guard_cases=guard_cases,
             geometry=geometry,
             cfg=epoch_cfg,
             x_idx=x_idx,
@@ -5527,8 +5133,6 @@ def main() -> None:
         for guard_key in NO_REGRESSION_LOG_METRIC_KEYS:
             row[f"train_{guard_key}"] = _metric_to_float(train_eval, guard_key)
             row[f"valid_{guard_key}"] = _metric_to_float(valid_eval_for_log, guard_key)
-        for guard_case_key in GUARD_CASE_LOG_METRIC_KEYS:
-            row[f"train_{guard_case_key}"] = _metric_to_float(train_eval, guard_case_key)
         for timing_key in TIMING_LOG_METRIC_KEYS:
             row[f"train_{timing_key}"] = _metric_to_float(train_eval, timing_key)
             row[f"valid_{timing_key}"] = _metric_to_float(valid_eval_for_log, timing_key)

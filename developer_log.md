@@ -931,3 +931,11 @@ alpha_y(t) + response/load + static conditioning 在 240-step 训练中有效。
 |---|---|---|---|---|
 | 2026-05-12 Asia/Shanghai | `src/student/transformer/transformer_rollout_torch.py` | Add | Add `rollout_with_theta_sequence(...)`, a supplied-theta physical rollout helper used by training diagnostics to evaluate `theta_slow` without changing the dynamic core or final total-theta interface. | slow/fast phase-gate separation |
 | 2026-05-12 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Add | Add optional slow-only branch diagnosis controlled by `--use-slow-only-branch-diagnosis` and `--w-slow-*` weights. It runs a detached slow-only rollout, treats slow-good windows as places to suppress `g_phase * alpha_fast`, treats slow-bad windows as places to boost local phase loss, and records `slow_*` diagnostics in training history. | slow/fast phase-gate separation |
+
+# 2026-05-13 remove case-name/manual guard mechanisms
+
+| Time | Files | Change Type | Content | Stage |
+|---|---|---|---|---|
+| 2026-05-13 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Remove | Remove the case-name keyword no-regression guard and explicit guard-only case training path. The removed command-line controls are `--use-no-regression-guard`, `--no-regression-guard-case-keywords`, `--w-no-regression-*`, `--guard-load-files`, `--guard-case-paths`, and `--w-guard-case-loss`. | state-driven phase/frequency generalization |
+| 2026-05-13 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Remove | Remove the simple-case name based gate regularizer `--w-phase-gate-simple-l1`; phase gate sparsity now comes from global gate regularization plus response-state diagnostics, not from case-name matching. | state-driven phase/frequency generalization |
+| 2026-05-13 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Modify | Keep automatic `state_window_no_regression_guard_loss`, static-quality gate suppression, and slow-only branch diagnosis. `guarded_freq` now adds `state_no_regression_guard_loss` instead of any case-keyword guard loss. | state-driven phase/frequency generalization |
