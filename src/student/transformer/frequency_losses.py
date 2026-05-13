@@ -994,6 +994,129 @@ def phase_drift_rate_loss(
     }
 
 
+def local_band_phase_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    dt: float,
+    dof_indices: torch.Tensor,
+    observations: str | Sequence[str] = "tip,last5",
+    last_k: int = 5,
+    start_time: float = 0.0,
+    end_time: float | None = None,
+    window_seconds: float = 1.54,
+    stride_seconds: float = 0.32,
+    freq_min: float = 0.45,
+    freq_max: float | None = 1.50,
+    high_power_threshold: float = 0.08,
+    high_power_temperature: float = 0.04,
+    eps: float = 1.0e-12,
+) -> dict[str, torch.Tensor]:
+    """
+    Directly align local narrow-band phase in sliding windows.
+
+    Unlike response MSE or soft-lag losses, this compares the complex spectrum
+    phase in the target-dominant high-frequency band for each local window.
+    Window weights are detached and computed from teacher high-band content, so
+    activation is state/spectrum driven rather than case-name driven.
+    """
+    pred_btd = _as_btd(pred)
+    target_btd = _as_btd(target)
+    if pred_btd.shape != target_btd.shape:
+        raise ValueError(f"pred/target shape mismatch: {tuple(pred_btd.shape)} vs {tuple(target_btd.shape)}")
+
+    B, T, _ = pred_btd.shape
+    obs_list = _parse_observations(observations)
+    idx = dof_indices.to(device=pred_btd.device, dtype=torch.long)
+
+    start_idx = max(0, int(round(float(start_time) / float(dt))))
+    end_idx = T if end_time is None else min(T, int(round(float(end_time) / float(dt))) + 1)
+    win_steps = max(8, int(round(float(window_seconds) / float(dt))))
+    stride_steps = max(1, int(round(float(stride_seconds) / float(dt))))
+    zero = _zero_like_signal_loss(pred_btd)
+
+    if end_idx - start_idx < win_steps:
+        return {
+            "loss": zero,
+            "raw_phase_loss": zero.detach(),
+            "high_weight_mean": zero.detach(),
+            "phase_cos_mean": zero.detach(),
+            "n_windows": torch.as_tensor(0.0, device=pred_btd.device, dtype=pred_btd.dtype),
+        }
+
+    weighted_losses: list[torch.Tensor] = []
+    raw_losses: list[torch.Tensor] = []
+    high_weights: list[torch.Tensor] = []
+    phase_cos_terms: list[torch.Tensor] = []
+    n_windows = 0
+
+    for obs in obs_list:
+        pred_sig = direction_observation_signal(
+            pred_btd,
+            dof_indices=idx,
+            observation=obs,
+            last_k=last_k,
+        )
+        target_sig = direction_observation_signal(
+            target_btd,
+            dof_indices=idx,
+            observation=obs,
+            last_k=last_k,
+        )
+        for b in range(B):
+            for lo in range(start_idx, end_idx - win_steps + 1, stride_steps):
+                hi = lo + win_steps
+                p = pred_sig[b, lo:hi]
+                t = target_sig[b, lo:hi]
+
+                phase_payload = _complex_phase_and_amp_loss_from_window(
+                    p,
+                    t,
+                    dt=dt,
+                    freq_min=freq_min,
+                    freq_max=freq_max,
+                    eps=eps,
+                )
+                phase_loss = phase_payload["phase_loss"]
+                high_weight = _high_band_power_weight_from_window(
+                    t,
+                    dt=dt,
+                    freq_min=freq_min,
+                    freq_max=freq_max,
+                    threshold=high_power_threshold,
+                    temperature=high_power_temperature,
+                    eps=eps,
+                )
+
+                weighted_losses.append(high_weight * phase_loss)
+                raw_losses.append(phase_loss.detach())
+                high_weights.append(high_weight)
+                phase_cos_terms.append((1.0 - phase_loss).detach())
+                n_windows += 1
+
+    if not weighted_losses:
+        return {
+            "loss": zero,
+            "raw_phase_loss": zero.detach(),
+            "high_weight_mean": zero.detach(),
+            "phase_cos_mean": zero.detach(),
+            "n_windows": torch.as_tensor(0.0, device=pred_btd.device, dtype=pred_btd.dtype),
+        }
+
+    loss = torch.stack(weighted_losses).mean()
+    raw_phase_loss = torch.stack(raw_losses).mean().detach()
+    high_weight_mean = torch.stack(high_weights).mean().detach()
+    phase_cos_mean = torch.stack(phase_cos_terms).mean().detach()
+
+    return {
+        "loss": loss,
+        "raw_phase_loss": raw_phase_loss,
+        "high_weight_mean": high_weight_mean,
+        "phase_cos_mean": phase_cos_mean,
+        "n_windows": torch.as_tensor(float(n_windows), device=pred_btd.device, dtype=pred_btd.dtype),
+    }
+
+
 def adaptive_phase_window_loss(
     pred: torch.Tensor,
     target: torch.Tensor,

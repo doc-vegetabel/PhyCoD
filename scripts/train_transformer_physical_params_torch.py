@@ -166,6 +166,7 @@ from src.student.transformer.frequency_losses import (  # noqa: E402
     build_peak_lag_alignment_cache,
     frequency_alignment_loss,
     frequency_alignment_loss_from_cache,
+    local_band_phase_loss,
     peak_and_lag_alignment_loss,
     peak_and_lag_alignment_loss_from_cache,
     phase_drift_rate_loss,
@@ -517,6 +518,19 @@ class TransformerPhysicalTrainConfig:
     phase_drift_amplitude_max_weight: float = 4.0
     phase_drift_static_failure_weight: float = 0.0
     phase_drift_static_failure_max_weight: float = 4.0
+    use_local_band_phase_loss: bool = False
+    w_local_band_phase_x: float = 0.0
+    w_local_band_phase_y: float = 0.0
+    local_band_phase_observations: str = "tip,last5"
+    local_band_phase_last_k: int = 5
+    local_band_phase_start: float = 0.0
+    local_band_phase_end: Optional[float] = None
+    local_band_phase_window_seconds: float = 1.54
+    local_band_phase_stride_seconds: float = 0.32
+    local_band_phase_freq_min: float = 0.45
+    local_band_phase_freq_max: Optional[float] = 1.50
+    local_band_phase_high_power_threshold: float = 0.08
+    local_band_phase_high_power_temperature: float = 0.04
     use_slow_only_branch_diagnosis: bool = False
     w_slow_good_no_regression: float = 0.0
     w_slow_good_fast_suppress: float = 0.0
@@ -749,6 +763,8 @@ def make_epoch_curriculum_cfg(
             "effective_w_phase_drift_lag_y": float(cfg.w_phase_drift_lag_y),
             "effective_w_phase_drift_rate_x": float(cfg.w_phase_drift_rate_x),
             "effective_w_phase_drift_rate_y": float(cfg.w_phase_drift_rate_y),
+            "effective_w_local_band_phase_x": float(cfg.w_local_band_phase_x),
+            "effective_w_local_band_phase_y": float(cfg.w_local_band_phase_y),
             "effective_w_phase_gate_l1": float(cfg.w_phase_gate_l1),
             "effective_w_phase_gate_tv": float(cfg.w_phase_gate_tv),
             "effective_w_static_good_gate_l1": float(cfg.w_static_good_gate_l1),
@@ -812,6 +828,8 @@ def make_epoch_curriculum_cfg(
         w_phase_drift_lag_y=float(cfg.w_phase_drift_lag_y) * phase_scale,
         w_phase_drift_rate_x=float(cfg.w_phase_drift_rate_x) * phase_scale,
         w_phase_drift_rate_y=float(cfg.w_phase_drift_rate_y) * phase_scale,
+        w_local_band_phase_x=float(cfg.w_local_band_phase_x) * phase_scale,
+        w_local_band_phase_y=float(cfg.w_local_band_phase_y) * phase_scale,
         w_phase_gate_l1=float(cfg.w_phase_gate_l1) * gate_reg_scale,
         w_phase_gate_tv=float(cfg.w_phase_gate_tv) * gate_reg_scale,
         w_static_good_gate_l1=float(cfg.w_static_good_gate_l1) * static_good_gate_scale,
@@ -835,6 +853,8 @@ def make_epoch_curriculum_cfg(
         "effective_w_phase_drift_lag_y": float(epoch_cfg.w_phase_drift_lag_y),
         "effective_w_phase_drift_rate_x": float(epoch_cfg.w_phase_drift_rate_x),
         "effective_w_phase_drift_rate_y": float(epoch_cfg.w_phase_drift_rate_y),
+        "effective_w_local_band_phase_x": float(epoch_cfg.w_local_band_phase_x),
+        "effective_w_local_band_phase_y": float(epoch_cfg.w_local_band_phase_y),
         "effective_w_phase_gate_l1": float(epoch_cfg.w_phase_gate_l1),
         "effective_w_phase_gate_tv": float(epoch_cfg.w_phase_gate_tv),
         "effective_w_static_good_gate_l1": float(epoch_cfg.w_static_good_gate_l1),
@@ -1480,6 +1500,17 @@ ADAPTIVE_PHASE_LOG_METRIC_KEYS = [
     "phase_drift_y_combined_weight_mean",
     "phase_drift_x_n_windows",
     "phase_drift_y_n_windows",
+    "local_band_phase_loss",
+    "local_band_phase_x_loss",
+    "local_band_phase_y_loss",
+    "local_band_phase_x_raw_phase_loss",
+    "local_band_phase_y_raw_phase_loss",
+    "local_band_phase_x_high_weight_mean",
+    "local_band_phase_y_high_weight_mean",
+    "local_band_phase_x_phase_cos_mean",
+    "local_band_phase_y_phase_cos_mean",
+    "local_band_phase_x_n_windows",
+    "local_band_phase_y_n_windows",
     "slow_only_diagnosis_loss",
     "slow_good_no_regression_loss",
     "slow_good_fast_suppress_loss",
@@ -1928,6 +1959,75 @@ def phase_drift_rate_training_loss(
         "phase_drift_y_combined_weight_mean": drift_y["combined_weight_mean"],
         "phase_drift_x_n_windows": drift_x["n_windows"],
         "phase_drift_y_n_windows": drift_y["n_windows"],
+    }
+
+
+def local_band_phase_training_loss(
+        *,
+        pred: torch.Tensor,
+        teacher: torch.Tensor,
+        cfg: TransformerPhysicalTrainConfig,
+        x_idx: torch.Tensor,
+        y_idx: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    zero = torch.zeros((), dtype=pred.dtype, device=pred.device)
+    empty = {
+        "local_band_phase_loss": zero,
+        "local_band_phase_x_loss": zero,
+        "local_band_phase_y_loss": zero,
+        "local_band_phase_x_raw_phase_loss": zero.detach(),
+        "local_band_phase_y_raw_phase_loss": zero.detach(),
+        "local_band_phase_x_high_weight_mean": zero.detach(),
+        "local_band_phase_y_high_weight_mean": zero.detach(),
+        "local_band_phase_x_phase_cos_mean": zero.detach(),
+        "local_band_phase_y_phase_cos_mean": zero.detach(),
+        "local_band_phase_x_n_windows": zero.detach(),
+        "local_band_phase_y_n_windows": zero.detach(),
+    }
+    if not bool(getattr(cfg, "use_local_band_phase_loss", False)):
+        return empty
+
+    common_kwargs = dict(
+        dt=float(cfg.dt),
+        observations=str(cfg.local_band_phase_observations),
+        last_k=int(cfg.local_band_phase_last_k),
+        start_time=float(cfg.local_band_phase_start),
+        end_time=cfg.local_band_phase_end,
+        window_seconds=float(cfg.local_band_phase_window_seconds),
+        stride_seconds=float(cfg.local_band_phase_stride_seconds),
+        freq_min=float(cfg.local_band_phase_freq_min),
+        freq_max=cfg.local_band_phase_freq_max,
+        high_power_threshold=float(cfg.local_band_phase_high_power_threshold),
+        high_power_temperature=float(cfg.local_band_phase_high_power_temperature),
+    )
+    phase_x = local_band_phase_loss(
+        pred,
+        teacher,
+        dof_indices=x_idx,
+        **common_kwargs,
+    )
+    phase_y = local_band_phase_loss(
+        pred,
+        teacher,
+        dof_indices=y_idx,
+        **common_kwargs,
+    )
+    loss = (
+        float(cfg.w_local_band_phase_x) * phase_x["loss"]
+        + float(cfg.w_local_band_phase_y) * phase_y["loss"]
+    )
+    return {
+        "local_band_phase_loss": loss,
+        "local_band_phase_x_loss": phase_x["loss"],
+        "local_band_phase_y_loss": phase_y["loss"],
+        "local_band_phase_x_raw_phase_loss": phase_x["raw_phase_loss"],
+        "local_band_phase_y_raw_phase_loss": phase_y["raw_phase_loss"],
+        "local_band_phase_x_high_weight_mean": phase_x["high_weight_mean"],
+        "local_band_phase_y_high_weight_mean": phase_y["high_weight_mean"],
+        "local_band_phase_x_phase_cos_mean": phase_x["phase_cos_mean"],
+        "local_band_phase_y_phase_cos_mean": phase_y["phase_cos_mean"],
+        "local_band_phase_x_n_windows": phase_x["n_windows"],
+        "local_band_phase_y_n_windows": phase_y["n_windows"],
     }
 
 
@@ -2697,6 +2797,13 @@ def compute_response_loss(
         x_idx=x_idx,
         y_idx=y_idx,
     )
+    local_band_phase = local_band_phase_training_loss(
+        pred=pred,
+        teacher=teacher,
+        cfg=cfg,
+        x_idx=x_idx,
+        y_idx=y_idx,
+    )
     static_quality_gate = static_quality_gate_suppression_loss(
         static=case.u_static,
         teacher=teacher,
@@ -2735,6 +2842,7 @@ def compute_response_loss(
         + adaptive_phase["complex_amp_guard_loss"]
         + adaptive_phase["phase_gate_align_loss"]
         + phase_drift["phase_drift_loss"]
+        + local_band_phase["local_band_phase_loss"]
         + slow_only_diag["slow_only_diagnosis_loss"]
     )
 
@@ -2787,6 +2895,17 @@ def compute_response_loss(
         "phase_drift_y_combined_weight_mean": phase_drift["phase_drift_y_combined_weight_mean"],
         "phase_drift_x_n_windows": phase_drift["phase_drift_x_n_windows"],
         "phase_drift_y_n_windows": phase_drift["phase_drift_y_n_windows"],
+        "local_band_phase_loss": local_band_phase["local_band_phase_loss"],
+        "local_band_phase_x_loss": local_band_phase["local_band_phase_x_loss"],
+        "local_band_phase_y_loss": local_band_phase["local_band_phase_y_loss"],
+        "local_band_phase_x_raw_phase_loss": local_band_phase["local_band_phase_x_raw_phase_loss"],
+        "local_band_phase_y_raw_phase_loss": local_band_phase["local_band_phase_y_raw_phase_loss"],
+        "local_band_phase_x_high_weight_mean": local_band_phase["local_band_phase_x_high_weight_mean"],
+        "local_band_phase_y_high_weight_mean": local_band_phase["local_band_phase_y_high_weight_mean"],
+        "local_band_phase_x_phase_cos_mean": local_band_phase["local_band_phase_x_phase_cos_mean"],
+        "local_band_phase_y_phase_cos_mean": local_band_phase["local_band_phase_y_phase_cos_mean"],
+        "local_band_phase_x_n_windows": local_band_phase["local_band_phase_x_n_windows"],
+        "local_band_phase_y_n_windows": local_band_phase["local_band_phase_y_n_windows"],
         "slow_only_diagnosis_loss": slow_only_diag["slow_only_diagnosis_loss"],
         "slow_good_no_regression_loss": slow_only_diag["slow_good_no_regression_loss"],
         "slow_good_fast_suppress_loss": slow_only_diag["slow_good_fast_suppress_loss"],
@@ -4088,6 +4207,32 @@ def parse_args() -> tuple[
                         default=d.phase_drift_static_failure_weight)
     parser.add_argument("--phase-drift-static-failure-max-weight", type=float,
                         default=d.phase_drift_static_failure_max_weight)
+    parser.add_argument("--use-local-band-phase-loss", action="store_true",
+                        default=d.use_local_band_phase_loss)
+    parser.add_argument("--no-local-band-phase-loss", dest="use_local_band_phase_loss",
+                        action="store_false")
+    parser.add_argument("--w-local-band-phase-x", type=float, default=d.w_local_band_phase_x)
+    parser.add_argument("--w-local-band-phase-y", type=float, default=d.w_local_band_phase_y)
+    parser.add_argument("--local-band-phase-observations", type=str,
+                        default=d.local_band_phase_observations)
+    parser.add_argument("--local-band-phase-last-k", type=int,
+                        default=d.local_band_phase_last_k)
+    parser.add_argument("--local-band-phase-start", type=float,
+                        default=d.local_band_phase_start)
+    parser.add_argument("--local-band-phase-end", type=float,
+                        default=d.local_band_phase_end)
+    parser.add_argument("--local-band-phase-window-seconds", type=float,
+                        default=d.local_band_phase_window_seconds)
+    parser.add_argument("--local-band-phase-stride-seconds", type=float,
+                        default=d.local_band_phase_stride_seconds)
+    parser.add_argument("--local-band-phase-freq-min", type=float,
+                        default=d.local_band_phase_freq_min)
+    parser.add_argument("--local-band-phase-freq-max", type=float,
+                        default=d.local_band_phase_freq_max)
+    parser.add_argument("--local-band-phase-high-power-threshold", type=float,
+                        default=d.local_band_phase_high_power_threshold)
+    parser.add_argument("--local-band-phase-high-power-temperature", type=float,
+                        default=d.local_band_phase_high_power_temperature)
     parser.add_argument("--use-slow-only-branch-diagnosis", action="store_true",
                         default=d.use_slow_only_branch_diagnosis)
     parser.add_argument("--no-slow-only-branch-diagnosis", dest="use_slow_only_branch_diagnosis",
@@ -4434,6 +4579,19 @@ def parse_args() -> tuple[
         phase_drift_amplitude_max_weight=float(args.phase_drift_amplitude_max_weight),
         phase_drift_static_failure_weight=float(args.phase_drift_static_failure_weight),
         phase_drift_static_failure_max_weight=float(args.phase_drift_static_failure_max_weight),
+        use_local_band_phase_loss=bool(args.use_local_band_phase_loss),
+        w_local_band_phase_x=float(args.w_local_band_phase_x),
+        w_local_band_phase_y=float(args.w_local_band_phase_y),
+        local_band_phase_observations=str(args.local_band_phase_observations),
+        local_band_phase_last_k=int(args.local_band_phase_last_k),
+        local_band_phase_start=float(args.local_band_phase_start),
+        local_band_phase_end=args.local_band_phase_end,
+        local_band_phase_window_seconds=float(args.local_band_phase_window_seconds),
+        local_band_phase_stride_seconds=float(args.local_band_phase_stride_seconds),
+        local_band_phase_freq_min=float(args.local_band_phase_freq_min),
+        local_band_phase_freq_max=args.local_band_phase_freq_max,
+        local_band_phase_high_power_threshold=float(args.local_band_phase_high_power_threshold),
+        local_band_phase_high_power_temperature=float(args.local_band_phase_high_power_temperature),
         use_slow_only_branch_diagnosis=bool(args.use_slow_only_branch_diagnosis),
         w_slow_good_no_regression=float(args.w_slow_good_no_regression),
         w_slow_good_fast_suppress=float(args.w_slow_good_fast_suppress),
@@ -4577,6 +4735,19 @@ def main() -> None:
             f"amp_max_weight={cfg.phase_drift_amplitude_max_weight}, "
             f"static_failure_weight={cfg.phase_drift_static_failure_weight}, "
             f"static_failure_max_weight={cfg.phase_drift_static_failure_max_weight}"
+        )
+    print(f"  use_local_band_phase_loss = {cfg.use_local_band_phase_loss}")
+    if bool(cfg.use_local_band_phase_loss):
+        print(
+            "  local_band_phase = "
+            f"obs={cfg.local_band_phase_observations}, "
+            f"freq=[{cfg.local_band_phase_freq_min}, {cfg.local_band_phase_freq_max}], "
+            f"window={cfg.local_band_phase_window_seconds}, "
+            f"stride={cfg.local_band_phase_stride_seconds}, "
+            f"w_x={cfg.w_local_band_phase_x}, "
+            f"w_y={cfg.w_local_band_phase_y}, "
+            f"high_power_threshold={cfg.local_band_phase_high_power_threshold}, "
+            f"high_power_temperature={cfg.local_band_phase_high_power_temperature}"
         )
     print(f"  use_slow_only_branch_diagnosis = {cfg.use_slow_only_branch_diagnosis}")
     if bool(cfg.use_slow_only_branch_diagnosis):

@@ -939,3 +939,10 @@ alpha_y(t) + response/load + static conditioning 在 240-step 训练中有效。
 | 2026-05-13 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Remove | Remove the case-name keyword no-regression guard and explicit guard-only case training path. The removed command-line controls are `--use-no-regression-guard`, `--no-regression-guard-case-keywords`, `--w-no-regression-*`, `--guard-load-files`, `--guard-case-paths`, and `--w-guard-case-loss`. | state-driven phase/frequency generalization |
 | 2026-05-13 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Remove | Remove the simple-case name based gate regularizer `--w-phase-gate-simple-l1`; phase gate sparsity now comes from global gate regularization plus response-state diagnostics, not from case-name matching. | state-driven phase/frequency generalization |
 | 2026-05-13 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Modify | Keep automatic `state_window_no_regression_guard_loss`, static-quality gate suppression, and slow-only branch diagnosis. `guarded_freq` now adds `state_no_regression_guard_loss` instead of any case-keyword guard loss. | state-driven phase/frequency generalization |
+
+# 2026-05-13 local-band phase loss update
+
+| Time | Files | Change Type | Content | Stage |
+|---|---|---|---|---|
+| 2026-05-13 Asia/Shanghai | `src/student/transformer/frequency_losses.py` | Add | Add `local_band_phase_loss(...)`, a local sliding-window narrow-band phase loss that directly penalizes high-frequency phase mismatch with `1 - cos(phase_pred - phase_teacher)`. Window emphasis is computed from detached teacher high-band spectral power, not from case names. | high-frequency x/y phase correction |
+| 2026-05-13 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Modify | Add CLI/config controls for local-band phase training, wire x/y losses into `freq_loss`, scale the weights under the existing phase curriculum, print startup settings, and log `local_band_phase_*` diagnostics in `training_history.csv`. | high-frequency x/y phase correction |

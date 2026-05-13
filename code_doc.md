@@ -305,3 +305,12 @@ python tests/compare_full_corrected_core_vs_student.py --time-series-load-file d
 |---|---|---|---|---|
 | 2026-05-13 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Remove case-name/manual guard controls | Remove the case-name keyword no-regression guard, explicit guard-only case inputs, and simple-case gate L1 regularizer. Deleted CLI/config entries include `--use-no-regression-guard`, `--no-regression-guard-case-keywords`, `--w-no-regression-*`, `--guard-load-files`, `--guard-case-paths`, `--w-guard-case-loss`, and `--w-phase-gate-simple-l1`. | state-driven phase/frequency generalization |
 | 2026-05-13 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Preserve automatic protection mechanisms | Keep state-window no-regression, static-quality gate suppression, and slow-only branch diagnosis. `guarded_freq` checkpoint scoring now uses `state_no_regression_guard_loss`, so protection is driven by local response quality rather than case names or manually selected guard cases. | state-driven phase/frequency generalization |
+
+---
+
+## 23. 2026-05-13 local-band phase loss update
+
+| Time | Files | Required Note | Content | Stage |
+|---|---|---|---|---|
+| 2026-05-13 Asia/Shanghai | `src/student/transformer/frequency_losses.py` | Add local narrow-band phase objective | Add `local_band_phase_loss(...)`, a sliding-window FFT phase-alignment loss. It compares target-dominant high-frequency band phase using `1 - cos(phase_pred - phase_teacher)` and weights windows by detached teacher high-band content, so activation is based on local spectral state rather than case names. | high-frequency x/y phase correction |
+| 2026-05-13 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Expose local-band phase controls | Add `--use-local-band-phase-loss`, `--w-local-band-phase-x/y`, and `--local-band-phase-*` CLI/config fields. The loss is added to `freq_loss`, logs `local_band_phase_*` diagnostics to `training_history.csv`, and leaves the dynamic core and final `theta=[alpha_x_total, alpha_xy_total]` interface unchanged. | high-frequency x/y phase correction |
