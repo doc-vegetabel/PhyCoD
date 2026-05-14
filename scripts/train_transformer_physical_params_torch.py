@@ -167,6 +167,7 @@ from src.student.transformer.frequency_losses import (  # noqa: E402
     frequency_alignment_loss,
     frequency_alignment_loss_from_cache,
     local_band_phase_loss,
+    local_phase_increment_loss,
     local_phase_correlation_loss,
     peak_and_lag_alignment_loss,
     peak_and_lag_alignment_loss_from_cache,
@@ -555,6 +556,25 @@ class TransformerPhysicalTrainConfig:
     local_phase_corr_corr_gap_weight: float = 1.0
     local_phase_corr_lag_weight: float = 0.25
     local_phase_corr_corr_gap_tol: float = 0.0
+    use_local_phase_increment_loss: bool = False
+    w_local_phase_absolute_x: float = 0.0
+    w_local_phase_absolute_y: float = 0.0
+    w_local_phase_increment_x: float = 0.0
+    w_local_phase_increment_y: float = 0.0
+    local_phase_increment_observations: str = "tip,last5"
+    local_phase_increment_last_k: int = 5
+    local_phase_increment_start: float = 0.0
+    local_phase_increment_end: Optional[float] = None
+    local_phase_increment_window_seconds: float = 1.54
+    local_phase_increment_stride_seconds: float = 0.16
+    local_phase_increment_freq_min: float = 0.45
+    local_phase_increment_freq_max: Optional[float] = 1.50
+    local_phase_increment_base_weight: float = 1.0
+    local_phase_increment_high_power_weight: float = 2.0
+    local_phase_increment_high_power_threshold: float = 0.08
+    local_phase_increment_high_power_temperature: float = 0.04
+    local_phase_increment_static_failure_weight: float = 0.0
+    local_phase_increment_static_failure_max_weight: float = 3.0
     use_slow_only_branch_diagnosis: bool = False
     w_slow_good_no_regression: float = 0.0
     w_slow_good_fast_suppress: float = 0.0
@@ -1589,6 +1609,27 @@ ADAPTIVE_PHASE_LOG_METRIC_KEYS = [
     "local_phase_corr_y_combined_weight_mean",
     "local_phase_corr_x_n_windows",
     "local_phase_corr_y_n_windows",
+    "local_phase_increment_loss",
+    "local_phase_increment_x_absolute_loss",
+    "local_phase_increment_y_absolute_loss",
+    "local_phase_increment_x_increment_loss",
+    "local_phase_increment_y_increment_loss",
+    "local_phase_increment_x_phase_cos_mean",
+    "local_phase_increment_y_phase_cos_mean",
+    "local_phase_increment_x_increment_cos_mean",
+    "local_phase_increment_y_increment_cos_mean",
+    "local_phase_increment_x_high_weight_mean",
+    "local_phase_increment_y_high_weight_mean",
+    "local_phase_increment_x_static_failure_weight_mean",
+    "local_phase_increment_y_static_failure_weight_mean",
+    "local_phase_increment_x_combined_weight_mean",
+    "local_phase_increment_y_combined_weight_mean",
+    "local_phase_increment_x_target_freq_hz_mean",
+    "local_phase_increment_y_target_freq_hz_mean",
+    "local_phase_increment_x_n_windows",
+    "local_phase_increment_y_n_windows",
+    "local_phase_increment_x_n_increments",
+    "local_phase_increment_y_n_increments",
     "slow_only_diagnosis_loss",
     "slow_good_no_regression_loss",
     "slow_good_fast_suppress_loss",
@@ -2233,6 +2274,109 @@ def local_phase_correlation_training_loss(
         "local_phase_corr_y_combined_weight_mean": corr_y["combined_weight_mean"],
         "local_phase_corr_x_n_windows": corr_x["n_windows"],
         "local_phase_corr_y_n_windows": corr_y["n_windows"],
+    }
+
+
+def local_phase_increment_training_loss(
+        *,
+        pred: torch.Tensor,
+        teacher: torch.Tensor,
+        static: torch.Tensor,
+        cfg: TransformerPhysicalTrainConfig,
+        x_idx: torch.Tensor,
+        y_idx: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    zero = torch.zeros((), dtype=pred.dtype, device=pred.device)
+    empty = {
+        "local_phase_increment_loss": zero,
+        "local_phase_increment_x_absolute_loss": zero,
+        "local_phase_increment_y_absolute_loss": zero,
+        "local_phase_increment_x_increment_loss": zero,
+        "local_phase_increment_y_increment_loss": zero,
+        "local_phase_increment_x_phase_cos_mean": zero.detach(),
+        "local_phase_increment_y_phase_cos_mean": zero.detach(),
+        "local_phase_increment_x_increment_cos_mean": zero.detach(),
+        "local_phase_increment_y_increment_cos_mean": zero.detach(),
+        "local_phase_increment_x_high_weight_mean": zero.detach(),
+        "local_phase_increment_y_high_weight_mean": zero.detach(),
+        "local_phase_increment_x_static_failure_weight_mean": zero.detach(),
+        "local_phase_increment_y_static_failure_weight_mean": zero.detach(),
+        "local_phase_increment_x_combined_weight_mean": zero.detach(),
+        "local_phase_increment_y_combined_weight_mean": zero.detach(),
+        "local_phase_increment_x_target_freq_hz_mean": zero.detach(),
+        "local_phase_increment_y_target_freq_hz_mean": zero.detach(),
+        "local_phase_increment_x_n_windows": zero.detach(),
+        "local_phase_increment_y_n_windows": zero.detach(),
+        "local_phase_increment_x_n_increments": zero.detach(),
+        "local_phase_increment_y_n_increments": zero.detach(),
+    }
+    if not bool(getattr(cfg, "use_local_phase_increment_loss", False)):
+        return empty
+
+    common_kwargs = dict(
+        dt=float(cfg.dt),
+        observations=str(cfg.local_phase_increment_observations),
+        last_k=int(cfg.local_phase_increment_last_k),
+        start_time=float(cfg.local_phase_increment_start),
+        end_time=cfg.local_phase_increment_end,
+        window_seconds=float(cfg.local_phase_increment_window_seconds),
+        stride_seconds=float(cfg.local_phase_increment_stride_seconds),
+        freq_min=float(cfg.local_phase_increment_freq_min),
+        freq_max=cfg.local_phase_increment_freq_max,
+        base_weight=float(cfg.local_phase_increment_base_weight),
+        high_power_weight=float(cfg.local_phase_increment_high_power_weight),
+        high_power_threshold=float(cfg.local_phase_increment_high_power_threshold),
+        high_power_temperature=float(cfg.local_phase_increment_high_power_temperature),
+        static_failure_weight=float(cfg.local_phase_increment_static_failure_weight),
+        static_failure_max_weight=float(cfg.local_phase_increment_static_failure_max_weight),
+        static_failure_corr_threshold=float(cfg.static_quality_good_corr_threshold),
+        static_failure_lag_seconds=float(cfg.static_quality_good_lag_seconds),
+        static_failure_amp_log_tol=float(cfg.static_quality_good_amp_log_tol),
+        static_failure_max_lag_seconds=float(cfg.static_quality_max_lag_seconds),
+        lag_temperature=float(cfg.lag_temperature),
+    )
+    phase_x = local_phase_increment_loss(
+        pred,
+        teacher,
+        static_reference=static,
+        dof_indices=x_idx,
+        **common_kwargs,
+    )
+    phase_y = local_phase_increment_loss(
+        pred,
+        teacher,
+        static_reference=static,
+        dof_indices=y_idx,
+        **common_kwargs,
+    )
+    loss = (
+        float(cfg.w_local_phase_absolute_x) * phase_x["absolute_phase_loss"]
+        + float(cfg.w_local_phase_absolute_y) * phase_y["absolute_phase_loss"]
+        + float(cfg.w_local_phase_increment_x) * phase_x["increment_phase_loss"]
+        + float(cfg.w_local_phase_increment_y) * phase_y["increment_phase_loss"]
+    )
+    return {
+        "local_phase_increment_loss": loss,
+        "local_phase_increment_x_absolute_loss": phase_x["absolute_phase_loss"],
+        "local_phase_increment_y_absolute_loss": phase_y["absolute_phase_loss"],
+        "local_phase_increment_x_increment_loss": phase_x["increment_phase_loss"],
+        "local_phase_increment_y_increment_loss": phase_y["increment_phase_loss"],
+        "local_phase_increment_x_phase_cos_mean": phase_x["phase_cos_mean"],
+        "local_phase_increment_y_phase_cos_mean": phase_y["phase_cos_mean"],
+        "local_phase_increment_x_increment_cos_mean": phase_x["increment_cos_mean"],
+        "local_phase_increment_y_increment_cos_mean": phase_y["increment_cos_mean"],
+        "local_phase_increment_x_high_weight_mean": phase_x["high_weight_mean"],
+        "local_phase_increment_y_high_weight_mean": phase_y["high_weight_mean"],
+        "local_phase_increment_x_static_failure_weight_mean": phase_x["static_failure_weight_mean"],
+        "local_phase_increment_y_static_failure_weight_mean": phase_y["static_failure_weight_mean"],
+        "local_phase_increment_x_combined_weight_mean": phase_x["combined_weight_mean"],
+        "local_phase_increment_y_combined_weight_mean": phase_y["combined_weight_mean"],
+        "local_phase_increment_x_target_freq_hz_mean": phase_x["target_freq_hz_mean"],
+        "local_phase_increment_y_target_freq_hz_mean": phase_y["target_freq_hz_mean"],
+        "local_phase_increment_x_n_windows": phase_x["n_windows"],
+        "local_phase_increment_y_n_windows": phase_y["n_windows"],
+        "local_phase_increment_x_n_increments": phase_x["n_increments"],
+        "local_phase_increment_y_n_increments": phase_y["n_increments"],
     }
 
 
@@ -3017,6 +3161,14 @@ def compute_response_loss(
         x_idx=x_idx,
         y_idx=y_idx,
     )
+    local_phase_increment = local_phase_increment_training_loss(
+        pred=pred,
+        teacher=teacher,
+        static=case.u_static.to(device=u_pred.device, dtype=u_pred.dtype),
+        cfg=cfg,
+        x_idx=x_idx,
+        y_idx=y_idx,
+    )
     static_quality_gate = static_quality_gate_suppression_loss(
         static=case.u_static,
         teacher=teacher,
@@ -3057,6 +3209,7 @@ def compute_response_loss(
         + phase_drift["phase_drift_loss"]
         + local_band_phase["local_band_phase_loss"]
         + local_phase_corr["local_phase_corr_loss"]
+        + local_phase_increment["local_phase_increment_loss"]
         + slow_only_diag["slow_only_diagnosis_loss"]
     )
 
@@ -3145,6 +3298,27 @@ def compute_response_loss(
         "local_phase_corr_y_combined_weight_mean": local_phase_corr["local_phase_corr_y_combined_weight_mean"],
         "local_phase_corr_x_n_windows": local_phase_corr["local_phase_corr_x_n_windows"],
         "local_phase_corr_y_n_windows": local_phase_corr["local_phase_corr_y_n_windows"],
+        "local_phase_increment_loss": local_phase_increment["local_phase_increment_loss"],
+        "local_phase_increment_x_absolute_loss": local_phase_increment["local_phase_increment_x_absolute_loss"],
+        "local_phase_increment_y_absolute_loss": local_phase_increment["local_phase_increment_y_absolute_loss"],
+        "local_phase_increment_x_increment_loss": local_phase_increment["local_phase_increment_x_increment_loss"],
+        "local_phase_increment_y_increment_loss": local_phase_increment["local_phase_increment_y_increment_loss"],
+        "local_phase_increment_x_phase_cos_mean": local_phase_increment["local_phase_increment_x_phase_cos_mean"],
+        "local_phase_increment_y_phase_cos_mean": local_phase_increment["local_phase_increment_y_phase_cos_mean"],
+        "local_phase_increment_x_increment_cos_mean": local_phase_increment["local_phase_increment_x_increment_cos_mean"],
+        "local_phase_increment_y_increment_cos_mean": local_phase_increment["local_phase_increment_y_increment_cos_mean"],
+        "local_phase_increment_x_high_weight_mean": local_phase_increment["local_phase_increment_x_high_weight_mean"],
+        "local_phase_increment_y_high_weight_mean": local_phase_increment["local_phase_increment_y_high_weight_mean"],
+        "local_phase_increment_x_static_failure_weight_mean": local_phase_increment["local_phase_increment_x_static_failure_weight_mean"],
+        "local_phase_increment_y_static_failure_weight_mean": local_phase_increment["local_phase_increment_y_static_failure_weight_mean"],
+        "local_phase_increment_x_combined_weight_mean": local_phase_increment["local_phase_increment_x_combined_weight_mean"],
+        "local_phase_increment_y_combined_weight_mean": local_phase_increment["local_phase_increment_y_combined_weight_mean"],
+        "local_phase_increment_x_target_freq_hz_mean": local_phase_increment["local_phase_increment_x_target_freq_hz_mean"],
+        "local_phase_increment_y_target_freq_hz_mean": local_phase_increment["local_phase_increment_y_target_freq_hz_mean"],
+        "local_phase_increment_x_n_windows": local_phase_increment["local_phase_increment_x_n_windows"],
+        "local_phase_increment_y_n_windows": local_phase_increment["local_phase_increment_y_n_windows"],
+        "local_phase_increment_x_n_increments": local_phase_increment["local_phase_increment_x_n_increments"],
+        "local_phase_increment_y_n_increments": local_phase_increment["local_phase_increment_y_n_increments"],
         "slow_only_diagnosis_loss": slow_only_diag["slow_only_diagnosis_loss"],
         "slow_good_no_regression_loss": slow_only_diag["slow_good_no_regression_loss"],
         "slow_good_fast_suppress_loss": slow_only_diag["slow_good_fast_suppress_loss"],
@@ -4523,6 +4697,46 @@ def parse_args() -> tuple[
                         default=d.local_phase_corr_lag_weight)
     parser.add_argument("--local-phase-corr-corr-gap-tol", type=float,
                         default=d.local_phase_corr_corr_gap_tol)
+    parser.add_argument("--use-local-phase-increment-loss", action="store_true",
+                        default=d.use_local_phase_increment_loss)
+    parser.add_argument("--no-local-phase-increment-loss", dest="use_local_phase_increment_loss",
+                        action="store_false")
+    parser.add_argument("--w-local-phase-absolute-x", type=float,
+                        default=d.w_local_phase_absolute_x)
+    parser.add_argument("--w-local-phase-absolute-y", type=float,
+                        default=d.w_local_phase_absolute_y)
+    parser.add_argument("--w-local-phase-increment-x", type=float,
+                        default=d.w_local_phase_increment_x)
+    parser.add_argument("--w-local-phase-increment-y", type=float,
+                        default=d.w_local_phase_increment_y)
+    parser.add_argument("--local-phase-increment-observations", type=str,
+                        default=d.local_phase_increment_observations)
+    parser.add_argument("--local-phase-increment-last-k", type=int,
+                        default=d.local_phase_increment_last_k)
+    parser.add_argument("--local-phase-increment-start", type=float,
+                        default=d.local_phase_increment_start)
+    parser.add_argument("--local-phase-increment-end", type=float,
+                        default=d.local_phase_increment_end)
+    parser.add_argument("--local-phase-increment-window-seconds", type=float,
+                        default=d.local_phase_increment_window_seconds)
+    parser.add_argument("--local-phase-increment-stride-seconds", type=float,
+                        default=d.local_phase_increment_stride_seconds)
+    parser.add_argument("--local-phase-increment-freq-min", type=float,
+                        default=d.local_phase_increment_freq_min)
+    parser.add_argument("--local-phase-increment-freq-max", type=float,
+                        default=d.local_phase_increment_freq_max)
+    parser.add_argument("--local-phase-increment-base-weight", type=float,
+                        default=d.local_phase_increment_base_weight)
+    parser.add_argument("--local-phase-increment-high-power-weight", type=float,
+                        default=d.local_phase_increment_high_power_weight)
+    parser.add_argument("--local-phase-increment-high-power-threshold", type=float,
+                        default=d.local_phase_increment_high_power_threshold)
+    parser.add_argument("--local-phase-increment-high-power-temperature", type=float,
+                        default=d.local_phase_increment_high_power_temperature)
+    parser.add_argument("--local-phase-increment-static-failure-weight", type=float,
+                        default=d.local_phase_increment_static_failure_weight)
+    parser.add_argument("--local-phase-increment-static-failure-max-weight", type=float,
+                        default=d.local_phase_increment_static_failure_max_weight)
     parser.add_argument("--use-slow-only-branch-diagnosis", action="store_true",
                         default=d.use_slow_only_branch_diagnosis)
     parser.add_argument("--no-slow-only-branch-diagnosis", dest="use_slow_only_branch_diagnosis",
@@ -4917,6 +5131,25 @@ def parse_args() -> tuple[
         local_phase_corr_corr_gap_weight=float(args.local_phase_corr_corr_gap_weight),
         local_phase_corr_lag_weight=float(args.local_phase_corr_lag_weight),
         local_phase_corr_corr_gap_tol=float(args.local_phase_corr_corr_gap_tol),
+        use_local_phase_increment_loss=bool(args.use_local_phase_increment_loss),
+        w_local_phase_absolute_x=float(args.w_local_phase_absolute_x),
+        w_local_phase_absolute_y=float(args.w_local_phase_absolute_y),
+        w_local_phase_increment_x=float(args.w_local_phase_increment_x),
+        w_local_phase_increment_y=float(args.w_local_phase_increment_y),
+        local_phase_increment_observations=str(args.local_phase_increment_observations),
+        local_phase_increment_last_k=int(args.local_phase_increment_last_k),
+        local_phase_increment_start=float(args.local_phase_increment_start),
+        local_phase_increment_end=args.local_phase_increment_end,
+        local_phase_increment_window_seconds=float(args.local_phase_increment_window_seconds),
+        local_phase_increment_stride_seconds=float(args.local_phase_increment_stride_seconds),
+        local_phase_increment_freq_min=float(args.local_phase_increment_freq_min),
+        local_phase_increment_freq_max=args.local_phase_increment_freq_max,
+        local_phase_increment_base_weight=float(args.local_phase_increment_base_weight),
+        local_phase_increment_high_power_weight=float(args.local_phase_increment_high_power_weight),
+        local_phase_increment_high_power_threshold=float(args.local_phase_increment_high_power_threshold),
+        local_phase_increment_high_power_temperature=float(args.local_phase_increment_high_power_temperature),
+        local_phase_increment_static_failure_weight=float(args.local_phase_increment_static_failure_weight),
+        local_phase_increment_static_failure_max_weight=float(args.local_phase_increment_static_failure_max_weight),
         use_slow_only_branch_diagnosis=bool(args.use_slow_only_branch_diagnosis),
         w_slow_good_no_regression=float(args.w_slow_good_no_regression),
         w_slow_good_fast_suppress=float(args.w_slow_good_fast_suppress),
@@ -5095,6 +5328,19 @@ def main() -> None:
             f"static_failure_weight={cfg.local_phase_corr_static_failure_weight}, "
             f"w_x={cfg.w_local_phase_corr_x}, "
             f"w_y={cfg.w_local_phase_corr_y}"
+        )
+    print(f"  use_local_phase_increment_loss = {cfg.use_local_phase_increment_loss}")
+    if bool(cfg.use_local_phase_increment_loss):
+        print(
+            "  local_phase_increment = "
+            f"obs={cfg.local_phase_increment_observations}, "
+            f"freq=[{cfg.local_phase_increment_freq_min}, {cfg.local_phase_increment_freq_max}], "
+            f"window={cfg.local_phase_increment_window_seconds}, "
+            f"stride={cfg.local_phase_increment_stride_seconds}, "
+            f"w_abs=({cfg.w_local_phase_absolute_x}, {cfg.w_local_phase_absolute_y}), "
+            f"w_inc=({cfg.w_local_phase_increment_x}, {cfg.w_local_phase_increment_y}), "
+            f"high_weight={cfg.local_phase_increment_high_power_weight}, "
+            f"static_failure_weight={cfg.local_phase_increment_static_failure_weight}"
         )
     print(f"  use_slow_only_branch_diagnosis = {cfg.use_slow_only_branch_diagnosis}")
     if bool(cfg.use_slow_only_branch_diagnosis):
