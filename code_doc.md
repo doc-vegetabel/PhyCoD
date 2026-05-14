@@ -314,3 +314,13 @@ python tests/compare_full_corrected_core_vs_student.py --time-series-load-file d
 |---|---|---|---|---|
 | 2026-05-13 Asia/Shanghai | `src/student/transformer/frequency_losses.py` | Add local narrow-band phase objective | Add `local_band_phase_loss(...)`, a sliding-window FFT phase-alignment loss. It compares target-dominant high-frequency band phase using `1 - cos(phase_pred - phase_teacher)` and weights windows by detached teacher high-band content, so activation is based on local spectral state rather than case names. | high-frequency x/y phase correction |
 | 2026-05-13 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Expose local-band phase controls | Add `--use-local-band-phase-loss`, `--w-local-band-phase-x/y`, and `--local-band-phase-*` CLI/config fields. The loss is added to `freq_loss`, logs `local_band_phase_*` diagnostics to `training_history.csv`, and leaves the dynamic core and final `theta=[alpha_x_total, alpha_xy_total]` interface unchanged. | high-frequency x/y phase correction |
+
+---
+
+## 24. 2026-05-14 phase-gate bootstrap and delayed-best update
+
+| Time | Files | Required Note | Content | Stage |
+|---|---|---|---|---|
+| 2026-05-14 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Add delayed best-checkpoint selection | Add `--best-start-epoch`. Validation still runs and is logged before this epoch, but `best_transformer_physical_params.pt` cannot be updated and LR/early-stop patience is not consumed before the allowed epoch. This avoids saving an early closed-gate checkpoint during phase/gate curricula. | phase-gated fast branch startup |
+| 2026-05-14 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Add optional phase-gate bootstrap regularizer | Add `--w-phase-gate-bootstrap`, `--phase-gate-bootstrap-target`, and `--phase-gate-bootstrap-end-epoch`. When enabled, early epochs can softly penalize `mean(g_phase)` below a low target so the fast residual branch can receive gradient before later automatic gate suppression/guard terms take over. Defaults are zero, so existing commands keep prior behavior and the final physical core still receives only total `theta=[alpha_x_total, alpha_xy_total]`. | phase-gated fast branch startup |
+| 2026-05-14 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Extend diagnostics | `training_history.csv` now records `best_start_epoch`, `best_epoch_allowed`, `effective_w_phase_gate_bootstrap`, `phase_gate_bootstrap_loss`, and `phase_gate_bootstrap_deficit` for train/valid diagnostics. | phase-gated fast branch startup |

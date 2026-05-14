@@ -946,3 +946,11 @@ alpha_y(t) + response/load + static conditioning 在 240-step 训练中有效。
 |---|---|---|---|---|
 | 2026-05-13 Asia/Shanghai | `src/student/transformer/frequency_losses.py` | Add | Add `local_band_phase_loss(...)`, a local sliding-window narrow-band phase loss that directly penalizes high-frequency phase mismatch with `1 - cos(phase_pred - phase_teacher)`. Window emphasis is computed from detached teacher high-band spectral power, not from case names. | high-frequency x/y phase correction |
 | 2026-05-13 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Modify | Add CLI/config controls for local-band phase training, wire x/y losses into `freq_loss`, scale the weights under the existing phase curriculum, print startup settings, and log `local_band_phase_*` diagnostics in `training_history.csv`. | high-frequency x/y phase correction |
+
+# 2026-05-14 phase-gate bootstrap and delayed-best update
+
+| Time | Files | Change Type | Content | Stage |
+|---|---|---|---|---|
+| 2026-05-14 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Add | Add `--best-start-epoch` so best checkpoint selection can be delayed until after the phase/gate curriculum has started. Early validation is still logged, but closed-gate early epochs cannot overwrite `best_transformer_physical_params.pt` or consume patience. | phase-gated fast branch startup |
+| 2026-05-14 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Add | Add optional `--w-phase-gate-bootstrap`, `--phase-gate-bootstrap-target`, and `--phase-gate-bootstrap-end-epoch`. The bootstrap loss softly encourages `mean(g_phase)` to reach a low target during early epochs, helping the fast branch receive gradients without adding new physical parameters or changing the total-theta dynamic core interface. | phase-gated fast branch startup |
+| 2026-05-14 Asia/Shanghai | `scripts/train_transformer_physical_params_torch.py` | Modify | Extend training history with best-start and gate-bootstrap diagnostics: `best_start_epoch`, `best_epoch_allowed`, `effective_w_phase_gate_bootstrap`, `phase_gate_bootstrap_loss`, and `phase_gate_bootstrap_deficit`. | phase-gated fast branch startup |

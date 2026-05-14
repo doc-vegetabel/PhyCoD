@@ -577,6 +577,9 @@ class TransformerPhysicalTrainConfig:
     w_phase_gate_l1: float = 1.0e-3
     w_phase_gate_tv: float = 1.0e-3
     phase_gate_active_threshold: float = 0.2
+    w_phase_gate_bootstrap: float = 0.0
+    phase_gate_bootstrap_target: float = 0.0
+    phase_gate_bootstrap_end_epoch: int = 0
 
     # Optional from-scratch curriculum. It leaves the model/core unchanged and
     # only ramps selected loss weights across epochs.
@@ -594,6 +597,7 @@ class TransformerPhysicalTrainConfig:
 
     # best checkpoint selection: response / freq / mixed
     best_score_mode: str = "freq"
+    best_start_epoch: int = 1
 
     # Hard constraint for best-checkpoint selection.
     # If enabled, an epoch can update best checkpoint only when
@@ -736,6 +740,18 @@ def _linear_curriculum_scale(
     return start_scale + frac * (1.0 - start_scale)
 
 
+def _phase_gate_bootstrap_weight_for_epoch(
+        cfg: TransformerPhysicalTrainConfig,
+        epoch: int,
+) -> float:
+    """Return the optional early gate-bootstrap weight for this epoch."""
+    weight = float(getattr(cfg, "w_phase_gate_bootstrap", 0.0))
+    end_epoch = int(getattr(cfg, "phase_gate_bootstrap_end_epoch", 0))
+    if end_epoch > 0 and int(epoch) > end_epoch:
+        return 0.0
+    return weight
+
+
 def make_epoch_curriculum_cfg(
         cfg: TransformerPhysicalTrainConfig,
         epoch: int,
@@ -746,7 +762,9 @@ def make_epoch_curriculum_cfg(
     The schedule is intentionally loss-only: model parameters, registry, dynamic
     physical core, and final theta interface are untouched.
     """
+    bootstrap_weight = _phase_gate_bootstrap_weight_for_epoch(cfg, epoch)
     if not bool(getattr(cfg, "use_loss_curriculum", False)):
+        epoch_cfg = replace(cfg, w_phase_gate_bootstrap=bootstrap_weight)
         metrics = {
             "curriculum_enabled": 0.0,
             "curriculum_phase_scale": 1.0,
@@ -767,12 +785,13 @@ def make_epoch_curriculum_cfg(
             "effective_w_local_band_phase_y": float(cfg.w_local_band_phase_y),
             "effective_w_phase_gate_l1": float(cfg.w_phase_gate_l1),
             "effective_w_phase_gate_tv": float(cfg.w_phase_gate_tv),
+            "effective_w_phase_gate_bootstrap": float(epoch_cfg.w_phase_gate_bootstrap),
             "effective_w_static_good_gate_l1": float(cfg.w_static_good_gate_l1),
             "effective_w_state_no_regression_response": float(cfg.w_state_no_regression_response),
             "effective_w_state_no_regression_corr": float(cfg.w_state_no_regression_corr),
             "effective_w_state_no_regression_amp": float(cfg.w_state_no_regression_amp),
         }
-        return cfg, metrics
+        return epoch_cfg, metrics
 
     phase_scale = _linear_curriculum_scale(
         epoch=epoch,
@@ -832,6 +851,7 @@ def make_epoch_curriculum_cfg(
         w_local_band_phase_y=float(cfg.w_local_band_phase_y) * phase_scale,
         w_phase_gate_l1=float(cfg.w_phase_gate_l1) * gate_reg_scale,
         w_phase_gate_tv=float(cfg.w_phase_gate_tv) * gate_reg_scale,
+        w_phase_gate_bootstrap=bootstrap_weight,
         w_static_good_gate_l1=float(cfg.w_static_good_gate_l1) * static_good_gate_scale,
         w_state_no_regression_response=float(cfg.w_state_no_regression_response) * guard_scale,
         w_state_no_regression_corr=float(cfg.w_state_no_regression_corr) * guard_scale,
@@ -857,6 +877,7 @@ def make_epoch_curriculum_cfg(
         "effective_w_local_band_phase_y": float(epoch_cfg.w_local_band_phase_y),
         "effective_w_phase_gate_l1": float(epoch_cfg.w_phase_gate_l1),
         "effective_w_phase_gate_tv": float(epoch_cfg.w_phase_gate_tv),
+        "effective_w_phase_gate_bootstrap": float(epoch_cfg.w_phase_gate_bootstrap),
         "effective_w_static_good_gate_l1": float(epoch_cfg.w_static_good_gate_l1),
         "effective_w_state_no_regression_response": float(epoch_cfg.w_state_no_regression_response),
         "effective_w_state_no_regression_corr": float(epoch_cfg.w_state_no_regression_corr),
@@ -1422,6 +1443,8 @@ PHASE_GATED_LOG_METRIC_KEYS = [
     "theta_fast_smooth",
     "phase_gate_l1",
     "phase_gate_tv",
+    "phase_gate_bootstrap_loss",
+    "phase_gate_bootstrap_deficit",
     "phase_gate_mean",
     "phase_gate_max",
     "phase_gate_active_ratio",
@@ -1633,6 +1656,8 @@ def phase_gated_decomposition_regularization_loss(
             "theta_fast_smooth": zero,
             "phase_gate_l1": zero,
             "phase_gate_tv": zero,
+            "phase_gate_bootstrap_loss": zero,
+            "phase_gate_bootstrap_deficit": zero,
             "phase_gate_mean": zero,
             "phase_gate_max": zero,
             "phase_gate_active_ratio": zero,
@@ -1668,6 +1693,14 @@ def phase_gated_decomposition_regularization_loss(
         gate_tv = torch.mean(torch.abs(g_phase[:, 1:, :] - g_phase[:, :-1, :]))
     else:
         gate_tv = zero
+    gate_bootstrap_target = min(max(float(cfg.phase_gate_bootstrap_target), 0.0), 1.0)
+    if gate_bootstrap_target > 0.0:
+        target = torch.as_tensor(gate_bootstrap_target, dtype=dtype, device=device)
+        gate_bootstrap_deficit = torch.relu(target - gate_l1)
+        gate_bootstrap_loss = gate_bootstrap_deficit ** 2
+    else:
+        gate_bootstrap_deficit = zero
+        gate_bootstrap_loss = zero
 
     phase_reg_loss = (
         float(cfg.w_theta_slow_smooth) * slow_smooth
@@ -1675,6 +1708,7 @@ def phase_gated_decomposition_regularization_loss(
         + float(cfg.w_theta_fast_smooth) * fast_smooth
         + float(cfg.w_phase_gate_l1) * gate_l1
         + float(cfg.w_phase_gate_tv) * gate_tv
+        + float(cfg.w_phase_gate_bootstrap) * gate_bootstrap_loss
     )
 
     return {
@@ -1684,6 +1718,8 @@ def phase_gated_decomposition_regularization_loss(
         "theta_fast_smooth": fast_smooth,
         "phase_gate_l1": gate_l1,
         "phase_gate_tv": gate_tv,
+        "phase_gate_bootstrap_loss": gate_bootstrap_loss,
+        "phase_gate_bootstrap_deficit": gate_bootstrap_deficit,
         "phase_gate_mean": torch.mean(g_phase),
         "phase_gate_max": torch.max(g_phase),
         "phase_gate_active_ratio": torch.mean(
@@ -2965,6 +3001,8 @@ def compute_response_loss(
         "theta_fast_smooth": phase_reg["theta_fast_smooth"],
         "phase_gate_l1": phase_reg["phase_gate_l1"],
         "phase_gate_tv": phase_reg["phase_gate_tv"],
+        "phase_gate_bootstrap_loss": phase_reg["phase_gate_bootstrap_loss"],
+        "phase_gate_bootstrap_deficit": phase_reg["phase_gate_bootstrap_deficit"],
         "phase_gate_mean": phase_reg["phase_gate_mean"],
         "phase_gate_max": phase_reg["phase_gate_max"],
         "phase_gate_active_ratio": phase_reg["phase_gate_active_ratio"],
@@ -4078,6 +4116,9 @@ def parse_args() -> tuple[
     parser.add_argument("--w-phase-gate-l1", type=float, default=d.w_phase_gate_l1)
     parser.add_argument("--w-phase-gate-tv", type=float, default=d.w_phase_gate_tv)
     parser.add_argument("--phase-gate-active-threshold", type=float, default=d.phase_gate_active_threshold)
+    parser.add_argument("--w-phase-gate-bootstrap", type=float, default=d.w_phase_gate_bootstrap)
+    parser.add_argument("--phase-gate-bootstrap-target", type=float, default=d.phase_gate_bootstrap_target)
+    parser.add_argument("--phase-gate-bootstrap-end-epoch", type=int, default=d.phase_gate_bootstrap_end_epoch)
     parser.add_argument("--use-loss-curriculum", action="store_true", default=d.use_loss_curriculum)
     parser.add_argument("--no-loss-curriculum", dest="use_loss_curriculum", action="store_false")
     parser.add_argument("--curriculum-phase-start-epoch", type=int, default=d.curriculum_phase_start_epoch)
@@ -4281,6 +4322,15 @@ def parse_args() -> tuple[
 
     parser.add_argument("--best-score-mode", type=str, default=d.best_score_mode,
                         choices=["response", "freq", "mixed", "guarded_freq"])
+    parser.add_argument(
+        "--best-start-epoch",
+        type=int,
+        default=d.best_start_epoch,
+        help=(
+            "Do not allow best checkpoint updates before this epoch. "
+            "Use this with phase/gate curricula to avoid saving an early closed-gate model."
+        ),
+    )
 
     parser.add_argument(
         "--init-checkpoint",
@@ -4486,6 +4536,9 @@ def parse_args() -> tuple[
         w_phase_gate_l1=args.w_phase_gate_l1,
         w_phase_gate_tv=args.w_phase_gate_tv,
         phase_gate_active_threshold=float(args.phase_gate_active_threshold),
+        w_phase_gate_bootstrap=float(args.w_phase_gate_bootstrap),
+        phase_gate_bootstrap_target=float(args.phase_gate_bootstrap_target),
+        phase_gate_bootstrap_end_epoch=int(args.phase_gate_bootstrap_end_epoch),
         use_loss_curriculum=bool(args.use_loss_curriculum),
         curriculum_phase_start_epoch=int(args.curriculum_phase_start_epoch),
         curriculum_phase_full_epoch=int(args.curriculum_phase_full_epoch),
@@ -4621,6 +4674,7 @@ def parse_args() -> tuple[
         state_no_regression_amp_log_tol=float(args.state_no_regression_amp_log_tol),
         best_score_guard_weight=float(args.best_score_guard_weight),
         best_score_mode=args.best_score_mode,
+        best_start_epoch=int(args.best_start_epoch),
         init_checkpoint=args.init_checkpoint,
         early_stop_patience=args.early_stop_patience,
         early_stop_min_delta=args.early_stop_min_delta,
@@ -4689,7 +4743,14 @@ def main() -> None:
     print(f"  use_phase_gated_decomposition = {getattr(cfg, 'use_phase_gated_decomposition', False)}")
     if bool(getattr(cfg, "use_phase_gated_decomposition", False)):
         print(f"  phase_gate_active_threshold = {cfg.phase_gate_active_threshold}")
+        print(
+            "  phase_gate_bootstrap = "
+            f"w={cfg.w_phase_gate_bootstrap}, "
+            f"target={cfg.phase_gate_bootstrap_target}, "
+            f"end_epoch={cfg.phase_gate_bootstrap_end_epoch}"
+        )
     print(f"  best_score_mode = {cfg.best_score_mode}")
+    print(f"  best_start_epoch = {cfg.best_start_epoch}")
     print(f"  use_loss_curriculum = {cfg.use_loss_curriculum}")
     if bool(cfg.use_loss_curriculum):
         print(
@@ -5095,6 +5156,7 @@ def main() -> None:
             score = select_best_score(train_eval, epoch_cfg)
 
         # Construct metrics block for best checkpoint evaluation
+        best_epoch_allowed = epoch >= int(cfg.best_start_epoch)
         if run_valid_this_epoch and valid_eval is not None:
             valid_metrics_for_best = {
                 "valid_y": float(valid_eval["y_ratio"].detach().cpu()),
@@ -5107,6 +5169,9 @@ def main() -> None:
                 valid_metrics=valid_metrics_for_best,
                 cfg=epoch_cfg,
             )
+            if not best_epoch_allowed:
+                eligible_for_best = False
+                best_gate_reason = f"before_best_start_epoch({int(cfg.best_start_epoch)})"
 
             improved = bool(
                 eligible_for_best
@@ -5151,7 +5216,7 @@ def main() -> None:
         else:
             # 只有真正做了 valid 检查的 epoch，才计入 early stop / LR plateau。
             # 否则 valid_every > 1 时，会因为跳过验证而过早触发 early stop。
-            if run_valid_this_epoch:
+            if run_valid_this_epoch and best_epoch_allowed:
                 epochs_since_best += 1
                 lr_plateau_count += 1
 
@@ -5215,6 +5280,8 @@ def main() -> None:
             "best_epoch": float(best_epoch),
             "best_eligible": int(eligible_for_best),
             "best_gate_reason": str(best_gate_reason),
+            "best_start_epoch": float(cfg.best_start_epoch),
+            "best_epoch_allowed": int(best_epoch_allowed),
             "best_score_mode": str(cfg.best_score_mode),
             "x_best_constraint_max": float(cfg.x_best_constraint_max),
             "use_x_constraint_for_best": int(bool(cfg.use_x_constraint_for_best)),
@@ -5331,7 +5398,8 @@ def main() -> None:
                     f"gate_reg={row['curriculum_gate_reg_scale']:.3f} "
                     f"w_drift_y=({row['effective_w_phase_drift_lag_y']:.3e},"
                     f"{row['effective_w_phase_drift_rate_y']:.3e}) "
-                    f"w_gate_l1={row['effective_w_phase_gate_l1']:.3e}"
+                    f"w_gate_l1={row['effective_w_phase_gate_l1']:.3e} "
+                    f"w_gate_boot={row['effective_w_phase_gate_bootstrap']:.3e}"
                 )
             if bool(cfg.profile_train_timing):
                 print(
