@@ -1615,6 +1615,287 @@ def local_phase_increment_loss(
     }
 
 
+def _continuous_band_phase_payload_from_window(
+    pred_win: torch.Tensor,
+    target_win: torch.Tensor,
+    *,
+    dt: float,
+    freq_min: float,
+    freq_max: float,
+    n_freq_bins: int,
+    frequency_temperature: float,
+    time_shift_scale_seconds: float,
+    eps: float = 1.0e-12,
+) -> dict[str, torch.Tensor]:
+    """Dense-frequency complex projection with phase converted to lag-scale loss."""
+    if pred_win.ndim != 1 or target_win.ndim != 1:
+        raise ValueError("pred_win and target_win must be 1D tensors.")
+    if pred_win.shape != target_win.shape:
+        raise ValueError(
+            f"pred_win/target_win shape mismatch: {tuple(pred_win.shape)} vs {tuple(target_win.shape)}"
+        )
+
+    zero = pred_win.sum() * 0.0
+    empty = {
+        "valid": torch.as_tensor(False, device=pred_win.device),
+        "absolute_phase_loss": zero,
+        "time_shift_loss": zero,
+        "phase_cos": zero.detach(),
+        "equivalent_abs_lag_s": zero.detach(),
+        "target_freq_hz": zero.detach(),
+    }
+    if pred_win.numel() < 8:
+        return empty
+    if freq_max <= freq_min:
+        return empty
+
+    n_freq = max(4, int(n_freq_bins))
+    p = pred_win - pred_win.mean()
+    t = target_win - target_win.mean()
+    n = int(p.numel())
+    dtype = p.dtype
+    device = p.device
+
+    window = torch.hann_window(n, periodic=False, device=device, dtype=dtype)
+    pw = p * window
+    tw = t * window
+    freqs = torch.linspace(float(freq_min), float(freq_max), n_freq, device=device, dtype=dtype)
+    time = torch.arange(n, device=device, dtype=dtype) * float(dt)
+    phase = 2.0 * torch.pi * time[:, None] * freqs[None, :]
+    cos_basis = torch.cos(phase)
+    sin_basis = -torch.sin(phase)
+
+    p_spec = torch.complex(
+        torch.sum(pw[:, None] * cos_basis, dim=0),
+        torch.sum(pw[:, None] * sin_basis, dim=0),
+    )
+    t_spec = torch.complex(
+        torch.sum(tw[:, None] * cos_basis, dim=0),
+        torch.sum(tw[:, None] * sin_basis, dim=0),
+    )
+
+    target_power = (t_spec.real.square() + t_spec.imag.square()).detach()
+    if float(torch.max(target_power).detach().cpu()) <= 0.0:
+        return empty
+
+    tau = max(float(frequency_temperature), 1.0e-8)
+    freq_weights = torch.softmax(torch.log(target_power.clamp_min(eps)) / tau, dim=0).detach()
+
+    p_amp = torch.abs(p_spec)
+    t_amp = torch.abs(t_spec)
+    p_unit = p_spec / p_amp.clamp_min(eps)
+    t_unit = t_spec / t_amp.clamp_min(eps)
+    phase_cos_per_freq = torch.real(p_unit * torch.conj(t_unit))
+    phase_cos_per_freq = torch.clamp(phase_cos_per_freq, min=-1.0, max=1.0)
+    phase_loss_per_freq = 1.0 - phase_cos_per_freq
+
+    scale = max(float(time_shift_scale_seconds), eps)
+    omega_scale = (2.0 * torch.pi * freqs * scale).clamp_min(eps)
+    # For small phase errors, 2*(1-cos(dphi))/(omega*scale)^2 ~= (lag/scale)^2.
+    time_shift_loss_per_freq = 2.0 * phase_loss_per_freq / (omega_scale * omega_scale)
+    equiv_abs_lag = torch.sqrt((2.0 * phase_loss_per_freq).clamp_min(0.0)) / (
+        (2.0 * torch.pi * freqs).clamp_min(eps)
+    )
+
+    absolute_phase_loss = torch.sum(freq_weights * phase_loss_per_freq)
+    time_shift_loss = torch.sum(freq_weights * time_shift_loss_per_freq)
+    phase_cos = torch.sum(freq_weights * phase_cos_per_freq).detach()
+    equiv_abs_lag_mean = torch.sum(freq_weights * equiv_abs_lag).detach()
+    target_freq = torch.sum(freq_weights * freqs).detach()
+
+    return {
+        "valid": torch.as_tensor(True, device=device),
+        "absolute_phase_loss": absolute_phase_loss,
+        "time_shift_loss": time_shift_loss,
+        "phase_cos": phase_cos,
+        "equivalent_abs_lag_s": equiv_abs_lag_mean,
+        "target_freq_hz": target_freq,
+    }
+
+
+def local_continuous_phase_lag_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    dt: float,
+    dof_indices: torch.Tensor,
+    static_reference: torch.Tensor | None = None,
+    observations: str | Sequence[str] = "tip,last5",
+    last_k: int = 5,
+    start_time: float = 0.0,
+    end_time: float | None = None,
+    window_seconds: float = 1.28,
+    stride_seconds: float = 0.16,
+    freq_min: float = 0.45,
+    freq_max: float | None = 1.50,
+    n_freq_bins: int = 64,
+    frequency_temperature: float = 0.08,
+    time_shift_scale_seconds: float = 0.02,
+    base_weight: float = 0.0,
+    high_power_weight: float = 3.0,
+    high_power_threshold: float = 0.08,
+    high_power_temperature: float = 0.04,
+    static_failure_weight: float = 0.0,
+    static_failure_max_weight: float = 3.0,
+    static_failure_corr_threshold: float = 0.995,
+    static_failure_lag_seconds: float = 0.02,
+    static_failure_amp_log_tol: float = 0.08,
+    static_failure_max_lag_seconds: float = 0.20,
+    lag_temperature: float = 0.04,
+    eps: float = 1.0e-12,
+) -> dict[str, torch.Tensor]:
+    """
+    Dense-frequency phase objective that directly penalizes equivalent time lag.
+
+    Unlike FFT-bin phase losses, this projects each window onto a dense
+    frequency grid and weights frequencies by target energy. The phase mismatch
+    is converted to an equivalent time-shift loss, making residual 0.02-0.06 s
+    lag errors much more visible to training. Window selection remains
+    spectrum/state driven and does not use case names.
+    """
+    pred_btd = _as_btd(pred)
+    target_btd = _as_btd(target)
+    if pred_btd.shape != target_btd.shape:
+        raise ValueError(f"pred/target shape mismatch: {tuple(pred_btd.shape)} vs {tuple(target_btd.shape)}")
+    static_btd = None
+    if static_reference is not None:
+        static_btd = _as_btd(static_reference)
+        if static_btd.shape != target_btd.shape:
+            raise ValueError(
+                f"static_reference/target shape mismatch: {tuple(static_btd.shape)} vs {tuple(target_btd.shape)}"
+            )
+        static_btd = static_btd.to(device=target_btd.device, dtype=target_btd.dtype).detach()
+
+    if freq_max is None:
+        freq_max = float(freq_min) + 1.0
+
+    B, T, _ = pred_btd.shape
+    obs_list = _parse_observations(observations)
+    idx = dof_indices.to(device=pred_btd.device, dtype=torch.long)
+    start_idx = max(0, int(round(float(start_time) / float(dt))))
+    end_idx = T if end_time is None else min(T, int(round(float(end_time) / float(dt))) + 1)
+    win_steps = max(8, int(round(float(window_seconds) / float(dt))))
+    stride_steps = max(1, int(round(float(stride_seconds) / float(dt))))
+    zero = _zero_like_signal_loss(pred_btd)
+
+    empty = {
+        "loss": zero,
+        "absolute_phase_loss": zero,
+        "time_shift_loss": zero,
+        "phase_cos_mean": zero.detach(),
+        "equivalent_abs_lag_s_mean": zero.detach(),
+        "high_weight_mean": zero.detach(),
+        "static_failure_weight_mean": zero.detach(),
+        "combined_weight_mean": zero.detach(),
+        "target_freq_hz_mean": zero.detach(),
+        "n_windows": torch.as_tensor(0.0, device=pred_btd.device, dtype=pred_btd.dtype),
+    }
+    if end_idx - start_idx < win_steps:
+        return empty
+
+    weighted_abs_losses: list[torch.Tensor] = []
+    weighted_shift_losses: list[torch.Tensor] = []
+    phase_cos_terms: list[torch.Tensor] = []
+    equiv_lag_terms: list[torch.Tensor] = []
+    high_weights: list[torch.Tensor] = []
+    static_weights: list[torch.Tensor] = []
+    combined_weights: list[torch.Tensor] = []
+    freq_terms: list[torch.Tensor] = []
+    n_windows = 0
+
+    for obs in obs_list:
+        pred_sig = direction_observation_signal(
+            pred_btd,
+            dof_indices=idx,
+            observation=obs,
+            last_k=last_k,
+        )
+        target_sig = direction_observation_signal(
+            target_btd,
+            dof_indices=idx,
+            observation=obs,
+            last_k=last_k,
+        )
+        static_sig = None
+        if static_btd is not None:
+            static_sig = direction_observation_signal(
+                static_btd,
+                dof_indices=idx,
+                observation=obs,
+                last_k=last_k,
+            )
+
+        for b in range(B):
+            for lo in range(start_idx, end_idx - win_steps + 1, stride_steps):
+                hi = lo + win_steps
+                p = pred_sig[b, lo:hi]
+                t = target_sig[b, lo:hi]
+                phase = _continuous_band_phase_payload_from_window(
+                    p,
+                    t,
+                    dt=dt,
+                    freq_min=freq_min,
+                    freq_max=float(freq_max),
+                    n_freq_bins=n_freq_bins,
+                    frequency_temperature=frequency_temperature,
+                    time_shift_scale_seconds=time_shift_scale_seconds,
+                    eps=eps,
+                )
+                if not bool(phase["valid"].detach().cpu()):
+                    continue
+
+                high_weight = _high_band_power_weight_from_window(
+                    t,
+                    dt=dt,
+                    freq_min=freq_min,
+                    freq_max=freq_max,
+                    threshold=high_power_threshold,
+                    temperature=high_power_temperature,
+                    eps=eps,
+                )
+                static_weight = _static_failure_weight_from_window(
+                    None if static_sig is None else static_sig[b, lo:hi],
+                    t,
+                    dt=dt,
+                    strength=static_failure_weight,
+                    max_weight=static_failure_max_weight,
+                    corr_threshold=static_failure_corr_threshold,
+                    lag_seconds=static_failure_lag_seconds,
+                    amp_log_tol=static_failure_amp_log_tol,
+                    max_lag_seconds=static_failure_max_lag_seconds,
+                    lag_temperature=lag_temperature,
+                    eps=eps,
+                )
+                spectral_weight = float(base_weight) + float(high_power_weight) * high_weight
+                combined_weight = (spectral_weight * static_weight).detach()
+
+                weighted_abs_losses.append(combined_weight * phase["absolute_phase_loss"])
+                weighted_shift_losses.append(combined_weight * phase["time_shift_loss"])
+                phase_cos_terms.append(phase["phase_cos"])
+                equiv_lag_terms.append(phase["equivalent_abs_lag_s"])
+                high_weights.append(high_weight)
+                static_weights.append(static_weight)
+                combined_weights.append(combined_weight)
+                freq_terms.append(phase["target_freq_hz"])
+                n_windows += 1
+
+    if not weighted_abs_losses:
+        return empty
+
+    return {
+        "loss": torch.stack(weighted_abs_losses).mean() + torch.stack(weighted_shift_losses).mean(),
+        "absolute_phase_loss": torch.stack(weighted_abs_losses).mean(),
+        "time_shift_loss": torch.stack(weighted_shift_losses).mean(),
+        "phase_cos_mean": torch.stack(phase_cos_terms).mean().detach(),
+        "equivalent_abs_lag_s_mean": torch.stack(equiv_lag_terms).mean().detach(),
+        "high_weight_mean": torch.stack(high_weights).mean().detach(),
+        "static_failure_weight_mean": torch.stack(static_weights).mean().detach(),
+        "combined_weight_mean": torch.stack(combined_weights).mean().detach(),
+        "target_freq_hz_mean": torch.stack(freq_terms).mean().detach(),
+        "n_windows": torch.as_tensor(float(n_windows), device=pred_btd.device, dtype=pred_btd.dtype),
+    }
+
+
 def adaptive_phase_window_loss(
     pred: torch.Tensor,
     target: torch.Tensor,

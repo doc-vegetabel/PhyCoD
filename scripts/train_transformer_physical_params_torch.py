@@ -167,6 +167,7 @@ from src.student.transformer.frequency_losses import (  # noqa: E402
     frequency_alignment_loss,
     frequency_alignment_loss_from_cache,
     local_band_phase_loss,
+    local_continuous_phase_lag_loss,
     local_phase_increment_loss,
     local_phase_correlation_loss,
     peak_and_lag_alignment_loss,
@@ -575,6 +576,28 @@ class TransformerPhysicalTrainConfig:
     local_phase_increment_high_power_temperature: float = 0.04
     local_phase_increment_static_failure_weight: float = 0.0
     local_phase_increment_static_failure_max_weight: float = 3.0
+    use_continuous_phase_lag_loss: bool = False
+    w_continuous_phase_absolute_x: float = 0.0
+    w_continuous_phase_absolute_y: float = 0.0
+    w_continuous_phase_time_shift_x: float = 0.0
+    w_continuous_phase_time_shift_y: float = 0.0
+    continuous_phase_observations: str = "tip,last5"
+    continuous_phase_last_k: int = 5
+    continuous_phase_start: float = 0.0
+    continuous_phase_end: Optional[float] = None
+    continuous_phase_window_seconds: float = 1.28
+    continuous_phase_stride_seconds: float = 0.16
+    continuous_phase_freq_min: float = 0.45
+    continuous_phase_freq_max: Optional[float] = 1.50
+    continuous_phase_n_freq_bins: int = 64
+    continuous_phase_frequency_temperature: float = 0.08
+    continuous_phase_time_shift_scale_seconds: float = 0.02
+    continuous_phase_base_weight: float = 0.0
+    continuous_phase_high_power_weight: float = 3.0
+    continuous_phase_high_power_threshold: float = 0.08
+    continuous_phase_high_power_temperature: float = 0.04
+    continuous_phase_static_failure_weight: float = 0.0
+    continuous_phase_static_failure_max_weight: float = 3.0
     use_slow_only_branch_diagnosis: bool = False
     w_slow_good_no_regression: float = 0.0
     w_slow_good_fast_suppress: float = 0.0
@@ -829,6 +852,10 @@ def make_epoch_curriculum_cfg(
             "effective_w_local_band_phase_y": float(cfg.w_local_band_phase_y),
             "effective_w_local_phase_corr_x": float(cfg.w_local_phase_corr_x),
             "effective_w_local_phase_corr_y": float(cfg.w_local_phase_corr_y),
+            "effective_w_local_phase_increment_x": float(cfg.w_local_phase_increment_x),
+            "effective_w_local_phase_increment_y": float(cfg.w_local_phase_increment_y),
+            "effective_w_continuous_phase_time_shift_x": float(cfg.w_continuous_phase_time_shift_x),
+            "effective_w_continuous_phase_time_shift_y": float(cfg.w_continuous_phase_time_shift_y),
             "effective_w_phase_gate_l1": float(cfg.w_phase_gate_l1),
             "effective_w_phase_gate_tv": float(cfg.w_phase_gate_tv),
             "effective_w_phase_gate_bootstrap": float(epoch_cfg.w_phase_gate_bootstrap),
@@ -897,6 +924,14 @@ def make_epoch_curriculum_cfg(
         w_local_band_phase_y=float(cfg.w_local_band_phase_y) * phase_scale,
         w_local_phase_corr_x=float(cfg.w_local_phase_corr_x) * phase_scale,
         w_local_phase_corr_y=float(cfg.w_local_phase_corr_y) * phase_scale,
+        w_local_phase_absolute_x=float(cfg.w_local_phase_absolute_x) * phase_scale,
+        w_local_phase_absolute_y=float(cfg.w_local_phase_absolute_y) * phase_scale,
+        w_local_phase_increment_x=float(cfg.w_local_phase_increment_x) * phase_scale,
+        w_local_phase_increment_y=float(cfg.w_local_phase_increment_y) * phase_scale,
+        w_continuous_phase_absolute_x=float(cfg.w_continuous_phase_absolute_x) * phase_scale,
+        w_continuous_phase_absolute_y=float(cfg.w_continuous_phase_absolute_y) * phase_scale,
+        w_continuous_phase_time_shift_x=float(cfg.w_continuous_phase_time_shift_x) * phase_scale,
+        w_continuous_phase_time_shift_y=float(cfg.w_continuous_phase_time_shift_y) * phase_scale,
         w_phase_gate_l1=float(cfg.w_phase_gate_l1) * gate_reg_scale,
         w_phase_gate_tv=float(cfg.w_phase_gate_tv) * gate_reg_scale,
         w_phase_gate_bootstrap=bootstrap_weight,
@@ -925,6 +960,10 @@ def make_epoch_curriculum_cfg(
         "effective_w_local_band_phase_y": float(epoch_cfg.w_local_band_phase_y),
         "effective_w_local_phase_corr_x": float(epoch_cfg.w_local_phase_corr_x),
         "effective_w_local_phase_corr_y": float(epoch_cfg.w_local_phase_corr_y),
+        "effective_w_local_phase_increment_x": float(epoch_cfg.w_local_phase_increment_x),
+        "effective_w_local_phase_increment_y": float(epoch_cfg.w_local_phase_increment_y),
+        "effective_w_continuous_phase_time_shift_x": float(epoch_cfg.w_continuous_phase_time_shift_x),
+        "effective_w_continuous_phase_time_shift_y": float(epoch_cfg.w_continuous_phase_time_shift_y),
         "effective_w_phase_gate_l1": float(epoch_cfg.w_phase_gate_l1),
         "effective_w_phase_gate_tv": float(epoch_cfg.w_phase_gate_tv),
         "effective_w_phase_gate_bootstrap": float(epoch_cfg.w_phase_gate_bootstrap),
@@ -1630,6 +1669,25 @@ ADAPTIVE_PHASE_LOG_METRIC_KEYS = [
     "local_phase_increment_y_n_windows",
     "local_phase_increment_x_n_increments",
     "local_phase_increment_y_n_increments",
+    "continuous_phase_loss",
+    "continuous_phase_x_absolute_loss",
+    "continuous_phase_y_absolute_loss",
+    "continuous_phase_x_time_shift_loss",
+    "continuous_phase_y_time_shift_loss",
+    "continuous_phase_x_phase_cos_mean",
+    "continuous_phase_y_phase_cos_mean",
+    "continuous_phase_x_equivalent_abs_lag_s_mean",
+    "continuous_phase_y_equivalent_abs_lag_s_mean",
+    "continuous_phase_x_high_weight_mean",
+    "continuous_phase_y_high_weight_mean",
+    "continuous_phase_x_static_failure_weight_mean",
+    "continuous_phase_y_static_failure_weight_mean",
+    "continuous_phase_x_combined_weight_mean",
+    "continuous_phase_y_combined_weight_mean",
+    "continuous_phase_x_target_freq_hz_mean",
+    "continuous_phase_y_target_freq_hz_mean",
+    "continuous_phase_x_n_windows",
+    "continuous_phase_y_n_windows",
     "slow_only_diagnosis_loss",
     "slow_good_no_regression_loss",
     "slow_good_fast_suppress_loss",
@@ -2377,6 +2435,108 @@ def local_phase_increment_training_loss(
         "local_phase_increment_y_n_windows": phase_y["n_windows"],
         "local_phase_increment_x_n_increments": phase_x["n_increments"],
         "local_phase_increment_y_n_increments": phase_y["n_increments"],
+    }
+
+
+def continuous_phase_lag_training_loss(
+        *,
+        pred: torch.Tensor,
+        teacher: torch.Tensor,
+        static: torch.Tensor,
+        cfg: TransformerPhysicalTrainConfig,
+        x_idx: torch.Tensor,
+        y_idx: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    zero = torch.zeros((), dtype=pred.dtype, device=pred.device)
+    empty = {
+        "continuous_phase_loss": zero,
+        "continuous_phase_x_absolute_loss": zero,
+        "continuous_phase_y_absolute_loss": zero,
+        "continuous_phase_x_time_shift_loss": zero,
+        "continuous_phase_y_time_shift_loss": zero,
+        "continuous_phase_x_phase_cos_mean": zero.detach(),
+        "continuous_phase_y_phase_cos_mean": zero.detach(),
+        "continuous_phase_x_equivalent_abs_lag_s_mean": zero.detach(),
+        "continuous_phase_y_equivalent_abs_lag_s_mean": zero.detach(),
+        "continuous_phase_x_high_weight_mean": zero.detach(),
+        "continuous_phase_y_high_weight_mean": zero.detach(),
+        "continuous_phase_x_static_failure_weight_mean": zero.detach(),
+        "continuous_phase_y_static_failure_weight_mean": zero.detach(),
+        "continuous_phase_x_combined_weight_mean": zero.detach(),
+        "continuous_phase_y_combined_weight_mean": zero.detach(),
+        "continuous_phase_x_target_freq_hz_mean": zero.detach(),
+        "continuous_phase_y_target_freq_hz_mean": zero.detach(),
+        "continuous_phase_x_n_windows": zero.detach(),
+        "continuous_phase_y_n_windows": zero.detach(),
+    }
+    if not bool(getattr(cfg, "use_continuous_phase_lag_loss", False)):
+        return empty
+
+    common_kwargs = dict(
+        dt=float(cfg.dt),
+        observations=str(cfg.continuous_phase_observations),
+        last_k=int(cfg.continuous_phase_last_k),
+        start_time=float(cfg.continuous_phase_start),
+        end_time=cfg.continuous_phase_end,
+        window_seconds=float(cfg.continuous_phase_window_seconds),
+        stride_seconds=float(cfg.continuous_phase_stride_seconds),
+        freq_min=float(cfg.continuous_phase_freq_min),
+        freq_max=cfg.continuous_phase_freq_max,
+        n_freq_bins=int(cfg.continuous_phase_n_freq_bins),
+        frequency_temperature=float(cfg.continuous_phase_frequency_temperature),
+        time_shift_scale_seconds=float(cfg.continuous_phase_time_shift_scale_seconds),
+        base_weight=float(cfg.continuous_phase_base_weight),
+        high_power_weight=float(cfg.continuous_phase_high_power_weight),
+        high_power_threshold=float(cfg.continuous_phase_high_power_threshold),
+        high_power_temperature=float(cfg.continuous_phase_high_power_temperature),
+        static_failure_weight=float(cfg.continuous_phase_static_failure_weight),
+        static_failure_max_weight=float(cfg.continuous_phase_static_failure_max_weight),
+        static_failure_corr_threshold=float(cfg.static_quality_good_corr_threshold),
+        static_failure_lag_seconds=float(cfg.static_quality_good_lag_seconds),
+        static_failure_amp_log_tol=float(cfg.static_quality_good_amp_log_tol),
+        static_failure_max_lag_seconds=float(cfg.static_quality_max_lag_seconds),
+        lag_temperature=float(cfg.lag_temperature),
+    )
+    phase_x = local_continuous_phase_lag_loss(
+        pred,
+        teacher,
+        static_reference=static,
+        dof_indices=x_idx,
+        **common_kwargs,
+    )
+    phase_y = local_continuous_phase_lag_loss(
+        pred,
+        teacher,
+        static_reference=static,
+        dof_indices=y_idx,
+        **common_kwargs,
+    )
+    loss = (
+        float(cfg.w_continuous_phase_absolute_x) * phase_x["absolute_phase_loss"]
+        + float(cfg.w_continuous_phase_absolute_y) * phase_y["absolute_phase_loss"]
+        + float(cfg.w_continuous_phase_time_shift_x) * phase_x["time_shift_loss"]
+        + float(cfg.w_continuous_phase_time_shift_y) * phase_y["time_shift_loss"]
+    )
+    return {
+        "continuous_phase_loss": loss,
+        "continuous_phase_x_absolute_loss": phase_x["absolute_phase_loss"],
+        "continuous_phase_y_absolute_loss": phase_y["absolute_phase_loss"],
+        "continuous_phase_x_time_shift_loss": phase_x["time_shift_loss"],
+        "continuous_phase_y_time_shift_loss": phase_y["time_shift_loss"],
+        "continuous_phase_x_phase_cos_mean": phase_x["phase_cos_mean"],
+        "continuous_phase_y_phase_cos_mean": phase_y["phase_cos_mean"],
+        "continuous_phase_x_equivalent_abs_lag_s_mean": phase_x["equivalent_abs_lag_s_mean"],
+        "continuous_phase_y_equivalent_abs_lag_s_mean": phase_y["equivalent_abs_lag_s_mean"],
+        "continuous_phase_x_high_weight_mean": phase_x["high_weight_mean"],
+        "continuous_phase_y_high_weight_mean": phase_y["high_weight_mean"],
+        "continuous_phase_x_static_failure_weight_mean": phase_x["static_failure_weight_mean"],
+        "continuous_phase_y_static_failure_weight_mean": phase_y["static_failure_weight_mean"],
+        "continuous_phase_x_combined_weight_mean": phase_x["combined_weight_mean"],
+        "continuous_phase_y_combined_weight_mean": phase_y["combined_weight_mean"],
+        "continuous_phase_x_target_freq_hz_mean": phase_x["target_freq_hz_mean"],
+        "continuous_phase_y_target_freq_hz_mean": phase_y["target_freq_hz_mean"],
+        "continuous_phase_x_n_windows": phase_x["n_windows"],
+        "continuous_phase_y_n_windows": phase_y["n_windows"],
     }
 
 
@@ -3169,6 +3329,14 @@ def compute_response_loss(
         x_idx=x_idx,
         y_idx=y_idx,
     )
+    continuous_phase = continuous_phase_lag_training_loss(
+        pred=pred,
+        teacher=teacher,
+        static=case.u_static.to(device=u_pred.device, dtype=u_pred.dtype),
+        cfg=cfg,
+        x_idx=x_idx,
+        y_idx=y_idx,
+    )
     static_quality_gate = static_quality_gate_suppression_loss(
         static=case.u_static,
         teacher=teacher,
@@ -3210,6 +3378,7 @@ def compute_response_loss(
         + local_band_phase["local_band_phase_loss"]
         + local_phase_corr["local_phase_corr_loss"]
         + local_phase_increment["local_phase_increment_loss"]
+        + continuous_phase["continuous_phase_loss"]
         + slow_only_diag["slow_only_diagnosis_loss"]
     )
 
@@ -3319,6 +3488,25 @@ def compute_response_loss(
         "local_phase_increment_y_n_windows": local_phase_increment["local_phase_increment_y_n_windows"],
         "local_phase_increment_x_n_increments": local_phase_increment["local_phase_increment_x_n_increments"],
         "local_phase_increment_y_n_increments": local_phase_increment["local_phase_increment_y_n_increments"],
+        "continuous_phase_loss": continuous_phase["continuous_phase_loss"],
+        "continuous_phase_x_absolute_loss": continuous_phase["continuous_phase_x_absolute_loss"],
+        "continuous_phase_y_absolute_loss": continuous_phase["continuous_phase_y_absolute_loss"],
+        "continuous_phase_x_time_shift_loss": continuous_phase["continuous_phase_x_time_shift_loss"],
+        "continuous_phase_y_time_shift_loss": continuous_phase["continuous_phase_y_time_shift_loss"],
+        "continuous_phase_x_phase_cos_mean": continuous_phase["continuous_phase_x_phase_cos_mean"],
+        "continuous_phase_y_phase_cos_mean": continuous_phase["continuous_phase_y_phase_cos_mean"],
+        "continuous_phase_x_equivalent_abs_lag_s_mean": continuous_phase["continuous_phase_x_equivalent_abs_lag_s_mean"],
+        "continuous_phase_y_equivalent_abs_lag_s_mean": continuous_phase["continuous_phase_y_equivalent_abs_lag_s_mean"],
+        "continuous_phase_x_high_weight_mean": continuous_phase["continuous_phase_x_high_weight_mean"],
+        "continuous_phase_y_high_weight_mean": continuous_phase["continuous_phase_y_high_weight_mean"],
+        "continuous_phase_x_static_failure_weight_mean": continuous_phase["continuous_phase_x_static_failure_weight_mean"],
+        "continuous_phase_y_static_failure_weight_mean": continuous_phase["continuous_phase_y_static_failure_weight_mean"],
+        "continuous_phase_x_combined_weight_mean": continuous_phase["continuous_phase_x_combined_weight_mean"],
+        "continuous_phase_y_combined_weight_mean": continuous_phase["continuous_phase_y_combined_weight_mean"],
+        "continuous_phase_x_target_freq_hz_mean": continuous_phase["continuous_phase_x_target_freq_hz_mean"],
+        "continuous_phase_y_target_freq_hz_mean": continuous_phase["continuous_phase_y_target_freq_hz_mean"],
+        "continuous_phase_x_n_windows": continuous_phase["continuous_phase_x_n_windows"],
+        "continuous_phase_y_n_windows": continuous_phase["continuous_phase_y_n_windows"],
         "slow_only_diagnosis_loss": slow_only_diag["slow_only_diagnosis_loss"],
         "slow_good_no_regression_loss": slow_only_diag["slow_good_no_regression_loss"],
         "slow_good_fast_suppress_loss": slow_only_diag["slow_good_fast_suppress_loss"],
@@ -4737,6 +4925,52 @@ def parse_args() -> tuple[
                         default=d.local_phase_increment_static_failure_weight)
     parser.add_argument("--local-phase-increment-static-failure-max-weight", type=float,
                         default=d.local_phase_increment_static_failure_max_weight)
+    parser.add_argument("--use-continuous-phase-lag-loss", action="store_true",
+                        default=d.use_continuous_phase_lag_loss)
+    parser.add_argument("--no-continuous-phase-lag-loss", dest="use_continuous_phase_lag_loss",
+                        action="store_false")
+    parser.add_argument("--w-continuous-phase-absolute-x", type=float,
+                        default=d.w_continuous_phase_absolute_x)
+    parser.add_argument("--w-continuous-phase-absolute-y", type=float,
+                        default=d.w_continuous_phase_absolute_y)
+    parser.add_argument("--w-continuous-phase-time-shift-x", type=float,
+                        default=d.w_continuous_phase_time_shift_x)
+    parser.add_argument("--w-continuous-phase-time-shift-y", type=float,
+                        default=d.w_continuous_phase_time_shift_y)
+    parser.add_argument("--continuous-phase-observations", type=str,
+                        default=d.continuous_phase_observations)
+    parser.add_argument("--continuous-phase-last-k", type=int,
+                        default=d.continuous_phase_last_k)
+    parser.add_argument("--continuous-phase-start", type=float,
+                        default=d.continuous_phase_start)
+    parser.add_argument("--continuous-phase-end", type=float,
+                        default=d.continuous_phase_end)
+    parser.add_argument("--continuous-phase-window-seconds", type=float,
+                        default=d.continuous_phase_window_seconds)
+    parser.add_argument("--continuous-phase-stride-seconds", type=float,
+                        default=d.continuous_phase_stride_seconds)
+    parser.add_argument("--continuous-phase-freq-min", type=float,
+                        default=d.continuous_phase_freq_min)
+    parser.add_argument("--continuous-phase-freq-max", type=float,
+                        default=d.continuous_phase_freq_max)
+    parser.add_argument("--continuous-phase-n-freq-bins", type=int,
+                        default=d.continuous_phase_n_freq_bins)
+    parser.add_argument("--continuous-phase-frequency-temperature", type=float,
+                        default=d.continuous_phase_frequency_temperature)
+    parser.add_argument("--continuous-phase-time-shift-scale-seconds", type=float,
+                        default=d.continuous_phase_time_shift_scale_seconds)
+    parser.add_argument("--continuous-phase-base-weight", type=float,
+                        default=d.continuous_phase_base_weight)
+    parser.add_argument("--continuous-phase-high-power-weight", type=float,
+                        default=d.continuous_phase_high_power_weight)
+    parser.add_argument("--continuous-phase-high-power-threshold", type=float,
+                        default=d.continuous_phase_high_power_threshold)
+    parser.add_argument("--continuous-phase-high-power-temperature", type=float,
+                        default=d.continuous_phase_high_power_temperature)
+    parser.add_argument("--continuous-phase-static-failure-weight", type=float,
+                        default=d.continuous_phase_static_failure_weight)
+    parser.add_argument("--continuous-phase-static-failure-max-weight", type=float,
+                        default=d.continuous_phase_static_failure_max_weight)
     parser.add_argument("--use-slow-only-branch-diagnosis", action="store_true",
                         default=d.use_slow_only_branch_diagnosis)
     parser.add_argument("--no-slow-only-branch-diagnosis", dest="use_slow_only_branch_diagnosis",
@@ -5150,6 +5384,28 @@ def parse_args() -> tuple[
         local_phase_increment_high_power_temperature=float(args.local_phase_increment_high_power_temperature),
         local_phase_increment_static_failure_weight=float(args.local_phase_increment_static_failure_weight),
         local_phase_increment_static_failure_max_weight=float(args.local_phase_increment_static_failure_max_weight),
+        use_continuous_phase_lag_loss=bool(args.use_continuous_phase_lag_loss),
+        w_continuous_phase_absolute_x=float(args.w_continuous_phase_absolute_x),
+        w_continuous_phase_absolute_y=float(args.w_continuous_phase_absolute_y),
+        w_continuous_phase_time_shift_x=float(args.w_continuous_phase_time_shift_x),
+        w_continuous_phase_time_shift_y=float(args.w_continuous_phase_time_shift_y),
+        continuous_phase_observations=str(args.continuous_phase_observations),
+        continuous_phase_last_k=int(args.continuous_phase_last_k),
+        continuous_phase_start=float(args.continuous_phase_start),
+        continuous_phase_end=args.continuous_phase_end,
+        continuous_phase_window_seconds=float(args.continuous_phase_window_seconds),
+        continuous_phase_stride_seconds=float(args.continuous_phase_stride_seconds),
+        continuous_phase_freq_min=float(args.continuous_phase_freq_min),
+        continuous_phase_freq_max=args.continuous_phase_freq_max,
+        continuous_phase_n_freq_bins=int(args.continuous_phase_n_freq_bins),
+        continuous_phase_frequency_temperature=float(args.continuous_phase_frequency_temperature),
+        continuous_phase_time_shift_scale_seconds=float(args.continuous_phase_time_shift_scale_seconds),
+        continuous_phase_base_weight=float(args.continuous_phase_base_weight),
+        continuous_phase_high_power_weight=float(args.continuous_phase_high_power_weight),
+        continuous_phase_high_power_threshold=float(args.continuous_phase_high_power_threshold),
+        continuous_phase_high_power_temperature=float(args.continuous_phase_high_power_temperature),
+        continuous_phase_static_failure_weight=float(args.continuous_phase_static_failure_weight),
+        continuous_phase_static_failure_max_weight=float(args.continuous_phase_static_failure_max_weight),
         use_slow_only_branch_diagnosis=bool(args.use_slow_only_branch_diagnosis),
         w_slow_good_no_regression=float(args.w_slow_good_no_regression),
         w_slow_good_fast_suppress=float(args.w_slow_good_fast_suppress),
@@ -5341,6 +5597,22 @@ def main() -> None:
             f"w_inc=({cfg.w_local_phase_increment_x}, {cfg.w_local_phase_increment_y}), "
             f"high_weight={cfg.local_phase_increment_high_power_weight}, "
             f"static_failure_weight={cfg.local_phase_increment_static_failure_weight}"
+        )
+    print(f"  use_continuous_phase_lag_loss = {cfg.use_continuous_phase_lag_loss}")
+    if bool(cfg.use_continuous_phase_lag_loss):
+        print(
+            "  continuous_phase_lag = "
+            f"obs={cfg.continuous_phase_observations}, "
+            f"freq=[{cfg.continuous_phase_freq_min}, {cfg.continuous_phase_freq_max}], "
+            f"n_freq_bins={cfg.continuous_phase_n_freq_bins}, "
+            f"window={cfg.continuous_phase_window_seconds}, "
+            f"stride={cfg.continuous_phase_stride_seconds}, "
+            f"lag_scale={cfg.continuous_phase_time_shift_scale_seconds}, "
+            f"w_abs=({cfg.w_continuous_phase_absolute_x}, {cfg.w_continuous_phase_absolute_y}), "
+            f"w_shift=({cfg.w_continuous_phase_time_shift_x}, {cfg.w_continuous_phase_time_shift_y}), "
+            f"base_weight={cfg.continuous_phase_base_weight}, "
+            f"high_weight={cfg.continuous_phase_high_power_weight}, "
+            f"static_failure_weight={cfg.continuous_phase_static_failure_weight}"
         )
     print(f"  use_slow_only_branch_diagnosis = {cfg.use_slow_only_branch_diagnosis}")
     if bool(cfg.use_slow_only_branch_diagnosis):
