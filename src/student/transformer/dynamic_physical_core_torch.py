@@ -50,8 +50,10 @@ class DynamicPhysicalCoreTorch(nn.Module):
         "alpha_xy": "K_xy_template",
     }
     PARAM_TO_DAMPING_TEMPLATE = {
-        "beta_damp_x": "C_x_template",
-        "beta_damp_y": "C_y_template",
+        "beta_damp_x": "C_hf_x_template",
+        "beta_damp_y": "C_hf_y_template",
+        "beta_damp_hf_x": "C_hf_x_template",
+        "beta_damp_hf_y": "C_hf_y_template",
     }
     PARAM_TO_TEMPLATE = PARAM_TO_STIFFNESS_TEMPLATE
 

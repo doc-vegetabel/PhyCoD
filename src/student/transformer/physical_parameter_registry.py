@@ -89,12 +89,11 @@ def build_default_physical_parameter_specs() -> dict[str, PhysicalParameterSpec]
             dim=1,
             target="C",
             max_abs=0.75,
-            template_name="C_x_template",
+            template_name="C_hf_x_template",
             description=(
-                "x-bending directional damping residual. It enters the Newmark core as "
-                "C_eff(t)=C0+beta_damp_x(t)*C_x_template, with C_x_template built from "
-                "the same ux/ry directional stiffness pattern as alpha_x and scaled by "
-                "the structural damping factor. theta=0 exactly recovers the alpha baseline."
+                "Backward-compatible alias for beta_damp_hf_x. It enters the Newmark core as "
+                "a response/load-conditioned high-frequency x-bending damping residual "
+                "C_eff(t)=C0+beta(t)*C_hf_x_template."
             ),
             enabled_by_default=False,
             smooth_weight=1.0,
@@ -105,12 +104,45 @@ def build_default_physical_parameter_specs() -> dict[str, PhysicalParameterSpec]
             dim=1,
             target="C",
             max_abs=0.75,
-            template_name="C_y_template",
+            template_name="C_hf_y_template",
             description=(
-                "y-bending directional damping residual. It enters the Newmark core as "
-                "C_eff(t)=C0+beta_damp_y(t)*C_y_template, using the uy/rx bending "
-                "direction so amplitude correction has a physical damping interpretation "
-                "instead of directly scaling force or displacement."
+                "Backward-compatible alias for beta_damp_hf_y. It enters the Newmark core as "
+                "a response/load-conditioned high-frequency y-bending damping residual "
+                "C_eff(t)=C0+beta(t)*C_hf_y_template."
+            ),
+            enabled_by_default=False,
+            smooth_weight=1.0,
+            amplitude_weight=1.0,
+        ),
+        "beta_damp_hf_x": PhysicalParameterSpec(
+            name="beta_damp_hf_x",
+            dim=1,
+            target="C",
+            max_abs=1.0,
+            template_name="C_hf_x_template",
+            description=(
+                "x-bending high-frequency amplitude correction. The encoder learns a time-varying "
+                "damping-like coefficient from response/load/spectral state and applies it through "
+                "C_eff(t)=C0+beta_damp_hf_x(t)*C_hf_x_template. The template uses the alpha_x "
+                "directional stiffness shape but an experiment-controlled high-frequency damping "
+                "scale instead of the small structural damping residual scale."
+            ),
+            enabled_by_default=False,
+            smooth_weight=1.0,
+            amplitude_weight=1.0,
+        ),
+        "beta_damp_hf_y": PhysicalParameterSpec(
+            name="beta_damp_hf_y",
+            dim=1,
+            target="C",
+            max_abs=1.0,
+            template_name="C_hf_y_template",
+            description=(
+                "y-bending high-frequency amplitude correction. The encoder learns a time-varying "
+                "damping-like coefficient from response/load/spectral state and applies it through "
+                "C_eff(t)=C0+beta_damp_hf_y(t)*C_hf_y_template. The template uses the y-bending "
+                "directional stiffness shape but an experiment-controlled high-frequency damping "
+                "scale instead of the small structural damping residual scale."
             ),
             enabled_by_default=False,
             smooth_weight=1.0,
@@ -153,8 +185,8 @@ def _normalize_enabled_params(
         raise KeyError(
             f"Unknown physical parameter(s): {unknown}. "
             f"Supported parameters: {list(all_specs.keys())}. "
-            "Use --enabled-params alpha_x,alpha_xy,beta_damp_x,beta_damp_y "
-            "for the first amplitude/beta experiment."
+            "Use --enabled-params alpha_x,alpha_xy,beta_damp_hf_x,beta_damp_hf_y "
+            "for the high-frequency amplitude/beta experiment."
         )
 
     out: list[str] = []

@@ -58,6 +58,8 @@ class PhysicalTemplateConfig:
     y_scale_mode: str = "y_bending"
     beta_damp_template_gain_x: float = 1.0
     beta_damp_template_gain_y: float = 1.0
+    beta_hf_damp_scale_x: float = 0.0
+    beta_hf_damp_scale_y: float = 0.0
 
     # alpha_xy residual phi finite difference
     xy_template_mode: XYTemplateMode = "root_to_tip"
@@ -105,13 +107,25 @@ class PhysicalTemplateBundle:
             damping_scale: float,
             beta_damp_template_gain_x: float = 1.0,
             beta_damp_template_gain_y: float = 1.0,
+            beta_hf_damp_scale_x: float = 0.0,
+            beta_hf_damp_scale_y: float = 0.0,
     ) -> dict[str, np.ndarray]:
         scale = float(damping_scale)
         gain_x = float(beta_damp_template_gain_x)
         gain_y = float(beta_damp_template_gain_y)
+        legacy_x_scale = gain_x * scale
+        legacy_y_scale = gain_y * scale
+        hf_x_scale = float(beta_hf_damp_scale_x)
+        hf_y_scale = float(beta_hf_damp_scale_y)
+        if hf_x_scale <= 0.0:
+            hf_x_scale = legacy_x_scale
+        if hf_y_scale <= 0.0:
+            hf_y_scale = legacy_y_scale
         return {
-            "C_x_template": gain_x * scale * self.K_x_template,
-            "C_y_template": gain_y * scale * self.K_y_template,
+            "C_x_template": hf_x_scale * self.K_x_template,
+            "C_y_template": hf_y_scale * self.K_y_template,
+            "C_hf_x_template": hf_x_scale * self.K_x_template,
+            "C_hf_y_template": hf_y_scale * self.K_y_template,
         }
 
     def summary(self) -> dict[str, Any]:
@@ -174,7 +188,14 @@ def _validate_enabled_params(enabled_params: str) -> list[str]:
     names = _split_enabled_params(enabled_params)
     if not names:
         names = ["alpha_x"]
-    allowed = {"alpha_x", "alpha_xy", "beta_damp_x", "beta_damp_y"}
+    allowed = {
+        "alpha_x",
+        "alpha_xy",
+        "beta_damp_x",
+        "beta_damp_y",
+        "beta_damp_hf_x",
+        "beta_damp_hf_y",
+    }
     unknown = [n for n in names if n not in allowed]
     if unknown:
         raise ValueError(
@@ -320,9 +341,13 @@ def build_dynamic_stiffness_templates(cfg: PhysicalTemplateConfig) -> PhysicalTe
         if "alpha_xy" in enabled_names:
             templates.append("K_xy_template")
         if "beta_damp_x" in enabled_names:
-            templates.append("C_x_template")
+            templates.append("C_hf_x_template")
         if "beta_damp_y" in enabled_names:
-            templates.append("C_y_template")
+            templates.append("C_hf_y_template")
+        if "beta_damp_hf_x" in enabled_names:
+            templates.append("C_hf_x_template")
+        if "beta_damp_hf_y" in enabled_names:
+            templates.append("C_hf_y_template")
         print()
         print("[Physical Templates Enabled Params]")
         print(f"  enabled_param_names = {enabled_names}")
@@ -449,7 +474,7 @@ def build_dynamic_stiffness_templates(cfg: PhysicalTemplateConfig) -> PhysicalTe
         },
         "K_y_template": {
             "meaning": (
-                "y-bending stiffness-shape template used to construct C_y_template for beta_damp_y; "
+                "y-bending stiffness-shape template used to construct C_hf_y_template for beta_damp_hf_y; "
                 "it is not registered as a stiffness alpha parameter in the first amplitude experiment."
             ),
             "y_delta_scale": float(cfg.y_delta_scale),
@@ -458,12 +483,15 @@ def build_dynamic_stiffness_templates(cfg: PhysicalTemplateConfig) -> PhysicalTe
         },
         "damping_templates": {
             "meaning": (
-                "C_x_template and C_y_template are built as beta_damp_template_gain times damping_scale "
-                "times K_x_template/K_y_template, where damping_scale is the same stiffness-proportional "
-                "factor used for C0."
+                "C_hf_x_template and C_hf_y_template are high-frequency damping-like amplitude templates. "
+                "When beta_hf_damp_scale_x/y is positive, templates are beta_hf_damp_scale times "
+                "K_x_template/K_y_template directly; otherwise they fall back to the legacy "
+                "beta_damp_template_gain times structural damping_scale."
             ),
             "beta_damp_template_gain_x": float(cfg.beta_damp_template_gain_x),
             "beta_damp_template_gain_y": float(cfg.beta_damp_template_gain_y),
+            "beta_hf_damp_scale_x": float(cfg.beta_hf_damp_scale_x),
+            "beta_hf_damp_scale_y": float(cfg.beta_hf_damp_scale_y),
         },
         "K_xy_template": {
             "meaning": (

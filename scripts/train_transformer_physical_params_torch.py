@@ -338,6 +338,8 @@ class TransformerPhysicalTrainConfig:
     ref_freq_hz: Optional[float] = None
     beta_damp_template_gain_x: float = 1.0
     beta_damp_template_gain_y: float = 1.0
+    beta_hf_damp_scale_x: float = 0.0
+    beta_hf_damp_scale_y: float = 0.0
 
     use_base_initial_twist_phi: bool = True
     base_phi_twist_column: str = "initial_twist_deg"
@@ -3147,6 +3149,14 @@ def _enabled_param_index(enabled_params: str, name: str) -> Optional[int]:
         return None
 
 
+def _enabled_param_index_any(enabled_params: str, names: list[str]) -> Optional[int]:
+    for name in names:
+        idx = _enabled_param_index(enabled_params, name)
+        if idx is not None:
+            return idx
+    return None
+
+
 def static_quality_gate_suppression_loss(
         *,
         static: torch.Tensor,
@@ -3588,8 +3598,14 @@ def beta_alpha_relative_amplitude_loss(
     theta_seq = None
     if theta is not None:
         theta_seq = theta[: int(pred.shape[0])].to(dtype=pred.dtype, device=pred.device)
-    beta_x_index = _enabled_param_index(str(cfg.enabled_params), "beta_damp_x")
-    beta_y_index = _enabled_param_index(str(cfg.enabled_params), "beta_damp_y")
+    beta_x_index = _enabled_param_index_any(
+        str(cfg.enabled_params),
+        ["beta_damp_hf_x", "beta_damp_x"],
+    )
+    beta_y_index = _enabled_param_index_any(
+        str(cfg.enabled_params),
+        ["beta_damp_hf_y", "beta_damp_y"],
+    )
     x_terms = _windowed_alpha_relative_amplitude_terms(
         pred=pred,
         alpha_ref=alpha,
@@ -5553,6 +5569,8 @@ def build_training_model(
         kappa_y_scale_mode=str(cfg.kappa_y_scale_mode),
         beta_damp_template_gain_x=float(cfg.beta_damp_template_gain_x),
         beta_damp_template_gain_y=float(cfg.beta_damp_template_gain_y),
+        beta_hf_damp_scale_x=float(cfg.beta_hf_damp_scale_x),
+        beta_hf_damp_scale_y=float(cfg.beta_hf_damp_scale_y),
         xy_template_mode="root_to_tip",
         xy_delta_phi_deg=1.0,
         enabled_params=str(cfg.enabled_params),  # 关键：显式传给 physical_templates
@@ -5578,6 +5596,8 @@ def build_training_model(
         damping_scale=damping_template_scale,
         beta_damp_template_gain_x=float(cfg.beta_damp_template_gain_x),
         beta_damp_template_gain_y=float(cfg.beta_damp_template_gain_y),
+        beta_hf_damp_scale_x=float(cfg.beta_hf_damp_scale_x),
+        beta_hf_damp_scale_y=float(cfg.beta_hf_damp_scale_y),
     )
 
     core = DynamicPhysicalCoreTorch(
@@ -5717,6 +5737,24 @@ def parse_args() -> tuple[
     parser.add_argument("--ref-freq-hz", type=float, default=d.ref_freq_hz)
     parser.add_argument("--beta-damp-template-gain-x", type=float, default=d.beta_damp_template_gain_x)
     parser.add_argument("--beta-damp-template-gain-y", type=float, default=d.beta_damp_template_gain_y)
+    parser.add_argument(
+        "--beta-hf-damp-scale-x",
+        type=float,
+        default=d.beta_hf_damp_scale_x,
+        help=(
+            "Direct stiffness-proportional high-frequency damping scale for C_hf_x_template. "
+            "If <=0, falls back to beta_damp_template_gain_x * structural damping scale."
+        ),
+    )
+    parser.add_argument(
+        "--beta-hf-damp-scale-y",
+        type=float,
+        default=d.beta_hf_damp_scale_y,
+        help=(
+            "Direct stiffness-proportional high-frequency damping scale for C_hf_y_template. "
+            "If <=0, falls back to beta_damp_template_gain_y * structural damping scale."
+        ),
+    )
 
     parser.add_argument("--kappa-y-static-scale", type=float, default=d.kappa_y_static_scale)
     parser.add_argument("--kappa-y-scale-mode", type=str, default=d.kappa_y_scale_mode,
@@ -6452,6 +6490,8 @@ def parse_args() -> tuple[
         ref_freq_hz=args.ref_freq_hz,
         beta_damp_template_gain_x=float(args.beta_damp_template_gain_x),
         beta_damp_template_gain_y=float(args.beta_damp_template_gain_y),
+        beta_hf_damp_scale_x=float(args.beta_hf_damp_scale_x),
+        beta_hf_damp_scale_y=float(args.beta_hf_damp_scale_y),
         kappa_y_static_scale=args.kappa_y_static_scale,
         kappa_y_scale_mode=args.kappa_y_scale_mode,
         enabled_params=args.enabled_params,
@@ -6853,6 +6893,10 @@ def main() -> None:
     print(
         "  beta_damp_template_gain = "
         f"x:{cfg.beta_damp_template_gain_x}, y:{cfg.beta_damp_template_gain_y}"
+    )
+    print(
+        "  beta_hf_damp_scale = "
+        f"x:{cfg.beta_hf_damp_scale_x}, y:{cfg.beta_hf_damp_scale_y}"
     )
     print(
         "  beta_amp_improvement = "

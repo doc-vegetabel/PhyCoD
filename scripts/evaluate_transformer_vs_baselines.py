@@ -429,7 +429,7 @@ def compute_alpha_beta_diagnostics(
         out[f"late_{name}_rms_beta_to_teacher"] = beta_ratio
         out[f"late_{name}_rms_beta_to_alpha"] = beta_ratio / max(alpha_ratio, eps)
 
-    for name in ("beta_damp_x", "beta_damp_y"):
+    for name in ("beta_damp_x", "beta_damp_y", "beta_damp_hf_x", "beta_damp_hf_y"):
         if name not in beta_theta_dict:
             continue
         arr = np.asarray(beta_theta_dict[name], dtype=np.float64).reshape(-1)
