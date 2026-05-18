@@ -647,6 +647,29 @@ class TransformerPhysicalTrainConfig:
     state_no_regression_corr_drop_tol: float = 0.01
     state_no_regression_amp_log_tol: float = 0.08
 
+    # Beta/amplitude training mode. In auto mode this is enabled only for
+    # freeze-alpha beta runs, leaving alpha training behavior unchanged.
+    beta_loss_mode: str = "auto"
+    beta_amp_observations: str = "tip,last5,mean"
+    beta_amp_last_k: int = 5
+    beta_amp_start: float = 0.0
+    beta_amp_end: Optional[float] = None
+    beta_amp_window_seconds: float = 1.28
+    beta_amp_stride_seconds: float = 0.32
+    beta_amp_alpha_error_ref: float = 0.05
+    beta_amp_alpha_error_max_weight: float = 4.0
+    beta_amp_log_tol: float = 0.0
+    w_beta_amp_x: float = 0.20
+    w_beta_amp_y: float = 0.20
+    w_beta_amp_tip_y: float = 0.0
+    w_beta_amp_last5_y: float = 0.20
+    w_beta_alpha_response_guard: float = 0.20
+    w_beta_alpha_corr_guard: float = 0.20
+    w_beta_alpha_amp_guard: float = 0.10
+    beta_alpha_response_ratio_limit: float = 1.02
+    beta_alpha_corr_drop_tol: float = 0.01
+    beta_alpha_amp_worsen_tol: float = 0.02
+
     best_score_guard_weight: float = 1.0
 
     # Optional slow + phase-gated fast decomposition for alpha_x / alpha_xy.
@@ -1258,6 +1281,43 @@ def _beta_theta_indices(registry: Any) -> list[int]:
         sl = slices[name]
         indices.extend(range(int(sl.start), int(sl.stop)))
     return indices
+
+
+def _enabled_param_names_from_cfg(cfg: TransformerPhysicalTrainConfig) -> list[str]:
+    return [
+        item.strip()
+        for item in str(getattr(cfg, "enabled_params", "")).replace(",", " ").split()
+        if item.strip()
+    ]
+
+
+def _use_beta_alpha_reference_loss(cfg: TransformerPhysicalTrainConfig) -> bool:
+    mode = str(getattr(cfg, "beta_loss_mode", "auto")).strip().lower()
+    if mode in {"standard", "none", "off", "false", "0"}:
+        return False
+    if mode in {"alpha_relative", "alpha_relative_amp", "amplitude", "amp"}:
+        return True
+    if mode != "auto":
+        raise ValueError(
+            f"Unsupported beta_loss_mode={getattr(cfg, 'beta_loss_mode', None)!r}. "
+            "Expected auto, standard, or alpha_relative_amp."
+        )
+    names = _enabled_param_names_from_cfg(cfg)
+    return bool(getattr(cfg, "freeze_alpha_backbone_for_beta", False)) and any(
+        name.startswith("beta_") for name in names
+    )
+
+
+def _alpha_reference_theta_sequence(
+        theta: torch.Tensor,
+        registry: Any,
+) -> Optional[torch.Tensor]:
+    beta_indices = _beta_theta_indices(registry)
+    if not beta_indices:
+        return None
+    theta_ref = theta.detach().clone()
+    theta_ref[..., beta_indices] = 0.0
+    return theta_ref
 
 
 def _mask_parameter_rows(param: torch.nn.Parameter, train_rows: list[int]) -> None:
@@ -1995,6 +2055,31 @@ NO_REGRESSION_LOG_METRIC_KEYS = [
     "state_no_regression_corr_drop_excess",
     "state_no_regression_amp_log_excess",
     "state_no_regression_n_windows",
+]
+
+BETA_ALPHA_LOG_METRIC_KEYS = [
+    "beta_alpha_loss_mode_active",
+    "beta_amp_loss",
+    "beta_amp_x_loss",
+    "beta_amp_y_loss",
+    "beta_amp_tip_y_loss",
+    "beta_amp_last5_y_loss",
+    "beta_amp_pred_log_error_mean",
+    "beta_amp_alpha_log_error_mean",
+    "beta_amp_weight_mean",
+    "beta_amp_n_windows",
+    "beta_alpha_guard_loss",
+    "beta_alpha_response_guard_loss",
+    "beta_alpha_corr_guard_loss",
+    "beta_alpha_amp_guard_loss",
+    "beta_alpha_response_excess",
+    "beta_alpha_corr_drop_excess",
+    "beta_alpha_amp_worsen_excess",
+    "beta_alpha_guard_n_windows",
+    "x_ratio_to_alpha",
+    "y_ratio_to_alpha",
+    "tip_y_ratio_to_alpha",
+    "last5_y_ratio_to_alpha",
 ]
 
 TIMING_LOG_METRIC_KEYS = [
@@ -3307,6 +3392,303 @@ def state_window_no_regression_guard_loss(
     }
 
 
+def _windowed_alpha_relative_amplitude_terms(
+        *,
+        pred: torch.Tensor,
+        alpha_ref: torch.Tensor,
+        teacher: torch.Tensor,
+        index_groups: list[torch.Tensor],
+        cfg: TransformerPhysicalTrainConfig,
+) -> dict[str, torch.Tensor]:
+    zero = torch.zeros((), dtype=pred.dtype, device=pred.device)
+    empty = {
+        "loss": zero,
+        "pred_log_error": zero.detach(),
+        "alpha_log_error": zero.detach(),
+        "weight": zero.detach(),
+        "n_windows": zero.detach(),
+    }
+    if not index_groups:
+        return empty
+
+    T = int(min(pred.shape[0], alpha_ref.shape[0], teacher.shape[0]))
+    if T < 2:
+        return empty
+    pred = pred[:T]
+    alpha_ref = alpha_ref[:T].to(dtype=pred.dtype, device=pred.device).detach()
+    teacher = teacher[:T].to(dtype=pred.dtype, device=pred.device)
+
+    dt = float(cfg.dt)
+    start = max(0, int(round(float(cfg.beta_amp_start) / dt)))
+    end = T if cfg.beta_amp_end is None else min(T, int(round(float(cfg.beta_amp_end) / dt)))
+    win = max(2, int(round(float(cfg.beta_amp_window_seconds) / dt)))
+    stride = max(1, int(round(float(cfg.beta_amp_stride_seconds) / dt)))
+    if end - start < win:
+        return empty
+
+    eps = torch.as_tensor(1.0e-12, dtype=pred.dtype, device=pred.device)
+    alpha_ref_error = max(float(cfg.beta_amp_alpha_error_ref), 1.0e-12)
+    max_weight = max(float(cfg.beta_amp_alpha_error_max_weight), 0.0)
+    log_tol = max(float(cfg.beta_amp_log_tol), 0.0)
+
+    losses: list[torch.Tensor] = []
+    pred_errors: list[torch.Tensor] = []
+    alpha_errors: list[torch.Tensor] = []
+    weights: list[torch.Tensor] = []
+
+    for s0 in range(start, end - win + 1, stride):
+        s1 = s0 + win
+        for idx in index_groups:
+            idx = idx.to(device=pred.device, dtype=torch.long)
+            pred_signal = torch.mean(pred[s0:s1, idx], dim=-1)
+            alpha_signal = torch.mean(alpha_ref[s0:s1, idx], dim=-1)
+            teacher_signal = torch.mean(teacher[s0:s1, idx], dim=-1)
+
+            _, pred_amp_log_abs = _window_corr_and_amp_log_abs(pred_signal, teacher_signal, eps)
+            _, alpha_amp_log_abs = _window_corr_and_amp_log_abs(alpha_signal, teacher_signal, eps)
+            alpha_amp_log_abs = alpha_amp_log_abs.detach()
+            weight = torch.clamp(alpha_amp_log_abs / alpha_ref_error, min=0.0, max=max_weight).detach()
+            amp_error = torch.relu(pred_amp_log_abs - log_tol)
+            losses.append(weight * amp_error ** 2)
+            pred_errors.append(pred_amp_log_abs.detach())
+            alpha_errors.append(alpha_amp_log_abs)
+            weights.append(weight)
+
+    if not losses:
+        return empty
+
+    return {
+        "loss": torch.stack(losses).mean(),
+        "pred_log_error": torch.stack(pred_errors).mean().detach(),
+        "alpha_log_error": torch.stack(alpha_errors).mean().detach(),
+        "weight": torch.stack(weights).mean().detach(),
+        "n_windows": torch.as_tensor(float(len(losses)), dtype=pred.dtype, device=pred.device),
+    }
+
+
+def beta_alpha_relative_amplitude_loss(
+        *,
+        pred: torch.Tensor,
+        alpha_ref: Optional[torch.Tensor],
+        teacher: torch.Tensor,
+        cfg: TransformerPhysicalTrainConfig,
+        x_idx: torch.Tensor,
+        y_idx: torch.Tensor,
+        tip_y_idx: int,
+        last5_y_idx: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    zero = torch.zeros((), dtype=pred.dtype, device=pred.device)
+    empty = {
+        "beta_amp_loss": zero,
+        "beta_amp_x_loss": zero,
+        "beta_amp_y_loss": zero,
+        "beta_amp_tip_y_loss": zero,
+        "beta_amp_last5_y_loss": zero,
+        "beta_amp_pred_log_error_mean": zero.detach(),
+        "beta_amp_alpha_log_error_mean": zero.detach(),
+        "beta_amp_weight_mean": zero.detach(),
+        "beta_amp_n_windows": zero.detach(),
+    }
+    if alpha_ref is None:
+        return empty
+
+    alpha = alpha_ref.to(dtype=pred.dtype, device=pred.device)
+    x_terms = _windowed_alpha_relative_amplitude_terms(
+        pred=pred,
+        alpha_ref=alpha,
+        teacher=teacher,
+        index_groups=_static_quality_observation_indices(
+            dof_indices=x_idx,
+            observations=str(cfg.beta_amp_observations),
+            last_k=int(cfg.beta_amp_last_k),
+        ),
+        cfg=cfg,
+    )
+    y_terms = _windowed_alpha_relative_amplitude_terms(
+        pred=pred,
+        alpha_ref=alpha,
+        teacher=teacher,
+        index_groups=_static_quality_observation_indices(
+            dof_indices=y_idx,
+            observations=str(cfg.beta_amp_observations),
+            last_k=int(cfg.beta_amp_last_k),
+        ),
+        cfg=cfg,
+    )
+    tip_y_terms = _windowed_alpha_relative_amplitude_terms(
+        pred=pred,
+        alpha_ref=alpha,
+        teacher=teacher,
+        index_groups=[torch.as_tensor([int(tip_y_idx)], dtype=torch.long, device=pred.device)],
+        cfg=cfg,
+    )
+    last5_y_terms = _windowed_alpha_relative_amplitude_terms(
+        pred=pred,
+        alpha_ref=alpha,
+        teacher=teacher,
+        index_groups=[last5_y_idx.to(dtype=torch.long, device=pred.device)],
+        cfg=cfg,
+    )
+
+    loss = (
+        float(cfg.w_beta_amp_x) * x_terms["loss"]
+        + float(cfg.w_beta_amp_y) * y_terms["loss"]
+        + float(cfg.w_beta_amp_tip_y) * tip_y_terms["loss"]
+        + float(cfg.w_beta_amp_last5_y) * last5_y_terms["loss"]
+    )
+    pred_error_values = [
+        x_terms["pred_log_error"],
+        y_terms["pred_log_error"],
+        tip_y_terms["pred_log_error"],
+        last5_y_terms["pred_log_error"],
+    ]
+    alpha_error_values = [
+        x_terms["alpha_log_error"],
+        y_terms["alpha_log_error"],
+        tip_y_terms["alpha_log_error"],
+        last5_y_terms["alpha_log_error"],
+    ]
+    weight_values = [
+        x_terms["weight"],
+        y_terms["weight"],
+        tip_y_terms["weight"],
+        last5_y_terms["weight"],
+    ]
+    n_windows = (
+        x_terms["n_windows"]
+        + y_terms["n_windows"]
+        + tip_y_terms["n_windows"]
+        + last5_y_terms["n_windows"]
+    )
+    return {
+        "beta_amp_loss": loss,
+        "beta_amp_x_loss": x_terms["loss"],
+        "beta_amp_y_loss": y_terms["loss"],
+        "beta_amp_tip_y_loss": tip_y_terms["loss"],
+        "beta_amp_last5_y_loss": last5_y_terms["loss"],
+        "beta_amp_pred_log_error_mean": torch.stack(pred_error_values).mean().detach(),
+        "beta_amp_alpha_log_error_mean": torch.stack(alpha_error_values).mean().detach(),
+        "beta_amp_weight_mean": torch.stack(weight_values).mean().detach(),
+        "beta_amp_n_windows": n_windows.detach(),
+    }
+
+
+def beta_alpha_no_regression_guard_loss(
+        *,
+        pred: torch.Tensor,
+        alpha_ref: Optional[torch.Tensor],
+        teacher: torch.Tensor,
+        cfg: TransformerPhysicalTrainConfig,
+        x_idx: torch.Tensor,
+        y_idx: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    zero = torch.zeros((), dtype=pred.dtype, device=pred.device)
+    empty = {
+        "beta_alpha_guard_loss": zero,
+        "beta_alpha_response_guard_loss": zero,
+        "beta_alpha_corr_guard_loss": zero,
+        "beta_alpha_amp_guard_loss": zero,
+        "beta_alpha_response_excess": zero.detach(),
+        "beta_alpha_corr_drop_excess": zero.detach(),
+        "beta_alpha_amp_worsen_excess": zero.detach(),
+        "beta_alpha_guard_n_windows": zero.detach(),
+    }
+    if alpha_ref is None:
+        return empty
+
+    pred = pred.to(dtype=teacher.dtype, device=teacher.device)
+    alpha_ref = alpha_ref.to(dtype=teacher.dtype, device=teacher.device).detach()
+    teacher = teacher.to(dtype=pred.dtype, device=pred.device)
+    T = int(min(pred.shape[0], alpha_ref.shape[0], teacher.shape[0]))
+    if T < 2:
+        return empty
+    pred = pred[:T]
+    alpha_ref = alpha_ref[:T]
+    teacher = teacher[:T]
+
+    dt = float(cfg.dt)
+    start = max(0, int(round(float(cfg.beta_amp_start) / dt)))
+    end = T if cfg.beta_amp_end is None else min(T, int(round(float(cfg.beta_amp_end) / dt)))
+    win = max(2, int(round(float(cfg.beta_amp_window_seconds) / dt)))
+    stride = max(1, int(round(float(cfg.beta_amp_stride_seconds) / dt)))
+    if end - start < win:
+        return empty
+
+    obs_indices = (
+        _static_quality_observation_indices(
+            dof_indices=x_idx,
+            observations=str(cfg.beta_amp_observations),
+            last_k=int(cfg.beta_amp_last_k),
+        )
+        + _static_quality_observation_indices(
+            dof_indices=y_idx,
+            observations=str(cfg.beta_amp_observations),
+            last_k=int(cfg.beta_amp_last_k),
+        )
+    )
+    if not obs_indices:
+        return empty
+
+    eps = torch.as_tensor(1.0e-12, dtype=pred.dtype, device=pred.device)
+    response_terms: list[torch.Tensor] = []
+    corr_terms: list[torch.Tensor] = []
+    amp_terms: list[torch.Tensor] = []
+    response_excesses: list[torch.Tensor] = []
+    corr_excesses: list[torch.Tensor] = []
+    amp_excesses: list[torch.Tensor] = []
+
+    for s0 in range(start, end - win + 1, stride):
+        s1 = s0 + win
+        for idx in obs_indices:
+            idx = idx.to(device=pred.device, dtype=torch.long)
+            alpha_signal = torch.mean(alpha_ref[s0:s1, idx], dim=-1)
+            pred_signal = torch.mean(pred[s0:s1, idx], dim=-1)
+            teacher_signal = torch.mean(teacher[s0:s1, idx], dim=-1)
+
+            alpha_mse = torch.mean((alpha_signal - teacher_signal) ** 2).detach()
+            pred_mse = torch.mean((pred_signal - teacher_signal) ** 2)
+            response_ratio = pred_mse / alpha_mse.clamp_min(eps)
+            response_excess = torch.relu(response_ratio - float(cfg.beta_alpha_response_ratio_limit))
+
+            alpha_corr0, alpha_amp_log_abs = _window_corr_and_amp_log_abs(alpha_signal, teacher_signal, eps)
+            pred_corr0, pred_amp_log_abs = _window_corr_and_amp_log_abs(pred_signal, teacher_signal, eps)
+            corr_excess = torch.relu(
+                alpha_corr0.detach() - pred_corr0 - float(cfg.beta_alpha_corr_drop_tol)
+            )
+            amp_excess = torch.relu(
+                pred_amp_log_abs - alpha_amp_log_abs.detach() - float(cfg.beta_alpha_amp_worsen_tol)
+            )
+
+            response_terms.append(response_excess ** 2)
+            corr_terms.append(corr_excess ** 2)
+            amp_terms.append(amp_excess ** 2)
+            response_excesses.append(response_excess.detach())
+            corr_excesses.append(corr_excess.detach())
+            amp_excesses.append(amp_excess.detach())
+
+    if not response_terms:
+        return empty
+
+    response_guard = torch.stack(response_terms).mean()
+    corr_guard = torch.stack(corr_terms).mean()
+    amp_guard = torch.stack(amp_terms).mean()
+    guard_loss = (
+        float(cfg.w_beta_alpha_response_guard) * response_guard
+        + float(cfg.w_beta_alpha_corr_guard) * corr_guard
+        + float(cfg.w_beta_alpha_amp_guard) * amp_guard
+    )
+    return {
+        "beta_alpha_guard_loss": guard_loss,
+        "beta_alpha_response_guard_loss": response_guard,
+        "beta_alpha_corr_guard_loss": corr_guard,
+        "beta_alpha_amp_guard_loss": amp_guard,
+        "beta_alpha_response_excess": torch.stack(response_excesses).mean().detach(),
+        "beta_alpha_corr_drop_excess": torch.stack(corr_excesses).mean().detach(),
+        "beta_alpha_amp_worsen_excess": torch.stack(amp_excesses).mean().detach(),
+        "beta_alpha_guard_n_windows": torch.as_tensor(float(len(response_terms)), dtype=pred.dtype, device=pred.device),
+    }
+
+
 def _soft_lag_loss_single_window(
         pred_signal: torch.Tensor,
         teacher_signal: torch.Tensor,
@@ -3572,6 +3954,7 @@ def compute_response_loss(
         theta: torch.Tensor,
         theta_aux: Optional[dict[str, torch.Tensor]] = None,
         u_slow: Optional[torch.Tensor] = None,
+        u_alpha_ref: Optional[torch.Tensor] = None,
 ) -> dict[str, torch.Tensor]:
     """
     alpha_x / alpha_xy training loss.
@@ -3603,6 +3986,24 @@ def compute_response_loss(
     tip_y_ratio = tip_y_mse / torch.clamp(base_tip_y, min=eps)
     last5_y_ratio = last5_y_mse / torch.clamp(base_last5_y, min=eps)
 
+    beta_alpha_active = bool(u_alpha_ref is not None and _use_beta_alpha_reference_loss(cfg))
+    nan_metric = torch.as_tensor(float("nan"), dtype=u_pred.dtype, device=u_pred.device)
+    x_ratio_to_alpha = nan_metric
+    y_ratio_to_alpha = nan_metric
+    tip_y_ratio_to_alpha = nan_metric
+    last5_y_ratio_to_alpha = nan_metric
+    if u_alpha_ref is not None:
+        alpha_ref = u_alpha_ref[0].to(device=u_pred.device, dtype=u_pred.dtype).detach()
+        alpha_diff = alpha_ref - teacher
+        alpha_x_mse = torch.mean(alpha_diff[:, x_idx] ** 2)
+        alpha_y_mse = torch.mean(alpha_diff[:, y_idx] ** 2)
+        alpha_tip_y_mse = torch.mean(alpha_diff[:, tip_y_idx] ** 2)
+        alpha_last5_y_mse = torch.mean(alpha_diff[:, last5_y_idx] ** 2)
+        x_ratio_to_alpha = x_mse / torch.clamp(alpha_x_mse, min=eps)
+        y_ratio_to_alpha = y_mse / torch.clamp(alpha_y_mse, min=eps)
+        tip_y_ratio_to_alpha = tip_y_mse / torch.clamp(alpha_tip_y_mse, min=eps)
+        last5_y_ratio_to_alpha = last5_y_mse / torch.clamp(alpha_last5_y_mse, min=eps)
+
     x_guard = torch.relu(x_ratio - (1.0 + float(cfg.x_guard_tol))) ** 2
 
     response_loss = (
@@ -3612,6 +4013,17 @@ def compute_response_loss(
             + float(cfg.w_x_guard) * x_guard
             + float(cfg.w_x) * x_ratio
     )
+    if beta_alpha_active:
+        alpha_x_guard = torch.relu(
+            x_ratio_to_alpha - float(cfg.beta_alpha_response_ratio_limit)
+        ) ** 2
+        response_loss = (
+            float(cfg.w_y) * y_ratio_to_alpha
+            + float(cfg.w_tip_y) * tip_y_ratio_to_alpha
+            + float(cfg.w_last5_y) * last5_y_ratio_to_alpha
+            + float(cfg.w_x_guard) * alpha_x_guard
+            + float(cfg.w_x) * x_ratio_to_alpha
+        )
 
     if bool(cfg.use_cached_alignment_loss) and case.loss_cache is not None:
         freq_x = frequency_alignment_loss_from_cache(pred=pred, cache=case.loss_cache["freq_x"])
@@ -3771,6 +4183,24 @@ def compute_response_loss(
         x_idx=x_idx,
         y_idx=y_idx,
     )
+    beta_amp = beta_alpha_relative_amplitude_loss(
+        pred=pred,
+        alpha_ref=None if u_alpha_ref is None else u_alpha_ref[0],
+        teacher=teacher,
+        cfg=cfg,
+        x_idx=x_idx,
+        y_idx=y_idx,
+        tip_y_idx=tip_y_idx,
+        last5_y_idx=last5_y_idx,
+    )
+    beta_alpha_guard = beta_alpha_no_regression_guard_loss(
+        pred=pred,
+        alpha_ref=None if u_alpha_ref is None else u_alpha_ref[0],
+        teacher=teacher,
+        cfg=cfg,
+        x_idx=x_idx,
+        y_idx=y_idx,
+    )
     slow_only_diag = slow_only_branch_diagnosis_loss(
         pred=pred,
         slow=None if u_slow is None else u_slow[0],
@@ -3812,12 +4242,20 @@ def compute_response_loss(
     base_reg_loss = float(cfg.w_theta_amp) * amp + float(cfg.w_theta_smooth) * smooth
     reg_loss = base_reg_loss + phase_reg["phase_reg_loss"] + static_quality_gate["static_quality_gate_loss"]
 
-    total_loss = (
-        response_loss
-        + freq_loss
-        + reg_loss
-        + state_no_regression["state_no_regression_guard_loss"]
-    )
+    if beta_alpha_active:
+        total_loss = (
+            response_loss
+            + beta_amp["beta_amp_loss"]
+            + reg_loss
+            + beta_alpha_guard["beta_alpha_guard_loss"]
+        )
+    else:
+        total_loss = (
+            response_loss
+            + freq_loss
+            + reg_loss
+            + state_no_regression["state_no_regression_guard_loss"]
+        )
 
     result = {
         "total_loss": total_loss,
@@ -3966,6 +4404,28 @@ def compute_response_loss(
         "state_no_regression_corr_drop_excess": state_no_regression["state_no_regression_corr_drop_excess"],
         "state_no_regression_amp_log_excess": state_no_regression["state_no_regression_amp_log_excess"],
         "state_no_regression_n_windows": state_no_regression["state_no_regression_n_windows"],
+        "beta_alpha_loss_mode_active": torch.as_tensor(
+            1.0 if beta_alpha_active else 0.0,
+            dtype=u_pred.dtype,
+            device=u_pred.device,
+        ),
+        "beta_amp_loss": beta_amp["beta_amp_loss"],
+        "beta_amp_x_loss": beta_amp["beta_amp_x_loss"],
+        "beta_amp_y_loss": beta_amp["beta_amp_y_loss"],
+        "beta_amp_tip_y_loss": beta_amp["beta_amp_tip_y_loss"],
+        "beta_amp_last5_y_loss": beta_amp["beta_amp_last5_y_loss"],
+        "beta_amp_pred_log_error_mean": beta_amp["beta_amp_pred_log_error_mean"],
+        "beta_amp_alpha_log_error_mean": beta_amp["beta_amp_alpha_log_error_mean"],
+        "beta_amp_weight_mean": beta_amp["beta_amp_weight_mean"],
+        "beta_amp_n_windows": beta_amp["beta_amp_n_windows"],
+        "beta_alpha_guard_loss": beta_alpha_guard["beta_alpha_guard_loss"],
+        "beta_alpha_response_guard_loss": beta_alpha_guard["beta_alpha_response_guard_loss"],
+        "beta_alpha_corr_guard_loss": beta_alpha_guard["beta_alpha_corr_guard_loss"],
+        "beta_alpha_amp_guard_loss": beta_alpha_guard["beta_alpha_amp_guard_loss"],
+        "beta_alpha_response_excess": beta_alpha_guard["beta_alpha_response_excess"],
+        "beta_alpha_corr_drop_excess": beta_alpha_guard["beta_alpha_corr_drop_excess"],
+        "beta_alpha_amp_worsen_excess": beta_alpha_guard["beta_alpha_amp_worsen_excess"],
+        "beta_alpha_guard_n_windows": beta_alpha_guard["beta_alpha_guard_n_windows"],
         "reg_loss": reg_loss,
         "x_mse": x_mse,
         "y_mse": y_mse,
@@ -3975,6 +4435,10 @@ def compute_response_loss(
         "y_ratio": y_ratio,
         "tip_y_ratio": tip_y_ratio,
         "last5_y_ratio": last5_y_ratio,
+        "x_ratio_to_alpha": x_ratio_to_alpha,
+        "y_ratio_to_alpha": y_ratio_to_alpha,
+        "tip_y_ratio_to_alpha": tip_y_ratio_to_alpha,
+        "last5_y_ratio_to_alpha": last5_y_ratio_to_alpha,
         "x_guard": x_guard,
         "freq_x_spec_loss": freq_x["spec_loss"],
         "freq_y_spec_loss": freq_y["spec_loss"],
@@ -4062,6 +4526,39 @@ def compute_slow_only_rollout_for_diagnosis(
         )
     return u_slow
 
+
+def compute_alpha_reference_rollout_for_beta_loss(
+        *,
+        model: TransformerPhysicalRolloutTorch,
+        theta: torch.Tensor,
+        cfg: TransformerPhysicalTrainConfig,
+        u_static: torch.Tensor,
+        v_static: torch.Tensor,
+        a_static: torch.Tensor,
+        F: torch.Tensor,
+        u0: torch.Tensor,
+        v0: torch.Tensor,
+        a0: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    if not _use_beta_alpha_reference_loss(cfg):
+        return None
+    theta_ref = _alpha_reference_theta_sequence(theta, model.physical_core.registry)
+    if theta_ref is None:
+        return None
+    with torch.no_grad():
+        u_alpha, _, _ = model.rollout_with_theta_sequence(
+            theta_seq=theta_ref,
+            u_static=u_static,
+            v_static=v_static,
+            a_static=a_static,
+            F=F,
+            u0=u0,
+            v0=v0,
+            a0=a0,
+        )
+    return u_alpha.detach()
+
+
 def evaluate_cases(
         *,
         model: TransformerPhysicalRolloutTorch,
@@ -4088,6 +4585,7 @@ def evaluate_cases(
             **{k: zero for k in PHASE_GATED_LOG_METRIC_KEYS},
             **{k: zero for k in ADAPTIVE_PHASE_LOG_METRIC_KEYS},
             **{k: zero for k in NO_REGRESSION_LOG_METRIC_KEYS},
+            **{k: zero for k in BETA_ALPHA_LOG_METRIC_KEYS},
             **{k: 0.0 for k in TIMING_LOG_METRIC_KEYS},
             "num_cases": 0,
         }
@@ -4141,6 +4639,9 @@ def evaluate_cases(
         no_regression_metric_values: dict[str, list[torch.Tensor]] = {
             k: [] for k in NO_REGRESSION_LOG_METRIC_KEYS
         }
+        beta_alpha_metric_values: dict[str, list[torch.Tensor]] = {
+            k: [] for k in BETA_ALPHA_LOG_METRIC_KEYS
+        }
 
         for case in cases:
             # 当前训练逐 case 处理，batch size = 1。
@@ -4193,6 +4694,18 @@ def evaluate_cases(
                 v0=v0,
                 a0=a0,
             )
+            u_alpha_ref = compute_alpha_reference_rollout_for_beta_loss(
+                model=model,
+                theta=out.theta,
+                cfg=cfg,
+                u_static=u_static,
+                v_static=v_static,
+                a_static=a_static,
+                F=F,
+                u0=u0,
+                v0=v0,
+                a0=a0,
+            )
             loss_dict = compute_response_loss(
                 u_pred=out.u_pred,
                 case=case,
@@ -4204,6 +4717,7 @@ def evaluate_cases(
                 theta=out.theta,
                 theta_aux=out.theta_aux,
                 u_slow=u_slow,
+                u_alpha_ref=u_alpha_ref,
             )
             if profile_timing:
                 timing_sums["timing_loss_seconds"] += _time_now(cfg, next(model.parameters()).device) - t0
@@ -4254,6 +4768,8 @@ def evaluate_cases(
                 adaptive_metric_values[k].append(loss_dict.get(k, missing_metric_default))
             for k in NO_REGRESSION_LOG_METRIC_KEYS:
                 no_regression_metric_values[k].append(loss_dict.get(k, missing_metric_default))
+            for k in BETA_ALPHA_LOG_METRIC_KEYS:
+                beta_alpha_metric_values[k].append(loss_dict.get(k, missing_metric_default))
             if profile_timing:
                 timing_sums["timing_metric_accum_seconds"] += _time_now(cfg, next(model.parameters()).device) - t0
 
@@ -4311,6 +4827,10 @@ def evaluate_cases(
             k: torch.stack(values).mean()
             for k, values in no_regression_metric_values.items()
         }
+        beta_alpha_metrics = {
+            k: torch.stack(values).mean()
+            for k, values in beta_alpha_metric_values.items()
+        }
 
     result = {
         "total_loss": total_loss,
@@ -4350,6 +4870,7 @@ def evaluate_cases(
         **phase_metrics,
         **adaptive_metrics,
         **no_regression_metrics,
+        **beta_alpha_metrics,
         **timing_sums,
         "num_cases": len(cases),
     }
@@ -4457,6 +4978,7 @@ def train_cases_grad_accum(
         + phase_metric_mean_keys
         + adaptive_metric_mean_keys
         + list(NO_REGRESSION_LOG_METRIC_KEYS)
+        + list(BETA_ALPHA_LOG_METRIC_KEYS)
     )
 
     # Keep logging reductions on device during the per-case backward loop.
@@ -4517,6 +5039,18 @@ def train_cases_grad_accum(
             v0=v0,
             a0=a0,
         )
+        u_alpha_ref = compute_alpha_reference_rollout_for_beta_loss(
+            model=model,
+            theta=out.theta,
+            cfg=cfg,
+            u_static=u_static,
+            v_static=v_static,
+            a_static=a_static,
+            F=F,
+            u0=u0,
+            v0=v0,
+            a0=a0,
+        )
         loss_dict = compute_response_loss(
             u_pred=out.u_pred,
             case=case,
@@ -4528,6 +5062,7 @@ def train_cases_grad_accum(
                 theta=out.theta,
                 theta_aux=out.theta_aux,
                 u_slow=u_slow,
+                u_alpha_ref=u_alpha_ref,
             )
 
         # 关键：除以 n_cases，保证等价于 mean loss 再 backward。
@@ -4587,6 +5122,7 @@ def train_cases_grad_accum(
 
         del out
         del u_slow
+        del u_alpha_ref
         del loss_dict
         del scaled_loss
 
@@ -5005,6 +5541,7 @@ def parse_args() -> tuple[
     parser.add_argument("--use-load-spectral-features", action="store_true", default=d.use_load_spectral_features)
     parser.add_argument("--no-load-spectral-features", dest="use_load_spectral_features", action="store_false")
     parser.add_argument("--load-spectral-window-size", type=int, default=d.load_spectral_window_size)
+    parser.add_argument("--load-spectral-feature-dim", type=int, default=d.load_spectral_feature_dim)
     parser.add_argument("--load-spectral-freq-min", type=float, default=d.load_spectral_freq_min)
     parser.add_argument("--load-spectral-freq-max", type=float, default=d.load_spectral_freq_max)
     parser.add_argument("--load-spectral-bands", type=str, default=d.load_spectral_bands)
@@ -5512,6 +6049,43 @@ def parse_args() -> tuple[
     parser.add_argument("--state-no-regression-amp-log-tol", type=float,
                         default=d.state_no_regression_amp_log_tol)
 
+    parser.add_argument(
+        "--beta-loss-mode",
+        type=str,
+        default=d.beta_loss_mode,
+        choices=["auto", "standard", "alpha_relative_amp", "alpha_relative", "amplitude", "amp"],
+        help=(
+            "Beta training objective. auto enables alpha-relative amplitude loss "
+            "when freeze-alpha beta training is active; standard keeps alpha-style loss."
+        ),
+    )
+    parser.add_argument("--beta-amp-observations", type=str, default=d.beta_amp_observations)
+    parser.add_argument("--beta-amp-last-k", type=int, default=d.beta_amp_last_k)
+    parser.add_argument("--beta-amp-start", type=float, default=d.beta_amp_start)
+    parser.add_argument("--beta-amp-end", type=float, default=d.beta_amp_end)
+    parser.add_argument("--beta-amp-window-seconds", type=float, default=d.beta_amp_window_seconds)
+    parser.add_argument("--beta-amp-stride-seconds", type=float, default=d.beta_amp_stride_seconds)
+    parser.add_argument("--beta-amp-alpha-error-ref", type=float, default=d.beta_amp_alpha_error_ref)
+    parser.add_argument("--beta-amp-alpha-error-max-weight", type=float,
+                        default=d.beta_amp_alpha_error_max_weight)
+    parser.add_argument("--beta-amp-log-tol", type=float, default=d.beta_amp_log_tol)
+    parser.add_argument("--w-beta-amp-x", type=float, default=d.w_beta_amp_x)
+    parser.add_argument("--w-beta-amp-y", type=float, default=d.w_beta_amp_y)
+    parser.add_argument("--w-beta-amp-tip-y", type=float, default=d.w_beta_amp_tip_y)
+    parser.add_argument("--w-beta-amp-last5-y", type=float, default=d.w_beta_amp_last5_y)
+    parser.add_argument("--w-beta-alpha-response-guard", type=float,
+                        default=d.w_beta_alpha_response_guard)
+    parser.add_argument("--w-beta-alpha-corr-guard", type=float,
+                        default=d.w_beta_alpha_corr_guard)
+    parser.add_argument("--w-beta-alpha-amp-guard", type=float,
+                        default=d.w_beta_alpha_amp_guard)
+    parser.add_argument("--beta-alpha-response-ratio-limit", type=float,
+                        default=d.beta_alpha_response_ratio_limit)
+    parser.add_argument("--beta-alpha-corr-drop-tol", type=float,
+                        default=d.beta_alpha_corr_drop_tol)
+    parser.add_argument("--beta-alpha-amp-worsen-tol", type=float,
+                        default=d.beta_alpha_amp_worsen_tol)
+
     parser.add_argument("--best-score-guard-weight", type=float, default=d.best_score_guard_weight)
 
     parser.add_argument("--best-score-mode", type=str, default=d.best_score_mode,
@@ -5684,7 +6258,7 @@ def parse_args() -> tuple[
         use_geometry_branch=args.use_geometry_branch,
         use_load_spectral_features=bool(args.use_load_spectral_features),
         load_spectral_window_size=args.load_spectral_window_size,
-        load_spectral_feature_dim=None,
+        load_spectral_feature_dim=args.load_spectral_feature_dim,
         load_spectral_freq_min=float(args.load_spectral_freq_min),
         load_spectral_freq_max=float(args.load_spectral_freq_max),
         load_spectral_bands=str(args.load_spectral_bands),
@@ -5968,6 +6542,26 @@ def parse_args() -> tuple[
         state_no_regression_response_ratio_limit=float(args.state_no_regression_response_ratio_limit),
         state_no_regression_corr_drop_tol=float(args.state_no_regression_corr_drop_tol),
         state_no_regression_amp_log_tol=float(args.state_no_regression_amp_log_tol),
+        beta_loss_mode=str(args.beta_loss_mode),
+        beta_amp_observations=str(args.beta_amp_observations),
+        beta_amp_last_k=int(args.beta_amp_last_k),
+        beta_amp_start=float(args.beta_amp_start),
+        beta_amp_end=args.beta_amp_end,
+        beta_amp_window_seconds=float(args.beta_amp_window_seconds),
+        beta_amp_stride_seconds=float(args.beta_amp_stride_seconds),
+        beta_amp_alpha_error_ref=float(args.beta_amp_alpha_error_ref),
+        beta_amp_alpha_error_max_weight=float(args.beta_amp_alpha_error_max_weight),
+        beta_amp_log_tol=float(args.beta_amp_log_tol),
+        w_beta_amp_x=float(args.w_beta_amp_x),
+        w_beta_amp_y=float(args.w_beta_amp_y),
+        w_beta_amp_tip_y=float(args.w_beta_amp_tip_y),
+        w_beta_amp_last5_y=float(args.w_beta_amp_last5_y),
+        w_beta_alpha_response_guard=float(args.w_beta_alpha_response_guard),
+        w_beta_alpha_corr_guard=float(args.w_beta_alpha_corr_guard),
+        w_beta_alpha_amp_guard=float(args.w_beta_alpha_amp_guard),
+        beta_alpha_response_ratio_limit=float(args.beta_alpha_response_ratio_limit),
+        beta_alpha_corr_drop_tol=float(args.beta_alpha_corr_drop_tol),
+        beta_alpha_amp_worsen_tol=float(args.beta_alpha_amp_worsen_tol),
         best_score_guard_weight=float(args.best_score_guard_weight),
         best_score_mode=args.best_score_mode,
         best_start_epoch=int(args.best_start_epoch),
@@ -6048,6 +6642,8 @@ def main() -> None:
         )
     print(f"  best_score_mode = {cfg.best_score_mode}")
     print(f"  best_start_epoch = {cfg.best_start_epoch}")
+    print(f"  beta_loss_mode = {cfg.beta_loss_mode}")
+    print(f"  beta_alpha_reference_loss_active = {_use_beta_alpha_reference_loss(cfg)}")
     print(f"  use_loss_curriculum = {cfg.use_loss_curriculum}")
     if bool(cfg.use_loss_curriculum):
         print(
@@ -6541,11 +7137,20 @@ def main() -> None:
         # Construct metrics block for best checkpoint evaluation
         best_epoch_allowed = epoch >= int(cfg.best_start_epoch)
         if run_valid_this_epoch and valid_eval is not None:
+            valid_x_for_best = float(valid_eval["x_ratio"].detach().cpu())
+            valid_y_for_best = float(valid_eval["y_ratio"].detach().cpu())
+            if _use_beta_alpha_reference_loss(epoch_cfg):
+                alpha_x_for_best = _metric_to_float(valid_eval, "x_ratio_to_alpha")
+                alpha_y_for_best = _metric_to_float(valid_eval, "y_ratio_to_alpha")
+                if np.isfinite(alpha_x_for_best):
+                    valid_x_for_best = alpha_x_for_best
+                if np.isfinite(alpha_y_for_best):
+                    valid_y_for_best = alpha_y_for_best
             valid_metrics_for_best = {
-                "valid_y": float(valid_eval["y_ratio"].detach().cpu()),
-                "valid_x": float(valid_eval["x_ratio"].detach().cpu()),
-                "x_ratio": float(valid_eval["x_ratio"].detach().cpu()),
-                "y_ratio": float(valid_eval["y_ratio"].detach().cpu()),
+                "valid_y": valid_y_for_best,
+                "valid_x": valid_x_for_best,
+                "x_ratio": valid_x_for_best,
+                "y_ratio": valid_y_for_best,
             }
 
             eligible_for_best, best_gate_reason = can_update_best_checkpoint(
@@ -6754,6 +7359,9 @@ def main() -> None:
         for guard_key in NO_REGRESSION_LOG_METRIC_KEYS:
             row[f"train_{guard_key}"] = _metric_to_float(train_eval, guard_key)
             row[f"valid_{guard_key}"] = _metric_to_float(valid_eval_for_log, guard_key)
+        for beta_key in BETA_ALPHA_LOG_METRIC_KEYS:
+            row[f"train_{beta_key}"] = _metric_to_float(train_eval, beta_key)
+            row[f"valid_{beta_key}"] = _metric_to_float(valid_eval_for_log, beta_key)
         for timing_key in TIMING_LOG_METRIC_KEYS:
             row[f"train_{timing_key}"] = _metric_to_float(train_eval, timing_key)
             row[f"valid_{timing_key}"] = _metric_to_float(valid_eval_for_log, timing_key)
@@ -6761,13 +7369,23 @@ def main() -> None:
         history.append(row)
 
         if epoch % int(cfg.print_every) == 0:
+            use_alpha_print = (
+                _use_beta_alpha_reference_loss(epoch_cfg)
+                and np.isfinite(row.get("train_y_ratio_to_alpha", float("nan")))
+                and np.isfinite(row.get("valid_y_ratio_to_alpha", float("nan")))
+            )
+            train_y_print = row["train_y_ratio_to_alpha"] if use_alpha_print else row["train_y_ratio"]
+            train_x_print = row["train_x_ratio_to_alpha"] if use_alpha_print else row["train_x_ratio"]
+            valid_y_print = row["valid_y_ratio_to_alpha"] if use_alpha_print else row["valid_y_ratio"]
+            valid_x_print = row["valid_x_ratio_to_alpha"] if use_alpha_print else row["valid_x_ratio"]
+            ratio_label = "_to_alpha" if use_alpha_print else ""
             print(
                 f"[Epoch {epoch:04d}] "
                 f"score={score:.6e} best={best_score:.6e}@{best_epoch} "
                 f"train_freq={row['train_freq_loss']:.3e} valid_freq={row['valid_freq_loss']:.3e} "
                 f"valid_peak={row['valid_peak_time_loss']:.3e} valid_lag={row['valid_lag_loss']:.3e} "
-                f"train_y={row['train_y_ratio']:.6f} train_x={row['train_x_ratio']:.6f} "
-                f"valid_y={row['valid_y_ratio']:.6f} valid_x={row['valid_x_ratio']:.6f} "
+                f"train_y{ratio_label}={train_y_print:.6f} train_x{ratio_label}={train_x_print:.6f} "
+                f"valid_y{ratio_label}={valid_y_print:.6f} valid_x{ratio_label}={valid_x_print:.6f} "
                 f"best_mode={cfg.best_score_mode} best_gate={'PASS' if eligible_for_best else 'FAIL'} "
                 f"theta_max={row['train_theta_abs_max']:.4e} "
                 f"lr={current_lr:.3e}"
