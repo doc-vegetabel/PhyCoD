@@ -417,3 +417,11 @@ python tests/compare_full_corrected_core_vs_student.py --time-series-load-file d
 | 2026-05-18 Asia/Shanghai | `src/student/transformer/physical_parameter_registry.py`, `src/student/transformer/dynamic_physical_core_torch.py` | Add high-frequency beta parameter names | Add `beta_damp_hf_x` and `beta_damp_hf_y` as C-target physical parameters for response/load-conditioned high-frequency amplitude correction. Keep `beta_damp_x/y` as backward-compatible aliases that now map to the same high-frequency templates. | beta amplitude correction v4 |
 | 2026-05-18 Asia/Shanghai | `src/student/transformer/physical_templates.py`, `scripts/train_transformer_physical_params_torch.py` | Replace small structural damping residual scale with direct high-frequency scale | Add `--beta-hf-damp-scale-x/y`. When positive, `C_hf_x/y_template = beta_hf_damp_scale_x/y * K_x/y_template` directly; when nonpositive, the code falls back to the previous `beta_damp_template_gain * structural_damping_scale` behavior. This lets beta test larger damping-like amplitude leverage without changing alpha K templates or Newmark integration. | beta amplitude correction v4 |
 | 2026-05-18 Asia/Shanghai | `scripts/evaluate_transformer_vs_baselines.py` | Extend beta theta diagnostics | Evaluation diagnostics now include theta stats for both old `beta_damp_x/y` aliases and new `beta_damp_hf_x/y` parameter names, so four-curve summaries remain comparable across v3 and v4 experiments. | beta result interpretation |
+
+---
+
+## 34. 2026-05-18 constant beta-hf upper-bound scan
+
+| Time | Files | Required Note | Content | Stage |
+|---|---|---|---|---|
+| 2026-05-18 Asia/Shanghai | `scripts/scan_beta_hf_constant.py` | Add constant beta-hf scan script | Add a no-training sensitivity scan that rolls out the MAIN-ALPHA checkpoint to obtain `alpha_x(t), alpha_xy(t)`, then constructs a beta-capable physical core and overlays constant `beta_damp_hf_x/y` values on top of the alpha theta sequence. It writes metrics, late RMS diagnostics, summary JSON, and response NPZ to quantify whether the C-target high-frequency beta channel can physically reduce high-frequency amplitude errors before another learned beta run is attempted. | beta mechanism diagnosis |

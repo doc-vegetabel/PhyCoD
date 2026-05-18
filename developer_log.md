@@ -1030,3 +1030,9 @@ alpha_y(t) + response/load + static conditioning 在 240-step 训练中有效。
 | 2026-05-18 Asia/Shanghai | `src/student/transformer/physical_parameter_registry.py`, `src/student/transformer/dynamic_physical_core_torch.py` | Add | Add `beta_damp_hf_x` and `beta_damp_hf_y` C-target parameter names for high-frequency amplitude correction. The old `beta_damp_x/y` names remain supported as aliases and now map to the same high-frequency damping templates. | beta amplitude correction v4 |
 | 2026-05-18 Asia/Shanghai | `src/student/transformer/physical_templates.py`, `scripts/train_transformer_physical_params_torch.py` | Modify | Add direct high-frequency damping template scales `--beta-hf-damp-scale-x/y`. Positive values construct `C_hf_x/y_template = beta_hf_damp_scale_x/y * K_x/y_template`, bypassing the small structural damping residual scale; nonpositive values preserve the previous gain times structural damping fallback. | beta amplitude correction v4 |
 | 2026-05-18 Asia/Shanghai | `scripts/evaluate_transformer_vs_baselines.py` | Modify | Extend alpha+beta diagnostics to include theta stats for `beta_damp_hf_x/y` as well as the old alias names. | beta result interpretation |
+
+# 2026-05-18 constant beta-hf upper-bound scan
+
+| Time | Files | Change Type | Content | Stage |
+|---|---|---|---|---|
+| 2026-05-18 Asia/Shanghai | `scripts/scan_beta_hf_constant.py` | Add | Add a no-training constant beta scan. The script runs the alpha checkpoint to get dynamic `alpha_x(t), alpha_xy(t)`, then rolls out a beta-capable core with constant `beta_damp_hf_x/y` grid values. It reports metrics and late RMS diagnostics so the project can decide whether C-target high-frequency beta has enough physical leverage before further learned beta training. | beta mechanism diagnosis |
