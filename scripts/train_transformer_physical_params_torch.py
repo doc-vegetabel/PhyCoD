@@ -336,10 +336,6 @@ class TransformerPhysicalTrainConfig:
     alpha_torsion: float = 1.0
     zeta_structural: float = 0.015
     ref_freq_hz: Optional[float] = None
-    beta_damp_template_gain_x: float = 1.0
-    beta_damp_template_gain_y: float = 1.0
-    beta_hf_damp_scale_x: float = 0.0
-    beta_hf_damp_scale_y: float = 0.0
 
     use_base_initial_twist_phi: bool = True
     base_phi_twist_column: str = "initial_twist_deg"
@@ -669,9 +665,6 @@ class TransformerPhysicalTrainConfig:
     w_beta_amp_tip_y: float = 0.0
     w_beta_amp_last5_y: float = 0.20
     w_beta_amp_improvement: float = 0.0
-    w_beta_damp_sign_x: float = 0.0
-    w_beta_damp_sign_y: float = 0.0
-    beta_damp_sign_min_alpha_error: float = 0.02
     w_beta_alpha_response_guard: float = 0.20
     w_beta_alpha_corr_guard: float = 0.20
     w_beta_alpha_amp_guard: float = 0.10
@@ -1133,11 +1126,11 @@ def _build_structural_damping_matrix(
             raise ValueError("Cannot infer ref_freq_hz from empty natural_freqs_hz.")
         ref_freq_hz = float(natural_freqs_hz[0])
 
-    beta_damp = _structural_damping_scale(
+    damping_coeff = _structural_damping_scale(
         zeta_structural=float(zeta_structural),
         ref_freq_hz=float(ref_freq_hz),
     )
-    C = beta_damp * K
+    C = damping_coeff * K
     return np.asarray(C, dtype=np.float64), float(ref_freq_hz)
 
 
@@ -1285,7 +1278,7 @@ def _beta_theta_indices(registry: Any) -> list[int]:
     slices = registry.slices
     for name in registry.names:
         spec = registry.get_spec(name)
-        if spec.target != "C":
+        if not str(name).startswith("beta_"):
             continue
         sl = slices[name]
         indices.extend(range(int(sl.start), int(sl.stop)))
@@ -1348,16 +1341,16 @@ def _configure_beta_head_only_training(
         registry: Any,
 ) -> dict[str, Any]:
     """
-    Freeze the alpha backbone and train only C-target beta rows of theta heads.
+    Freeze the alpha backbone and train only beta rows of theta heads.
 
     This is intentionally conservative for the first amplitude run: alpha_x and
     alpha_xy rows stay bitwise untouched by gradients, while beta rows can learn
-    damping residuals from the already-trained Transformer features.
+    equivalent force residuals from the already-trained Transformer features.
     """
     beta_rows = _beta_theta_indices(registry)
     if not beta_rows:
         raise ValueError(
-            "freeze_alpha_backbone_for_beta=True but registry has no C-target beta parameters."
+            "freeze_alpha_backbone_for_beta=True but registry has no beta parameters."
         )
 
     for param in model.encoder.parameters():
@@ -2079,9 +2072,6 @@ BETA_ALPHA_LOG_METRIC_KEYS = [
     "beta_amp_y_improvement_loss",
     "beta_amp_tip_y_improvement_loss",
     "beta_amp_last5_y_improvement_loss",
-    "beta_damp_sign_loss",
-    "beta_damp_x_sign_loss",
-    "beta_damp_y_sign_loss",
     "beta_amp_pred_log_error_mean",
     "beta_amp_alpha_log_error_mean",
     "beta_amp_improvement_margin_mean",
@@ -3447,15 +3437,12 @@ def _windowed_alpha_relative_amplitude_terms(
         index_groups: list[torch.Tensor],
         cfg: TransformerPhysicalTrainConfig,
         theta: Optional[torch.Tensor] = None,
-        beta_index: Optional[int] = None,
-        beta_sign_weight: float = 0.0,
 ) -> dict[str, torch.Tensor]:
     zero = torch.zeros((), dtype=pred.dtype, device=pred.device)
     empty = {
         "loss": zero,
         "direct_loss": zero,
         "improvement_loss": zero,
-        "sign_loss": zero,
         "pred_log_error": zero.detach(),
         "alpha_log_error": zero.detach(),
         "improvement_margin": zero.detach(),
@@ -3486,18 +3473,9 @@ def _windowed_alpha_relative_amplitude_terms(
     log_tol = max(float(cfg.beta_amp_log_tol), 0.0)
     improvement_margin = max(float(cfg.beta_amp_improvement_margin), 0.0)
     improvement_weight = max(float(cfg.w_beta_amp_improvement), 0.0)
-    beta_sign_weight = max(float(beta_sign_weight), 0.0)
-    sign_min_alpha_error = max(float(cfg.beta_damp_sign_min_alpha_error), 0.0)
-    theta_seq = None
-    if theta is not None and beta_index is not None and beta_sign_weight > 0.0:
-        theta_seq = theta[:T].to(dtype=pred.dtype, device=pred.device)
-        if theta_seq.ndim != 2 or int(beta_index) < 0 or int(beta_index) >= int(theta_seq.shape[-1]):
-            theta_seq = None
-
     losses: list[torch.Tensor] = []
     direct_losses: list[torch.Tensor] = []
     improvement_losses: list[torch.Tensor] = []
-    sign_losses: list[torch.Tensor] = []
     pred_errors: list[torch.Tensor] = []
     alpha_errors: list[torch.Tensor] = []
     improvement_margins: list[torch.Tensor] = []
@@ -3521,21 +3499,13 @@ def _windowed_alpha_relative_amplitude_terms(
             direct_loss = weight * amp_error ** 2
             improvement_error = torch.relu(pred_amp_log_abs - alpha_amp_log_abs + improvement_margin)
             improvement_loss = weight * improvement_error ** 2
-            sign_loss = zero
-            if theta_seq is not None:
-                desired_sign = torch.sign(alpha_amp_log).detach()
-                active = (alpha_amp_log_abs > sign_min_alpha_error).to(dtype=pred.dtype)
-                theta_mean = torch.mean(theta_seq[s0:s1, int(beta_index)])
-                sign_loss = weight * active * torch.relu(-desired_sign * theta_mean) ** 2
             total = (
                 direct_loss
                 + improvement_weight * improvement_loss
-                + beta_sign_weight * sign_loss
             )
             losses.append(total)
             direct_losses.append(direct_loss)
             improvement_losses.append(improvement_loss)
-            sign_losses.append(sign_loss)
             pred_errors.append(pred_amp_log_abs.detach())
             alpha_errors.append(alpha_amp_log_abs)
             improvement_margins.append((alpha_amp_log_abs - pred_amp_log_abs).detach())
@@ -3548,7 +3518,6 @@ def _windowed_alpha_relative_amplitude_terms(
         "loss": torch.stack(losses).mean(),
         "direct_loss": torch.stack(direct_losses).mean(),
         "improvement_loss": torch.stack(improvement_losses).mean(),
-        "sign_loss": torch.stack(sign_losses).mean(),
         "pred_log_error": torch.stack(pred_errors).mean().detach(),
         "alpha_log_error": torch.stack(alpha_errors).mean().detach(),
         "improvement_margin": torch.stack(improvement_margins).mean().detach(),
@@ -3582,9 +3551,6 @@ def beta_alpha_relative_amplitude_loss(
         "beta_amp_y_improvement_loss": zero,
         "beta_amp_tip_y_improvement_loss": zero,
         "beta_amp_last5_y_improvement_loss": zero,
-        "beta_damp_sign_loss": zero,
-        "beta_damp_x_sign_loss": zero,
-        "beta_damp_y_sign_loss": zero,
         "beta_amp_pred_log_error_mean": zero.detach(),
         "beta_amp_alpha_log_error_mean": zero.detach(),
         "beta_amp_improvement_margin_mean": zero.detach(),
@@ -3598,14 +3564,6 @@ def beta_alpha_relative_amplitude_loss(
     theta_seq = None
     if theta is not None:
         theta_seq = theta[: int(pred.shape[0])].to(dtype=pred.dtype, device=pred.device)
-    beta_x_index = _enabled_param_index_any(
-        str(cfg.enabled_params),
-        ["beta_damp_hf_x", "beta_damp_x"],
-    )
-    beta_y_index = _enabled_param_index_any(
-        str(cfg.enabled_params),
-        ["beta_damp_hf_y", "beta_damp_y"],
-    )
     x_terms = _windowed_alpha_relative_amplitude_terms(
         pred=pred,
         alpha_ref=alpha,
@@ -3617,8 +3575,6 @@ def beta_alpha_relative_amplitude_loss(
         ),
         cfg=cfg,
         theta=theta_seq,
-        beta_index=beta_x_index,
-        beta_sign_weight=float(cfg.w_beta_damp_sign_x),
     )
     y_terms = _windowed_alpha_relative_amplitude_terms(
         pred=pred,
@@ -3631,8 +3587,6 @@ def beta_alpha_relative_amplitude_loss(
         ),
         cfg=cfg,
         theta=theta_seq,
-        beta_index=beta_y_index,
-        beta_sign_weight=float(cfg.w_beta_damp_sign_y),
     )
     tip_y_terms = _windowed_alpha_relative_amplitude_terms(
         pred=pred,
@@ -3641,8 +3595,6 @@ def beta_alpha_relative_amplitude_loss(
         index_groups=[torch.as_tensor([int(tip_y_idx)], dtype=torch.long, device=pred.device)],
         cfg=cfg,
         theta=theta_seq,
-        beta_index=beta_y_index,
-        beta_sign_weight=0.0,
     )
     last5_y_terms = _windowed_alpha_relative_amplitude_terms(
         pred=pred,
@@ -3651,8 +3603,6 @@ def beta_alpha_relative_amplitude_loss(
         index_groups=[last5_y_idx.to(dtype=torch.long, device=pred.device)],
         cfg=cfg,
         theta=theta_seq,
-        beta_index=beta_y_index,
-        beta_sign_weight=0.0,
     )
 
     loss = (
@@ -3691,10 +3641,6 @@ def beta_alpha_relative_amplitude_loss(
         + float(cfg.w_beta_amp_tip_y) * tip_y_terms["improvement_loss"]
         + float(cfg.w_beta_amp_last5_y) * last5_y_terms["improvement_loss"]
     )
-    sign_loss = (
-        float(cfg.w_beta_amp_x) * x_terms["sign_loss"]
-        + float(cfg.w_beta_amp_y) * y_terms["sign_loss"]
-    )
     improvement_margin_values = [
         x_terms["improvement_margin"],
         y_terms["improvement_margin"],
@@ -3719,9 +3665,6 @@ def beta_alpha_relative_amplitude_loss(
         "beta_amp_y_improvement_loss": y_terms["improvement_loss"],
         "beta_amp_tip_y_improvement_loss": tip_y_terms["improvement_loss"],
         "beta_amp_last5_y_improvement_loss": last5_y_terms["improvement_loss"],
-        "beta_damp_sign_loss": sign_loss,
-        "beta_damp_x_sign_loss": x_terms["sign_loss"],
-        "beta_damp_y_sign_loss": y_terms["sign_loss"],
         "beta_amp_pred_log_error_mean": torch.stack(pred_error_values).mean().detach(),
         "beta_amp_alpha_log_error_mean": torch.stack(alpha_error_values).mean().detach(),
         "beta_amp_improvement_margin_mean": torch.stack(improvement_margin_values).mean().detach(),
@@ -4578,9 +4521,6 @@ def compute_response_loss(
         "beta_amp_y_improvement_loss": beta_amp["beta_amp_y_improvement_loss"],
         "beta_amp_tip_y_improvement_loss": beta_amp["beta_amp_tip_y_improvement_loss"],
         "beta_amp_last5_y_improvement_loss": beta_amp["beta_amp_last5_y_improvement_loss"],
-        "beta_damp_sign_loss": beta_amp["beta_damp_sign_loss"],
-        "beta_damp_x_sign_loss": beta_amp["beta_damp_x_sign_loss"],
-        "beta_damp_y_sign_loss": beta_amp["beta_damp_y_sign_loss"],
         "beta_amp_pred_log_error_mean": beta_amp["beta_amp_pred_log_error_mean"],
         "beta_amp_alpha_log_error_mean": beta_amp["beta_amp_alpha_log_error_mean"],
         "beta_amp_improvement_margin_mean": beta_amp["beta_amp_improvement_margin_mean"],
@@ -5402,7 +5342,6 @@ def select_best_score(metrics: dict[str, Any], cfg: TransformerPhysicalTrainConf
         x_value = finite_or("x_ratio_to_alpha", "x_ratio")
         guard_value = as_metric_tensor("beta_alpha_guard_loss", 0.0, like=y_value)
         improvement_value = as_metric_tensor("beta_amp_improvement_loss", 0.0, like=y_value)
-        sign_value = as_metric_tensor("beta_damp_sign_loss", 0.0, like=y_value)
         value = (
             0.35 * y_value
             + 0.20 * tip_y_value
@@ -5410,7 +5349,6 @@ def select_best_score(metrics: dict[str, Any], cfg: TransformerPhysicalTrainConf
             + 0.20 * x_value
             + float(cfg.best_score_guard_weight) * guard_value
             + 0.25 * improvement_value
-            + 0.10 * sign_value
         )
     else:
         raise ValueError(
@@ -5567,10 +5505,6 @@ def build_training_model(
         rotate_mass=bool(cfg.rotate_mass),
         kappa_y_static_scale=float(cfg.kappa_y_static_scale),
         kappa_y_scale_mode=str(cfg.kappa_y_scale_mode),
-        beta_damp_template_gain_x=float(cfg.beta_damp_template_gain_x),
-        beta_damp_template_gain_y=float(cfg.beta_damp_template_gain_y),
-        beta_hf_damp_scale_x=float(cfg.beta_hf_damp_scale_x),
-        beta_hf_damp_scale_y=float(cfg.beta_hf_damp_scale_y),
         xy_template_mode="root_to_tip",
         xy_delta_phi_deg=1.0,
         enabled_params=str(cfg.enabled_params),  # 关键：显式传给 physical_templates
@@ -5588,24 +5522,11 @@ def build_training_model(
         ref_freq_hz=cfg.ref_freq_hz,
         natural_freqs_hz=natural_freqs_hz,
     )
-    damping_template_scale = _structural_damping_scale(
-        zeta_structural=float(cfg.zeta_structural),
-        ref_freq_hz=ref_freq_used,
-    )
-    damping_templates = template_bundle.damping_template_dict(
-        damping_scale=damping_template_scale,
-        beta_damp_template_gain_x=float(cfg.beta_damp_template_gain_x),
-        beta_damp_template_gain_y=float(cfg.beta_damp_template_gain_y),
-        beta_hf_damp_scale_x=float(cfg.beta_hf_damp_scale_x),
-        beta_hf_damp_scale_y=float(cfg.beta_hf_damp_scale_y),
-    )
-
     core = DynamicPhysicalCoreTorch(
         M0=M0,
         K0=K0,
         C0=C0,
         stiffness_templates=template_bundle.stiffness_template_dict(),
-        damping_templates=damping_templates,
         registry=registry,
         config=DynamicPhysicalCoreConfig(
             dt=float(cfg.dt),
@@ -5678,7 +5599,6 @@ def build_training_model(
         "M0_shape": list(M0.shape),
         "K0_shape": list(K0.shape),
         "C0_shape": list(C0.shape),
-        "damping_template_scale": float(damping_template_scale),
     }
 
     return model, info
@@ -5735,26 +5655,6 @@ def parse_args() -> tuple[
 
     parser.add_argument("--zeta-structural", type=float, default=d.zeta_structural)
     parser.add_argument("--ref-freq-hz", type=float, default=d.ref_freq_hz)
-    parser.add_argument("--beta-damp-template-gain-x", type=float, default=d.beta_damp_template_gain_x)
-    parser.add_argument("--beta-damp-template-gain-y", type=float, default=d.beta_damp_template_gain_y)
-    parser.add_argument(
-        "--beta-hf-damp-scale-x",
-        type=float,
-        default=d.beta_hf_damp_scale_x,
-        help=(
-            "Direct stiffness-proportional high-frequency damping scale for C_hf_x_template. "
-            "If <=0, falls back to beta_damp_template_gain_x * structural damping scale."
-        ),
-    )
-    parser.add_argument(
-        "--beta-hf-damp-scale-y",
-        type=float,
-        default=d.beta_hf_damp_scale_y,
-        help=(
-            "Direct stiffness-proportional high-frequency damping scale for C_hf_y_template. "
-            "If <=0, falls back to beta_damp_template_gain_y * structural damping scale."
-        ),
-    )
 
     parser.add_argument("--kappa-y-static-scale", type=float, default=d.kappa_y_static_scale)
     parser.add_argument("--kappa-y-scale-mode", type=str, default=d.kappa_y_scale_mode,
@@ -6307,10 +6207,6 @@ def parse_args() -> tuple[
     parser.add_argument("--w-beta-amp-last5-y", type=float, default=d.w_beta_amp_last5_y)
     parser.add_argument("--w-beta-amp-improvement", type=float,
                         default=d.w_beta_amp_improvement)
-    parser.add_argument("--w-beta-damp-sign-x", type=float, default=d.w_beta_damp_sign_x)
-    parser.add_argument("--w-beta-damp-sign-y", type=float, default=d.w_beta_damp_sign_y)
-    parser.add_argument("--beta-damp-sign-min-alpha-error", type=float,
-                        default=d.beta_damp_sign_min_alpha_error)
     parser.add_argument("--w-beta-alpha-response-guard", type=float,
                         default=d.w_beta_alpha_response_guard)
     parser.add_argument("--w-beta-alpha-corr-guard", type=float,
@@ -6353,8 +6249,8 @@ def parse_args() -> tuple[
         action="store_true",
         default=d.freeze_alpha_backbone_for_beta,
         help=(
-            "Freeze the loaded encoder/Transformer/alpha rows and train only C-target "
-            "beta rows of the final theta head. This is the conservative first beta mode."
+            "Freeze the loaded encoder/Transformer/alpha rows and train only beta "
+            "rows of the final theta head. This is the conservative first beta mode."
         ),
     )
     parser.add_argument(
@@ -6488,10 +6384,6 @@ def parse_args() -> tuple[
         teacher_demean=args.teacher_demean,
         zeta_structural=args.zeta_structural,
         ref_freq_hz=args.ref_freq_hz,
-        beta_damp_template_gain_x=float(args.beta_damp_template_gain_x),
-        beta_damp_template_gain_y=float(args.beta_damp_template_gain_y),
-        beta_hf_damp_scale_x=float(args.beta_hf_damp_scale_x),
-        beta_hf_damp_scale_y=float(args.beta_hf_damp_scale_y),
         kappa_y_static_scale=args.kappa_y_static_scale,
         kappa_y_scale_mode=args.kappa_y_scale_mode,
         enabled_params=args.enabled_params,
@@ -6800,9 +6692,6 @@ def parse_args() -> tuple[
         w_beta_amp_tip_y=float(args.w_beta_amp_tip_y),
         w_beta_amp_last5_y=float(args.w_beta_amp_last5_y),
         w_beta_amp_improvement=float(args.w_beta_amp_improvement),
-        w_beta_damp_sign_x=float(args.w_beta_damp_sign_x),
-        w_beta_damp_sign_y=float(args.w_beta_damp_sign_y),
-        beta_damp_sign_min_alpha_error=float(args.beta_damp_sign_min_alpha_error),
         w_beta_alpha_response_guard=float(args.w_beta_alpha_response_guard),
         w_beta_alpha_corr_guard=float(args.w_beta_alpha_corr_guard),
         w_beta_alpha_amp_guard=float(args.w_beta_alpha_amp_guard),
@@ -6891,17 +6780,8 @@ def main() -> None:
     print(f"  best_start_epoch = {cfg.best_start_epoch}")
     print(f"  beta_loss_mode = {cfg.beta_loss_mode}")
     print(
-        "  beta_damp_template_gain = "
-        f"x:{cfg.beta_damp_template_gain_x}, y:{cfg.beta_damp_template_gain_y}"
-    )
-    print(
-        "  beta_hf_damp_scale = "
-        f"x:{cfg.beta_hf_damp_scale_x}, y:{cfg.beta_hf_damp_scale_y}"
-    )
-    print(
         "  beta_amp_improvement = "
-        f"w:{cfg.w_beta_amp_improvement}, margin:{cfg.beta_amp_improvement_margin}, "
-        f"sign_w_x/y:{cfg.w_beta_damp_sign_x}/{cfg.w_beta_damp_sign_y}"
+        f"w:{cfg.w_beta_amp_improvement}, margin:{cfg.beta_amp_improvement_margin}"
     )
     print(f"  beta_alpha_reference_loss_active = {_use_beta_alpha_reference_loss(cfg)}")
     print(f"  use_loss_curriculum = {cfg.use_loss_curriculum}")

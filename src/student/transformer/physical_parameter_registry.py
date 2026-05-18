@@ -84,65 +84,34 @@ def build_default_physical_parameter_specs() -> dict[str, PhysicalParameterSpec]
             smooth_weight=1.0,
             amplitude_weight=1.0,
         ),
-        "beta_damp_x": PhysicalParameterSpec(
-            name="beta_damp_x",
+        "beta_force_x": PhysicalParameterSpec(
+            name="beta_force_x",
             dim=1,
-            target="C",
-            max_abs=0.75,
-            template_name="C_hf_x_template",
+            target="F",
+            max_abs=0.50,
+            template_name="force_x",
             description=(
-                "Backward-compatible alias for beta_damp_hf_x. It enters the Newmark core as "
-                "a response/load-conditioned high-frequency x-bending damping residual "
-                "C_eff(t)=C0+beta(t)*C_hf_x_template."
+                "Dimensionless x-load amplitude correction. It does not change M, C, or K; "
+                "the Newmark core uses F_eff(t)=F(t)+beta_force_x(t)*P_x*F(t), where P_x "
+                "selects nodal Fx degrees of freedom. This targets equivalent load-projection "
+                "and geometric-nonlinear amplitude residuals while preserving the alpha stiffness "
+                "frequency/phase mechanism."
             ),
             enabled_by_default=False,
             smooth_weight=1.0,
             amplitude_weight=1.0,
         ),
-        "beta_damp_y": PhysicalParameterSpec(
-            name="beta_damp_y",
+        "beta_force_y": PhysicalParameterSpec(
+            name="beta_force_y",
             dim=1,
-            target="C",
-            max_abs=0.75,
-            template_name="C_hf_y_template",
+            target="F",
+            max_abs=0.50,
+            template_name="force_y",
             description=(
-                "Backward-compatible alias for beta_damp_hf_y. It enters the Newmark core as "
-                "a response/load-conditioned high-frequency y-bending damping residual "
-                "C_eff(t)=C0+beta(t)*C_hf_y_template."
-            ),
-            enabled_by_default=False,
-            smooth_weight=1.0,
-            amplitude_weight=1.0,
-        ),
-        "beta_damp_hf_x": PhysicalParameterSpec(
-            name="beta_damp_hf_x",
-            dim=1,
-            target="C",
-            max_abs=1.0,
-            template_name="C_hf_x_template",
-            description=(
-                "x-bending high-frequency amplitude correction. The encoder learns a time-varying "
-                "damping-like coefficient from response/load/spectral state and applies it through "
-                "C_eff(t)=C0+beta_damp_hf_x(t)*C_hf_x_template. The template uses the alpha_x "
-                "directional stiffness shape but an experiment-controlled high-frequency damping "
-                "scale instead of the small structural damping residual scale."
-            ),
-            enabled_by_default=False,
-            smooth_weight=1.0,
-            amplitude_weight=1.0,
-        ),
-        "beta_damp_hf_y": PhysicalParameterSpec(
-            name="beta_damp_hf_y",
-            dim=1,
-            target="C",
-            max_abs=1.0,
-            template_name="C_hf_y_template",
-            description=(
-                "y-bending high-frequency amplitude correction. The encoder learns a time-varying "
-                "damping-like coefficient from response/load/spectral state and applies it through "
-                "C_eff(t)=C0+beta_damp_hf_y(t)*C_hf_y_template. The template uses the y-bending "
-                "directional stiffness shape but an experiment-controlled high-frequency damping "
-                "scale instead of the small structural damping residual scale."
+                "Dimensionless y-load amplitude correction. It does not change M, C, or K; "
+                "the Newmark core uses F_eff(t)=F(t)+beta_force_y(t)*P_y*F(t), where P_y "
+                "selects nodal Fy degrees of freedom. This gives beta a direct amplitude lever "
+                "for Euler-Bernoulli versus geometrically exact load/response mismatch."
             ),
             enabled_by_default=False,
             smooth_weight=1.0,
@@ -185,8 +154,8 @@ def _normalize_enabled_params(
         raise KeyError(
             f"Unknown physical parameter(s): {unknown}. "
             f"Supported parameters: {list(all_specs.keys())}. "
-            "Use --enabled-params alpha_x,alpha_xy,beta_damp_hf_x,beta_damp_hf_y "
-            "for the high-frequency amplitude/beta experiment."
+            "Use --enabled-params alpha_x,alpha_xy,beta_force_x,beta_force_y "
+            "for the force-amplitude beta experiment."
         )
 
     out: list[str] = []

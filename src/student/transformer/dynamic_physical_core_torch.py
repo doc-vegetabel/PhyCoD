@@ -49,11 +49,9 @@ class DynamicPhysicalCoreTorch(nn.Module):
         "alpha_x": "K_x_template",
         "alpha_xy": "K_xy_template",
     }
-    PARAM_TO_DAMPING_TEMPLATE = {
-        "beta_damp_x": "C_hf_x_template",
-        "beta_damp_y": "C_hf_y_template",
-        "beta_damp_hf_x": "C_hf_x_template",
-        "beta_damp_hf_y": "C_hf_y_template",
+    PARAM_TO_FORCE_COMPONENT = {
+        "beta_force_x": "x",
+        "beta_force_y": "y",
     }
     PARAM_TO_TEMPLATE = PARAM_TO_STIFFNESS_TEMPLATE
 
@@ -64,7 +62,6 @@ class DynamicPhysicalCoreTorch(nn.Module):
         K0: np.ndarray | torch.Tensor,
         C0: np.ndarray | torch.Tensor,
         stiffness_templates: dict[str, np.ndarray | torch.Tensor],
-        damping_templates: dict[str, np.ndarray | torch.Tensor] | None = None,
         registry: Any,
         config: Optional[DynamicPhysicalCoreConfig] = None,
     ) -> None:
@@ -92,16 +89,14 @@ class DynamicPhysicalCoreTorch(nn.Module):
         self.register_buffer("K0", K0_t)
         self.register_buffer("C0", C0_t)
 
-        damping_templates = {} if damping_templates is None else dict(damping_templates)
-
         unsupported: list[str] = []
         for name in self.registry.names:
             spec = self.registry.get_spec(name)
             if spec.target == "K":
                 if (spec.template_name or self.PARAM_TO_STIFFNESS_TEMPLATE.get(name)) is None:
                     unsupported.append(name)
-            elif spec.target == "C":
-                if (spec.template_name or self.PARAM_TO_DAMPING_TEMPLATE.get(name)) is None:
+            elif spec.target == "F":
+                if (spec.template_name or self.PARAM_TO_FORCE_COMPONENT.get(name)) is None:
                     unsupported.append(name)
             else:
                 unsupported.append(name)
@@ -109,21 +104,26 @@ class DynamicPhysicalCoreTorch(nn.Module):
             raise ValueError(
                 f"DynamicPhysicalCoreTorch does not support parameters: {unsupported}. "
                 f"Supported stiffness params: {list(self.PARAM_TO_STIFFNESS_TEMPLATE.keys())}; "
-                f"supported damping params: {list(self.PARAM_TO_DAMPING_TEMPLATE.keys())}."
+                f"supported force params: {list(self.PARAM_TO_FORCE_COMPONENT.keys())}."
             )
 
         self.enabled_stiffness_template_names: dict[str, str] = {}
         self.enabled_damping_template_names: dict[str, str] = {}
+        self.enabled_force_component_names: dict[str, str] = {}
         for param_name in self.registry.names:
             spec = self.registry.get_spec(param_name)
             if spec.target == "K":
                 template_name = spec.template_name or self.PARAM_TO_STIFFNESS_TEMPLATE[param_name]
                 template_source = stiffness_templates
                 template_kind = "stiffness"
-            elif spec.target == "C":
-                template_name = spec.template_name or self.PARAM_TO_DAMPING_TEMPLATE[param_name]
-                template_source = damping_templates
-                template_kind = "damping"
+            elif spec.target == "F":
+                component = spec.template_name or self.PARAM_TO_FORCE_COMPONENT[param_name]
+                if component not in {"force_x", "force_y", "x", "y"}:
+                    raise ValueError(
+                        f"Unsupported force component template {component!r} for {param_name!r}."
+                    )
+                self.enabled_force_component_names[param_name] = "x" if component.endswith("x") else "y"
+                continue
             else:
                 raise ValueError(f"Unsupported physical target {spec.target!r} for {param_name!r}.")
 
@@ -140,24 +140,15 @@ class DynamicPhysicalCoreTorch(nn.Module):
             self.register_buffer(template_name, tpl)
             if spec.target == "K":
                 self.enabled_stiffness_template_names[param_name] = template_name
-            else:
-                self.enabled_damping_template_names[param_name] = template_name
 
         self.enabled_param_names = tuple(self.registry.names)
-        self.enabled_template_names = {
-            **self.enabled_stiffness_template_names,
-            **self.enabled_damping_template_names,
-        }
+        self.enabled_template_names = dict(self.enabled_stiffness_template_names)
         self.enabled_stiffness_template_buffer_names = tuple(
             self.enabled_stiffness_template_names[name]
             for name in self.enabled_param_names
             if name in self.enabled_stiffness_template_names
         )
-        self.enabled_damping_template_buffer_names = tuple(
-            self.enabled_damping_template_names[name]
-            for name in self.enabled_param_names
-            if name in self.enabled_damping_template_names
-        )
+        self.enabled_damping_template_buffer_names = tuple()
         self.enabled_template_buffer_names = tuple(
             self.enabled_template_names[name]
             for name in self.enabled_param_names
@@ -172,6 +163,13 @@ class DynamicPhysicalCoreTorch(nn.Module):
                 self._fast_scalar_theta = False
                 break
             self._scalar_param_indices[name] = int(sl.start)
+
+        self._force_component_masks: dict[str, str] = {}
+        for component in sorted(set(self.enabled_force_component_names.values())):
+            mask = self._build_force_component_mask(component)
+            buffer_name = f"force_{component}_mask"
+            self.register_buffer(buffer_name, mask, persistent=False)
+            self._force_component_masks[component] = buffer_name
 
         if bool(self.config.precompute_newmark_matrices):
             self.register_buffer(
@@ -189,6 +187,14 @@ class DynamicPhysicalCoreTorch(nn.Module):
         if out.shape[0] != out.shape[1]:
             raise ValueError(f"{name} must be square, got shape={tuple(out.shape)}.")
         return out
+
+    def _build_force_component_mask(self, component: str) -> torch.Tensor:
+        if self.n_dofs % 6 != 0:
+            raise ValueError(f"n_dofs must be divisible by 6 for force beta masks, got {self.n_dofs}.")
+        offset = {"x": 0, "y": 1}[component]
+        mask = torch.zeros(int(self.n_dofs), dtype=self.dtype)
+        mask[offset::6] = 1.0
+        return mask
 
     def _normalize_theta(self, theta_t: torch.Tensor) -> torch.Tensor:
         theta = torch.as_tensor(theta_t, dtype=self.dtype, device=self.K0.device)
@@ -272,6 +278,53 @@ class DynamicPhysicalCoreTorch(nn.Module):
             C_eff = 0.5 * (C_eff + C_eff.T)
 
         return C_eff, dC_dict
+
+    def apply_force_correction(
+        self,
+        F_t1: torch.Tensor,
+        theta_t: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Apply beta_force corrections to the external load vector.
+
+        beta_force_x/y are dimensionless gains on the physical nodal Fx/Fy load
+        components. They deliberately leave M, C, and K unchanged so alpha keeps
+        owning the frequency/phase correction path.
+        """
+        F_eff = torch.as_tensor(F_t1, dtype=self.dtype, device=self.K0.device)
+        if theta_t is None or not self.enabled_force_component_names:
+            return F_eff
+
+        theta = self._normalize_theta(theta_t)
+        theta_dict = self.registry.split_theta(theta)
+        correction = torch.zeros_like(F_eff)
+        for param_name, component in self.enabled_force_component_names.items():
+            value = theta_dict[param_name].reshape(-1)
+            if value.numel() != 1:
+                raise ValueError(f"{param_name} must have one value, got {value.numel()}.")
+            mask = getattr(self, self._force_component_masks[component])
+            correction = correction + value[0] * mask * F_eff
+        return F_eff + correction
+
+    def _apply_force_correction_fast(
+        self,
+        F_t1: torch.Tensor,
+        theta: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if theta is None or not self.enabled_force_component_names:
+            return F_t1
+        if not self._fast_scalar_theta:
+            return self.apply_force_correction(F_t1, theta)
+
+        correction = None
+        for param_name, component in self.enabled_force_component_names.items():
+            idx = self._scalar_param_indices[param_name]
+            mask = getattr(self, self._force_component_masks[component])
+            term = theta[idx] * mask * F_t1
+            correction = term if correction is None else correction + term
+        if correction is None:
+            return F_t1
+        return F_t1 + correction
 
     def _compute_newmark_constants(self) -> tuple[float, float, float, float, float, float]:
         """Compute Newmark constants for the current fixed dt/gamma/beta."""
@@ -516,8 +569,9 @@ class DynamicPhysicalCoreTorch(nn.Module):
         C, _ = self.assemble_damping(theta_t)
 
         A = self._newmark_effective_matrix(theta_t)
+        F_eff = self.apply_force_correction(F_t1, theta_t)
         rhs = (
-            F_t1
+            F_eff
             + M @ (a0 * u_t + a2 * v_t + a3 * a_t)
             + C @ (a1 * u_t + a4 * v_t + a5 * a_t)
         )
@@ -544,8 +598,9 @@ class DynamicPhysicalCoreTorch(nn.Module):
 
         A = self._newmark_effective_matrix_fast(theta_t)
         C = self._assemble_damping_fast(theta_t)
+        F_eff = self._apply_force_correction_fast(F_t1, theta_t)
         rhs = (
-            F_t1
+            F_eff
             + self.M0 @ (a0 * u_t + a2 * v_t + a3 * a_t)
             + C @ (a1 * u_t + a4 * v_t + a5 * a_t)
         )
@@ -577,8 +632,9 @@ class DynamicPhysicalCoreTorch(nn.Module):
         timing["newmark_assemble_seconds"] = time_fn() - t0
 
         t0 = time_fn()
+        F_eff = self._apply_force_correction_fast(F_t1, theta_t)
         rhs = (
-            F_t1
+            F_eff
             + self.M0 @ (a0 * u_t + a2 * v_t + a3 * a_t)
             + self._assemble_damping_fast(theta_t) @ (a1 * u_t + a4 * v_t + a5 * a_t)
         )

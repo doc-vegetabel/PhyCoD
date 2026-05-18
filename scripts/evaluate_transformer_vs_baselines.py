@@ -268,8 +268,8 @@ def build_structural_damping_matrix(
     if ref_freq_hz is None:
         ref_freq_hz = float(natural_freqs_hz[0])
 
-    beta_damp = 2.0 * float(zeta_structural) / (2.0 * np.pi * float(ref_freq_hz))
-    C = beta_damp * K
+    damping_coeff = 2.0 * float(zeta_structural) / (2.0 * np.pi * float(ref_freq_hz))
+    C = damping_coeff * K
     return np.asarray(C, dtype=np.float64), float(ref_freq_hz)
 
 
@@ -429,7 +429,7 @@ def compute_alpha_beta_diagnostics(
         out[f"late_{name}_rms_beta_to_teacher"] = beta_ratio
         out[f"late_{name}_rms_beta_to_alpha"] = beta_ratio / max(alpha_ratio, eps)
 
-    for name in ("beta_damp_x", "beta_damp_y", "beta_damp_hf_x", "beta_damp_hf_y"):
+    for name in ("beta_force_x", "beta_force_y"):
         if name not in beta_theta_dict:
             continue
         arr = np.asarray(beta_theta_dict[name], dtype=np.float64).reshape(-1)

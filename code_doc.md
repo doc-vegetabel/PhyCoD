@@ -425,3 +425,14 @@ python tests/compare_full_corrected_core_vs_student.py --time-series-load-file d
 | Time | Files | Required Note | Content | Stage |
 |---|---|---|---|---|
 | 2026-05-18 Asia/Shanghai | `scripts/scan_beta_hf_constant.py` | Add constant beta-hf scan script | Add a no-training sensitivity scan that rolls out the MAIN-ALPHA checkpoint to obtain `alpha_x(t), alpha_xy(t)`, then constructs a beta-capable physical core and overlays constant `beta_damp_hf_x/y` values on top of the alpha theta sequence. It writes metrics, late RMS diagnostics, summary JSON, and response NPZ to quantify whether the C-target high-frequency beta channel can physically reduce high-frequency amplitude errors before another learned beta run is attempted. | beta mechanism diagnosis |
+
+---
+
+## 35. 2026-05-18 beta-force amplitude mechanism update
+
+| Time | Files | Required Note | Content | Stage |
+|---|---|---|---|---|
+| 2026-05-18 Asia/Shanghai | `src/student/transformer/physical_parameter_registry.py` | Replace damping beta with force beta | Remove the learned damping beta parameter family from the active registry and add `beta_force_x`, `beta_force_y` as bounded dimensionless F-target parameters. These rows preserve alpha checkpoint warm-start ordering while making beta act on equivalent load amplitude instead of `C_eff`. | beta force amplitude correction |
+| 2026-05-18 Asia/Shanghai | `src/student/transformer/dynamic_physical_core_torch.py` | Apply beta through Newmark RHS load correction | Add `F_eff(t)=F(t)+beta_force_x(t)*P_x*F(t)+beta_force_y(t)*P_y*F(t)` inside the Newmark step. The correction touches only nodal Fx/Fy load components and leaves M, C, and K unchanged, so `alpha_x/alpha_xy` remain responsible for frequency and phase. | beta force amplitude correction |
+| 2026-05-18 Asia/Shanghai | `src/student/transformer/physical_templates.py`, `scripts/train_transformer_physical_params_torch.py` | Remove beta damping template training path | Remove active damping template gains/scales and the beta damping sign objective from training. Alpha-relative amplitude loss, alpha-only reference rollout, partial checkpoint loading, and no-regression guards are kept for the new force beta mechanism. | beta force amplitude correction |
+| 2026-05-18 Asia/Shanghai | `scripts/evaluate_transformer_vs_baselines.py`, `scripts/scan_beta_hf_constant.py` | Update diagnostics and retire damping scan | Evaluation theta diagnostics now report `beta_force_x/y`; the constant beta-hf damping scan script is removed because the next mechanism no longer tests C-target damping leverage. | beta result interpretation |

@@ -1036,3 +1036,12 @@ alpha_y(t) + response/load + static conditioning 在 240-step 训练中有效。
 | Time | Files | Change Type | Content | Stage |
 |---|---|---|---|---|
 | 2026-05-18 Asia/Shanghai | `scripts/scan_beta_hf_constant.py` | Add | Add a no-training constant beta scan. The script runs the alpha checkpoint to get dynamic `alpha_x(t), alpha_xy(t)`, then rolls out a beta-capable core with constant `beta_damp_hf_x/y` grid values. It reports metrics and late RMS diagnostics so the project can decide whether C-target high-frequency beta has enough physical leverage before further learned beta training. | beta mechanism diagnosis |
+
+# 2026-05-18 beta-force amplitude mechanism update
+
+| Time | Files | Change Type | Content | Stage |
+|---|---|---|---|---|
+| 2026-05-18 Asia/Shanghai | `src/student/transformer/physical_parameter_registry.py` | Replace | Replace the active learned damping beta parameters with `beta_force_x` and `beta_force_y`, both F-target dimensionless coefficients. They are intended to learn equivalent load-amplitude residuals while keeping `alpha_x/alpha_xy` as the only dynamic stiffness frequency/phase parameters. | beta force amplitude correction |
+| 2026-05-18 Asia/Shanghai | `src/student/transformer/dynamic_physical_core_torch.py` | Modify | Add force beta support in the Newmark RHS: `F_eff=F+beta_force_x*P_x*F+beta_force_y*P_y*F`. The dynamic core no longer exposes learned beta damping templates in the active training path. | beta force amplitude correction |
+| 2026-05-18 Asia/Shanghai | `src/student/transformer/physical_templates.py`, `scripts/train_transformer_physical_params_torch.py` | Remove | Remove beta damping template gain/scale CLI/config plumbing and the damping-sign regularizer. The alpha-relative amplitude objective and alpha no-regression guards remain and now operate on beta-force rows. | beta force amplitude correction |
+| 2026-05-18 Asia/Shanghai | `scripts/evaluate_transformer_vs_baselines.py`, `scripts/scan_beta_hf_constant.py` | Modify | Update alpha+beta diagnostics to report `beta_force_x/y` theta statistics and delete the constant beta-hf damping scan script, since the active beta mechanism has moved from C-target damping to F-target equivalent load correction. | beta result interpretation |
