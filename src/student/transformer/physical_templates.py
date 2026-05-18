@@ -56,6 +56,8 @@ class PhysicalTemplateConfig:
     # after the training script knows the structural damping scale.
     y_delta_scale: float = 0.01
     y_scale_mode: str = "y_bending"
+    beta_damp_template_gain_x: float = 1.0
+    beta_damp_template_gain_y: float = 1.0
 
     # alpha_xy residual phi finite difference
     xy_template_mode: XYTemplateMode = "root_to_tip"
@@ -97,11 +99,19 @@ class PhysicalTemplateBundle:
             "K_xy_template": self.K_xy_template,
         }
 
-    def damping_template_dict(self, *, damping_scale: float) -> dict[str, np.ndarray]:
+    def damping_template_dict(
+            self,
+            *,
+            damping_scale: float,
+            beta_damp_template_gain_x: float = 1.0,
+            beta_damp_template_gain_y: float = 1.0,
+    ) -> dict[str, np.ndarray]:
         scale = float(damping_scale)
+        gain_x = float(beta_damp_template_gain_x)
+        gain_y = float(beta_damp_template_gain_y)
         return {
-            "C_x_template": scale * self.K_x_template,
-            "C_y_template": scale * self.K_y_template,
+            "C_x_template": gain_x * scale * self.K_x_template,
+            "C_y_template": gain_y * scale * self.K_y_template,
         }
 
     def summary(self) -> dict[str, Any]:
@@ -448,9 +458,12 @@ def build_dynamic_stiffness_templates(cfg: PhysicalTemplateConfig) -> PhysicalTe
         },
         "damping_templates": {
             "meaning": (
-                "C_x_template and C_y_template are built as damping_scale times K_x_template/K_y_template, "
-                "where damping_scale is the same stiffness-proportional factor used for C0."
+                "C_x_template and C_y_template are built as beta_damp_template_gain times damping_scale "
+                "times K_x_template/K_y_template, where damping_scale is the same stiffness-proportional "
+                "factor used for C0."
             ),
+            "beta_damp_template_gain_x": float(cfg.beta_damp_template_gain_x),
+            "beta_damp_template_gain_y": float(cfg.beta_damp_template_gain_y),
         },
         "K_xy_template": {
             "meaning": (

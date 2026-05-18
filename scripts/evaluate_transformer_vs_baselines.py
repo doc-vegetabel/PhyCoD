@@ -172,6 +172,12 @@ def save_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         return
 
     keys = list(rows[0].keys())
+    seen = set(keys)
+    for row in rows[1:]:
+        for key in row.keys():
+            if key not in seen:
+                keys.append(key)
+                seen.add(key)
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=keys)
         writer.writeheader()
@@ -349,6 +355,91 @@ def compute_metrics(
         "last5_y_mae": mae(diff[:, last5_y]),
         "last5_y_rmse": float(np.sqrt(mse(diff[:, last5_y]))),
     }
+
+    return out
+
+
+def _series_for_indices(u: np.ndarray, idx: int | np.ndarray) -> np.ndarray:
+    arr = np.asarray(u, dtype=np.float64)
+    if np.isscalar(idx):
+        return arr[:, int(idx)]
+    idx_arr = np.asarray(idx, dtype=np.int64)
+    return np.mean(arr[:, idx_arr], axis=1)
+
+
+def _demeaned_rms(signal: np.ndarray) -> float:
+    x = np.asarray(signal, dtype=np.float64)
+    x = x - np.mean(x)
+    return float(np.sqrt(np.mean(x * x)))
+
+
+def compute_alpha_beta_diagnostics(
+    *,
+    time: np.ndarray,
+    u_alpha: np.ndarray,
+    u_beta: np.ndarray,
+    u_teacher: np.ndarray,
+    n_nodes: int,
+    beta_theta_dict: dict[str, np.ndarray],
+) -> dict[str, float]:
+    alpha = np.asarray(u_alpha, dtype=np.float64)
+    beta = np.asarray(u_beta, dtype=np.float64)
+    teacher = np.asarray(u_teacher, dtype=np.float64)
+    delta = beta - alpha
+    alpha_error = alpha - teacher
+    eps = 1.0e-12
+
+    tip_x = tip_component_index(n_nodes, "x")
+    tip_y = tip_component_index(n_nodes, "y")
+    last5_x = last_k_component_indices(n_nodes, "x", last_k=5)
+    last5_y = last_k_component_indices(n_nodes, "y", last_k=5)
+    groups: dict[str, int | np.ndarray] = {
+        "tip_x": tip_x,
+        "tip_y": tip_y,
+        "last5_x": last5_x,
+        "last5_y": last5_y,
+    }
+
+    out: dict[str, float] = {
+        "alpha_beta_delta_rms": float(np.sqrt(np.mean(delta * delta))),
+        "alpha_beta_delta_max_abs": float(np.max(np.abs(delta))),
+        "alpha_beta_delta_to_alpha_error_ratio": float(
+            np.sqrt(np.mean(delta * delta)) / max(float(np.sqrt(np.mean(alpha_error * alpha_error))), eps)
+        ),
+    }
+
+    late_mask = np.asarray(time, dtype=np.float64) >= 0.5 * (float(time[0]) + float(time[-1]))
+    if not np.any(late_mask):
+        late_mask = np.ones_like(np.asarray(time), dtype=bool)
+
+    for name, idx in groups.items():
+        d = _series_for_indices(delta, idx)
+        e = _series_for_indices(alpha_error, idx)
+        out[f"{name}_alpha_beta_delta_rms"] = _demeaned_rms(d)
+        out[f"{name}_alpha_beta_delta_max_abs"] = float(np.max(np.abs(d)))
+        out[f"{name}_alpha_beta_delta_to_alpha_error_ratio"] = _demeaned_rms(d) / max(_demeaned_rms(e), eps)
+
+        alpha_late = _series_for_indices(alpha[late_mask], idx)
+        beta_late = _series_for_indices(beta[late_mask], idx)
+        teacher_late = _series_for_indices(teacher[late_mask], idx)
+        teacher_rms = max(_demeaned_rms(teacher_late), eps)
+        alpha_ratio = _demeaned_rms(alpha_late) / teacher_rms
+        beta_ratio = _demeaned_rms(beta_late) / teacher_rms
+        out[f"late_{name}_rms_alpha_to_teacher"] = alpha_ratio
+        out[f"late_{name}_rms_beta_to_teacher"] = beta_ratio
+        out[f"late_{name}_rms_beta_to_alpha"] = beta_ratio / max(alpha_ratio, eps)
+
+    for name in ("beta_damp_x", "beta_damp_y"):
+        if name not in beta_theta_dict:
+            continue
+        arr = np.asarray(beta_theta_dict[name], dtype=np.float64).reshape(-1)
+        if arr.size == 0:
+            continue
+        out[f"{name}_theta_mean"] = float(np.mean(arr))
+        out[f"{name}_theta_rms"] = float(np.sqrt(np.mean(arr * arr)))
+        out[f"{name}_theta_min"] = float(np.min(arr))
+        out[f"{name}_theta_max"] = float(np.max(arr))
+        out[f"{name}_theta_std"] = float(np.std(arr))
 
     return out
 
@@ -1208,6 +1299,23 @@ def main() -> None:
             ratio_key = f"{key}_ratio_to_static"
             m[ratio_key] = float(m[key] / denom) if denom > 0.0 else np.nan
 
+    alpha_beta_diagnostics: dict[str, float] = {}
+    alpha_label_for_diag = str(args.alpha_label)
+    if alpha_label_for_diag in transformer_responses and primary_label in transformer_responses:
+        alpha_beta_diagnostics = compute_alpha_beta_diagnostics(
+            time=time,
+            u_alpha=transformer_responses[alpha_label_for_diag],
+            u_beta=transformer_responses[primary_label],
+            u_teacher=u_teacher_cmp,
+            n_nodes=n_nodes,
+            beta_theta_dict=transformer_results[primary_label].get("theta_dict", {}),
+        )
+        for m in metrics:
+            for key in alpha_beta_diagnostics:
+                m.setdefault(key, np.nan)
+            if m.get("model") == primary_label:
+                m.update(alpha_beta_diagnostics)
+
     save_csv(output_dir / "metrics.csv", metrics)
 
     metrics_summary = {
@@ -1220,6 +1328,7 @@ def main() -> None:
         "time_end": float(time[-1]),
         "remove_initial_offset": bool(args.remove_initial_offset),
         "metrics": metrics,
+        "alpha_beta_diagnostics": alpha_beta_diagnostics,
         "theta_stats": {
             label: {
                 name: {
