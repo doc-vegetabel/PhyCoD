@@ -61,7 +61,25 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint",
         type=str,
         required=True,
-        help="Path to best_transformer_physical_params.pt",
+        help="Path to the primary Transformer checkpoint, e.g. alpha+beta best_transformer_physical_params.pt.",
+    )
+    parser.add_argument(
+        "--alpha-checkpoint",
+        type=str,
+        default=None,
+        help="Optional alpha-only checkpoint to plot/evaluate alongside the primary checkpoint.",
+    )
+    parser.add_argument(
+        "--checkpoint-label",
+        type=str,
+        default=None,
+        help="Plot/metric label for --checkpoint. Defaults to alpha_beta when --alpha-checkpoint is set.",
+    )
+    parser.add_argument(
+        "--alpha-label",
+        type=str,
+        default="alpha_only",
+        help="Plot/metric label for --alpha-checkpoint.",
     )
     parser.add_argument(
         "--load-file",
@@ -492,6 +510,39 @@ def load_transformer_model(
     return model
 
 
+def _safe_label(label: str) -> str:
+    out = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(label).strip())
+    return out or "model"
+
+
+def _extract_theta_series(result: dict[str, Any]) -> dict[str, np.ndarray]:
+    theta_series: dict[str, np.ndarray] = {}
+    theta_dict = result.get("theta_dict", {})
+    for name, arr in theta_dict.items():
+        arr_np = np.asarray(arr)
+        if arr_np.ndim == 2 and arr_np.shape[1] == 1:
+            theta_series[name] = arr_np[:, 0]
+        else:
+            theta_series[name] = arr_np.reshape((arr_np.shape[0], -1))[:, 0]
+
+    param_names = list(theta_dict.keys())
+    for aux_name, arr in result.get("theta_aux", {}).items():
+        arr_np = np.asarray(arr)
+        if arr_np.ndim == 1:
+            theta_series[aux_name] = arr_np
+        elif arr_np.ndim == 2 and arr_np.shape[1] == 1:
+            theta_series[aux_name] = arr_np[:, 0]
+        elif arr_np.ndim == 2 and arr_np.shape[1] == len(param_names):
+            suffix = aux_name.replace("theta_", "")
+            for j, param_name in enumerate(param_names):
+                theta_series[f"{param_name}_{suffix}"] = arr_np[:, j]
+        elif arr_np.ndim >= 2:
+            flat = arr_np.reshape((arr_np.shape[0], -1))
+            for j in range(flat.shape[1]):
+                theta_series[f"{aux_name}_{j}"] = flat[:, j]
+    return theta_series
+
+
 
 
 def _infer_load_spectral_window_size(cfg: TransformerPhysicalTrainConfig) -> Optional[int]:
@@ -701,6 +752,64 @@ def plot_timeseries(
     plt.close()
 
 
+def plot_response_series(
+    *,
+    time: np.ndarray,
+    series: dict[str, np.ndarray],
+    idx: int | np.ndarray,
+    title: str,
+    ylabel: str,
+    path: Path,
+    error_to: str | None = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    styles = {
+        "teacher": {"linewidth": 2.3, "linestyle": "-", "zorder": 5},
+        "base_student": {"linewidth": 1.6, "linestyle": "--", "zorder": 2},
+        "alpha_only": {"linewidth": 1.8, "linestyle": "-.", "zorder": 3},
+        "alpha_beta": {"linewidth": 2.0, "linestyle": ":", "zorder": 4},
+        "transformer": {"linewidth": 2.0, "linestyle": ":", "zorder": 4},
+    }
+
+    reference = None
+    if error_to is not None:
+        if error_to not in series:
+            raise KeyError(f"error_to={error_to!r} not found in series keys={list(series)}.")
+        reference = np.asarray(series[error_to], dtype=np.float64)
+
+    plt.figure(figsize=(10, 5))
+    if reference is not None:
+        plt.axhline(0.0, linewidth=1.0, linestyle="-", zorder=0)
+
+    for label, values in series.items():
+        arr = np.asarray(values, dtype=np.float64)
+        if isinstance(idx, np.ndarray):
+            y = np.mean(arr[:, idx], axis=1)
+        else:
+            y = arr[:, int(idx)]
+        if reference is not None:
+            if isinstance(idx, np.ndarray):
+                y_ref = np.mean(reference[:, idx], axis=1)
+            else:
+                y_ref = reference[:, int(idx)]
+            y = y - y_ref
+            if label == error_to:
+                continue
+
+        style = styles.get(label, {"linewidth": 1.5, "linestyle": "-", "zorder": 1})
+        plt.plot(time, y, label=label.replace("_", " "), **style)
+
+    plt.xlabel("time [s]")
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(path, dpi=180)
+    plt.close()
+
+
 def plot_timeseries_error_to_teacher(
     *,
     time: np.ndarray,
@@ -832,6 +941,11 @@ def main() -> None:
     args = parse_args()
 
     checkpoint = assert_file(args.checkpoint, "checkpoint")
+    alpha_checkpoint = (
+        assert_file(args.alpha_checkpoint, "alpha_checkpoint")
+        if args.alpha_checkpoint is not None and str(args.alpha_checkpoint).strip()
+        else None
+    )
     load_file = assert_file(args.load_file, "load_file")
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -843,13 +957,22 @@ def main() -> None:
     print("[Evaluate] Transformer vs baselines")
     print("=" * 100)
     print(f"  checkpoint = {checkpoint}")
+    if alpha_checkpoint is not None:
+        print(f"  alpha_checkpoint = {alpha_checkpoint}")
     print(f"  load_file  = {load_file}")
     print(f"  output_dir = {output_dir}")
 
     ckpt = torch.load(checkpoint, map_location=device)
     cfg = config_from_checkpoint(ckpt, args)
+    alpha_ckpt = None
+    alpha_cfg = None
+    if alpha_checkpoint is not None:
+        alpha_ckpt = torch.load(alpha_checkpoint, map_location=device)
+        alpha_cfg = config_from_checkpoint(alpha_ckpt, args)
 
     print(f"  enabled_params = {cfg.enabled_params}")
+    if alpha_cfg is not None:
+        print(f"  alpha_enabled_params = {alpha_cfg.enabled_params}")
     print(f"  use_phase_gated_decomposition = {getattr(cfg, 'use_phase_gated_decomposition', False)}")
     print(f"  use_load_spectral_features = {getattr(cfg, 'use_load_spectral_features', False)}")
     if bool(getattr(cfg, 'use_load_spectral_features', False)):
@@ -858,6 +981,9 @@ def main() -> None:
 
     cfg.output_dir = str(output_dir)
     cfg.device = str(device)
+    if alpha_cfg is not None:
+        alpha_cfg.output_dir = str(output_dir)
+        alpha_cfg.device = str(device)
 
     assert_file(cfg.teacher_exe, "teacher_exe")
     assert_file(cfg.template_inp, "template_inp")
@@ -870,6 +996,9 @@ def main() -> None:
             "cfg": asdict(cfg),
             "checkpoint_epoch": ckpt.get("epoch", None),
             "checkpoint_best_score": ckpt.get("best_score", None),
+            "alpha_checkpoint": None if alpha_checkpoint is None else str(alpha_checkpoint),
+            "alpha_checkpoint_epoch": None if alpha_ckpt is None else alpha_ckpt.get("epoch", None),
+            "alpha_checkpoint_best_score": None if alpha_ckpt is None else alpha_ckpt.get("best_score", None),
         },
     )
 
@@ -972,10 +1101,10 @@ def main() -> None:
     print(f"  t range = [{time[0]:.6f}, {time[-1]:.6f}]")
 
     # ------------------------------------------------------------
-    # 5. Run Transformer
+    # 5. Run Transformer checkpoints
     # ------------------------------------------------------------
     print()
-    print("[5/6] Run trained Transformer")
+    print("[5/6] Run trained Transformer checkpoint(s)")
 
     geo_bundle = build_blade_geometry_features(
         BladeGeometryFeatureConfig(
@@ -992,25 +1121,47 @@ def main() -> None:
         device=device,
     )
 
-    model = load_transformer_model(
-        cfg=cfg,
-        ckpt=ckpt,
-        geometry_dim=int(geo_bundle.feature_dim),
-        device=device,
+    primary_label = (
+        str(args.checkpoint_label).strip()
+        if args.checkpoint_label is not None and str(args.checkpoint_label).strip()
+        else ("alpha_beta" if alpha_ckpt is not None else "transformer")
     )
+    transformer_specs: list[tuple[str, TransformerPhysicalTrainConfig, dict[str, Any], Path]] = []
+    if alpha_ckpt is not None and alpha_cfg is not None and alpha_checkpoint is not None:
+        transformer_specs.append((str(args.alpha_label), alpha_cfg, alpha_ckpt, alpha_checkpoint))
+    transformer_specs.append((primary_label, cfg, ckpt, checkpoint))
 
-    transformer_result = run_transformer_response(
-        model=model,
-        cfg=cfg,
-        geometry=geometry,
-        F_time=F_time,
-        u_static=u_static_cmp,
-        v_static=v_static,
-        a_static=a_static,
-        device=device,
-    )
+    transformer_results: dict[str, dict[str, Any]] = {}
+    transformer_responses: dict[str, np.ndarray] = {}
+    transformer_checkpoint_paths: dict[str, str] = {}
 
-    u_transformer_cmp = transformer_result["u_full"]
+    for label, model_cfg, model_ckpt, model_checkpoint in transformer_specs:
+        safe_label = _safe_label(label)
+        print(f"  [{label}] checkpoint = {model_checkpoint}")
+        model = load_transformer_model(
+            cfg=model_cfg,
+            ckpt=model_ckpt,
+            geometry_dim=int(geo_bundle.feature_dim),
+            device=device,
+        )
+        result = run_transformer_response(
+            model=model,
+            cfg=model_cfg,
+            geometry=geometry,
+            F_time=F_time,
+            u_static=u_static_cmp,
+            v_static=v_static,
+            a_static=a_static,
+            device=device,
+        )
+        transformer_results[label] = result
+        transformer_responses[label] = result["u_full"]
+        transformer_checkpoint_paths[label] = str(model_checkpoint)
+        plot_theta(
+            time=time,
+            theta_dict=result["theta_dict"],
+            path=output_dir / "plots" / f"theta_timeseries_{safe_label}.png",
+        )
 
     # ------------------------------------------------------------
     # 6. Metrics + plots
@@ -1034,13 +1185,16 @@ def main() -> None:
             u_teacher=u_teacher_cmp,
             n_nodes=n_nodes,
         ),
-        compute_metrics(
-            name="transformer",
-            u=u_transformer_cmp,
-            u_teacher=u_teacher_cmp,
-            n_nodes=n_nodes,
-        ),
     ]
+    for label, response in transformer_responses.items():
+        metrics.append(
+            compute_metrics(
+                name=label,
+                u=response,
+                u_teacher=u_teacher_cmp,
+                n_nodes=n_nodes,
+            )
+        )
 
     static_metric = metrics[1]
     for m in metrics:
@@ -1058,6 +1212,7 @@ def main() -> None:
 
     metrics_summary = {
         "checkpoint": str(checkpoint),
+        "transformer_checkpoints": transformer_checkpoint_paths,
         "load_file": str(load_file),
         "teacher_out": str(teacher_out),
         "T_use": T_use,
@@ -1066,24 +1221,30 @@ def main() -> None:
         "remove_initial_offset": bool(args.remove_initial_offset),
         "metrics": metrics,
         "theta_stats": {
-            name: {
-                "min": float(np.min(arr)),
-                "max": float(np.max(arr)),
-                "max_abs": float(np.max(np.abs(arr))),
-                "mean": float(np.mean(arr)),
-                "std": float(np.std(arr)),
+            label: {
+                name: {
+                    "min": float(np.min(arr)),
+                    "max": float(np.max(arr)),
+                    "max_abs": float(np.max(np.abs(arr))),
+                    "mean": float(np.mean(arr)),
+                    "std": float(np.std(arr)),
+                }
+                for name, arr in result["theta_dict"].items()
             }
-            for name, arr in transformer_result["theta_dict"].items()
+            for label, result in transformer_results.items()
         },
         "theta_aux_stats": {
-            name: {
-                "min": float(np.min(arr)),
-                "max": float(np.max(arr)),
-                "max_abs": float(np.max(np.abs(arr))),
-                "mean": float(np.mean(arr)),
-                "std": float(np.std(arr)),
+            label: {
+                name: {
+                    "min": float(np.min(arr)),
+                    "max": float(np.max(arr)),
+                    "max_abs": float(np.max(np.abs(arr))),
+                    "mean": float(np.mean(arr)),
+                    "std": float(np.std(arr)),
+                }
+                for name, arr in result.get("theta_aux", {}).items()
             }
-            for name, arr in transformer_result.get("theta_aux", {}).items()
+            for label, result in transformer_results.items()
         },
         "load_spectral_features": {
             "enabled": bool(getattr(cfg, "use_load_spectral_features", False)),
@@ -1106,9 +1267,13 @@ def main() -> None:
                 "kappa_y_global_scale": float(cfg.kappa_y_static_scale),
                 "kappa_y_scale_mode": str(cfg.kappa_y_scale_mode),
             },
-            "transformer": {
-                "base": "base_static_kappa_y",
-                "enabled_params": str(cfg.enabled_params),
+            **{
+                label: {
+                    "base": "base_static_kappa_y",
+                    "checkpoint": transformer_checkpoint_paths[label],
+                    "enabled_params": str(model_cfg.enabled_params),
+                }
+                for label, model_cfg, _model_ckpt, _model_checkpoint in transformer_specs
             },
         },
     }
@@ -1117,96 +1282,90 @@ def main() -> None:
 
     tip_x = tip_component_index(n_nodes, "x")
     tip_y = tip_component_index(n_nodes, "y")
+    last5_x = last_k_component_indices(n_nodes, "x", last_k=5)
     last5_y = last_k_component_indices(n_nodes, "y", last_k=5)
 
-    plot_timeseries(
+    comparison_series = {
+        "teacher": u_teacher_cmp,
+        "base_student": u_static_cmp,
+        **transformer_responses,
+    }
+
+    plot_response_series(
         time=time,
-        teacher=u_teacher_cmp,
-        no_scale=u_no_scale_cmp,
-        static_scale=u_static_cmp,
-        transformer=u_transformer_cmp,
+        series=comparison_series,
         idx=tip_y,
         title="Tip y displacement comparison",
         ylabel="tip uy",
         path=output_dir / "plots" / "tip_y_timeseries.png",
     )
-
-    plot_timeseries(
+    plot_response_series(
         time=time,
-        teacher=u_teacher_cmp,
-        no_scale=u_no_scale_cmp,
-        static_scale=u_static_cmp,
-        transformer=u_transformer_cmp,
+        series=comparison_series,
         idx=tip_x,
         title="Tip x displacement comparison",
         ylabel="tip ux",
         path=output_dir / "plots" / "tip_x_timeseries.png",
     )
-
-    plot_timeseries_error_to_teacher(
+    plot_response_series(
         time=time,
-        teacher=u_teacher_cmp,
-        no_scale=u_no_scale_cmp,
-        static_scale=u_static_cmp,
-        transformer=u_transformer_cmp,
+        series=comparison_series,
+        idx=last5_y,
+        title="Mean last-5 nodes y displacement",
+        ylabel="mean last5 uy",
+        path=output_dir / "plots" / "last5_y_mean_timeseries.png",
+    )
+    plot_response_series(
+        time=time,
+        series=comparison_series,
+        idx=last5_x,
+        title="Mean last-5 nodes x displacement",
+        ylabel="mean last5 ux",
+        path=output_dir / "plots" / "last5_x_mean_timeseries.png",
+    )
+    plot_response_series(
+        time=time,
+        series=comparison_series,
         idx=tip_y,
         title="Tip y error relative to teacher",
         ylabel="tip uy error",
         path=output_dir / "plots" / "tip_y_error_to_teacher.png",
+        error_to="teacher",
     )
-
-    plot_timeseries_error_to_teacher(
+    plot_response_series(
         time=time,
-        teacher=u_teacher_cmp,
-        no_scale=u_no_scale_cmp,
-        static_scale=u_static_cmp,
-        transformer=u_transformer_cmp,
+        series=comparison_series,
         idx=tip_x,
         title="Tip x error relative to teacher",
         ylabel="tip ux error",
         path=output_dir / "plots" / "tip_x_error_to_teacher.png",
+        error_to="teacher",
+    )
+    plot_response_series(
+        time=time,
+        series=comparison_series,
+        idx=last5_y,
+        title="Mean last-5 y error relative to teacher",
+        ylabel="mean last5 uy error",
+        path=output_dir / "plots" / "last5_y_error_to_teacher.png",
+        error_to="teacher",
+    )
+    plot_response_series(
+        time=time,
+        series=comparison_series,
+        idx=last5_x,
+        title="Mean last-5 x error relative to teacher",
+        ylabel="mean last5 ux error",
+        path=output_dir / "plots" / "last5_x_error_to_teacher.png",
+        error_to="teacher",
     )
 
-    plot_mean_last5_y(
-        time=time,
-        teacher=u_teacher_cmp,
-        no_scale=u_no_scale_cmp,
-        static_scale=u_static_cmp,
-        transformer=u_transformer_cmp,
-        last5_y_idx=last5_y,
-        path=output_dir / "plots" / "last5_y_mean_timeseries.png",
-    )
-
-    plot_theta(
-        time=time,
-        theta_dict=transformer_result["theta_dict"],
-        path=output_dir / "plots" / "theta_timeseries.png",
-    )
+    theta_series_by_label = {
+        label: _extract_theta_series(result)
+        for label, result in transformer_results.items()
+    }
 
     rows = []
-    theta_series = {}
-    for name, arr in transformer_result["theta_dict"].items():
-        arr_np = np.asarray(arr)
-        if arr_np.ndim == 2 and arr_np.shape[1] == 1:
-            theta_series[name] = arr_np[:, 0]
-        else:
-            theta_series[name] = arr_np.reshape((arr_np.shape[0], -1))[:, 0]
-
-    param_names = list(transformer_result["theta_dict"].keys())
-    for aux_name, arr in transformer_result.get("theta_aux", {}).items():
-        arr_np = np.asarray(arr)
-        if arr_np.ndim == 1:
-            theta_series[aux_name] = arr_np
-        elif arr_np.ndim == 2 and arr_np.shape[1] == 1:
-            theta_series[aux_name] = arr_np[:, 0]
-        elif arr_np.ndim == 2 and arr_np.shape[1] == len(param_names):
-            suffix = aux_name.replace("theta_", "")
-            for j, param_name in enumerate(param_names):
-                theta_series[f"{param_name}_{suffix}"] = arr_np[:, j]
-        elif arr_np.ndim >= 2:
-            flat = arr_np.reshape((arr_np.shape[0], -1))
-            for j in range(flat.shape[1]):
-                theta_series[f"{aux_name}_{j}"] = flat[:, j]
 
     for i in range(T_use):
         row = {
@@ -1214,28 +1373,52 @@ def main() -> None:
 
             "teacher_tip_x": float(u_teacher_cmp[i, tip_x]),
             "no_scale_tip_x": float(u_no_scale_cmp[i, tip_x]),
-            "static_scale_tip_x": float(u_static_cmp[i, tip_x]),
-            "transformer_tip_x": float(u_transformer_cmp[i, tip_x]),
+            "base_student_tip_x": float(u_static_cmp[i, tip_x]),
 
             "teacher_tip_y": float(u_teacher_cmp[i, tip_y]),
             "no_scale_tip_y": float(u_no_scale_cmp[i, tip_y]),
-            "static_scale_tip_y": float(u_static_cmp[i, tip_y]),
-            "transformer_tip_y": float(u_transformer_cmp[i, tip_y]),
+            "base_student_tip_y": float(u_static_cmp[i, tip_y]),
+
+            "teacher_last5_x_mean": float(np.mean(u_teacher_cmp[i, last5_x])),
+            "no_scale_last5_x_mean": float(np.mean(u_no_scale_cmp[i, last5_x])),
+            "base_student_last5_x_mean": float(np.mean(u_static_cmp[i, last5_x])),
 
             "teacher_last5_y_mean": float(np.mean(u_teacher_cmp[i, last5_y])),
             "no_scale_last5_y_mean": float(np.mean(u_no_scale_cmp[i, last5_y])),
-            "static_scale_last5_y_mean": float(np.mean(u_static_cmp[i, last5_y])),
-            "transformer_last5_y_mean": float(np.mean(u_transformer_cmp[i, last5_y])),
+            "base_student_last5_y_mean": float(np.mean(u_static_cmp[i, last5_y])),
         }
 
-        for name, arr in theta_series.items():
-            row[name] = float(arr[i])
+        for label, response in transformer_responses.items():
+            safe_label = _safe_label(label)
+            row[f"{safe_label}_tip_x"] = float(response[i, tip_x])
+            row[f"{safe_label}_tip_y"] = float(response[i, tip_y])
+            row[f"{safe_label}_last5_x_mean"] = float(np.mean(response[i, last5_x]))
+            row[f"{safe_label}_last5_y_mean"] = float(np.mean(response[i, last5_y]))
+
+        for label, theta_series in theta_series_by_label.items():
+            safe_label = _safe_label(label)
+            for name, arr in theta_series.items():
+                row[f"{safe_label}_{name}"] = float(arr[i])
 
         rows.append(row)
 
     save_csv(output_dir / "selected_timeseries.csv", rows)
 
     if bool(args.save_npz):
+        response_payload = {
+            f"u_{_safe_label(label)}": response
+            for label, response in transformer_responses.items()
+        }
+        theta_payload: dict[str, np.ndarray] = {}
+        for label, result in transformer_results.items():
+            safe_label = _safe_label(label)
+            theta_payload[f"theta_{safe_label}"] = result["theta"]
+            for name, arr in result["theta_dict"].items():
+                theta_payload[f"theta_{safe_label}_{name}"] = arr
+            for name, arr in result.get("theta_aux", {}).items():
+                theta_payload[f"theta_aux_{safe_label}_{name}"] = arr
+
+        primary_result = transformer_results[primary_label]
         np.savez(
             output_dir / "comparison_responses.npz",
             time=time,
@@ -1243,21 +1426,14 @@ def main() -> None:
             u_teacher=u_teacher_cmp,
             u_base_no_scale=u_no_scale_cmp,
             u_base_static_kappa_y=u_static_cmp,
-            u_transformer=u_transformer_cmp,
-            theta=transformer_result["theta"],
+            **response_payload,
+            theta=primary_result["theta"],
             load_spectral_features=(
                 np.empty((0, 0), dtype=np.float64)
-                if transformer_result.get("load_spectral_features") is None
-                else transformer_result["load_spectral_features"]
+                if primary_result.get("load_spectral_features") is None
+                else primary_result["load_spectral_features"]
             ),
-            **{
-                f"theta_{name}": arr
-                for name, arr in transformer_result["theta_dict"].items()
-            },
-            **{
-                f"theta_aux_{name}": arr
-                for name, arr in transformer_result.get("theta_aux", {}).items()
-            },
+            **theta_payload,
         )
 
     print()

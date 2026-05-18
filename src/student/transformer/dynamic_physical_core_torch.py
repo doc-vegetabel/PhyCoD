@@ -45,10 +45,15 @@ class DynamicPhysicalCoreTorch(nn.Module):
             K contribution    = alpha_xy * K_xy_template
     """
 
-    PARAM_TO_TEMPLATE = {
+    PARAM_TO_STIFFNESS_TEMPLATE = {
         "alpha_x": "K_x_template",
         "alpha_xy": "K_xy_template",
     }
+    PARAM_TO_DAMPING_TEMPLATE = {
+        "beta_damp_x": "C_x_template",
+        "beta_damp_y": "C_y_template",
+    }
+    PARAM_TO_TEMPLATE = PARAM_TO_STIFFNESS_TEMPLATE
 
     def __init__(
         self,
@@ -57,6 +62,7 @@ class DynamicPhysicalCoreTorch(nn.Module):
         K0: np.ndarray | torch.Tensor,
         C0: np.ndarray | torch.Tensor,
         stiffness_templates: dict[str, np.ndarray | torch.Tensor],
+        damping_templates: dict[str, np.ndarray | torch.Tensor] | None = None,
         registry: Any,
         config: Optional[DynamicPhysicalCoreConfig] = None,
     ) -> None:
@@ -84,35 +90,86 @@ class DynamicPhysicalCoreTorch(nn.Module):
         self.register_buffer("K0", K0_t)
         self.register_buffer("C0", C0_t)
 
-        unsupported = [name for name in self.registry.names if name not in self.PARAM_TO_TEMPLATE]
+        damping_templates = {} if damping_templates is None else dict(damping_templates)
+
+        unsupported: list[str] = []
+        for name in self.registry.names:
+            spec = self.registry.get_spec(name)
+            if spec.target == "K":
+                if (spec.template_name or self.PARAM_TO_STIFFNESS_TEMPLATE.get(name)) is None:
+                    unsupported.append(name)
+            elif spec.target == "C":
+                if (spec.template_name or self.PARAM_TO_DAMPING_TEMPLATE.get(name)) is None:
+                    unsupported.append(name)
+            else:
+                unsupported.append(name)
         if unsupported:
             raise ValueError(
                 f"DynamicPhysicalCoreTorch does not support parameters: {unsupported}. "
-                f"Supported: {list(self.PARAM_TO_TEMPLATE.keys())}."
+                f"Supported stiffness params: {list(self.PARAM_TO_STIFFNESS_TEMPLATE.keys())}; "
+                f"supported damping params: {list(self.PARAM_TO_DAMPING_TEMPLATE.keys())}."
             )
 
-        self.enabled_template_names: dict[str, str] = {}
+        self.enabled_stiffness_template_names: dict[str, str] = {}
+        self.enabled_damping_template_names: dict[str, str] = {}
         for param_name in self.registry.names:
-            template_name = self.PARAM_TO_TEMPLATE[param_name]
-            if template_name not in stiffness_templates:
+            spec = self.registry.get_spec(param_name)
+            if spec.target == "K":
+                template_name = spec.template_name or self.PARAM_TO_STIFFNESS_TEMPLATE[param_name]
+                template_source = stiffness_templates
+                template_kind = "stiffness"
+            elif spec.target == "C":
+                template_name = spec.template_name or self.PARAM_TO_DAMPING_TEMPLATE[param_name]
+                template_source = damping_templates
+                template_kind = "damping"
+            else:
+                raise ValueError(f"Unsupported physical target {spec.target!r} for {param_name!r}.")
+
+            if template_name not in template_source:
                 raise KeyError(
-                    f"Missing required stiffness template {template_name!r} for parameter {param_name!r}. "
-                    f"Available templates: {list(stiffness_templates.keys())}"
+                    f"Missing required {template_kind} template {template_name!r} "
+                    f"for parameter {param_name!r}. Available templates: {list(template_source.keys())}"
                 )
-            tpl = self._as_matrix_tensor(stiffness_templates[template_name], template_name)
+            tpl = self._as_matrix_tensor(template_source[template_name], template_name)
             if tpl.shape != K0_t.shape:
                 raise ValueError(
                     f"{template_name} shape mismatch: expected {tuple(K0_t.shape)}, got {tuple(tpl.shape)}."
                 )
             self.register_buffer(template_name, tpl)
-            self.enabled_template_names[param_name] = template_name
+            if spec.target == "K":
+                self.enabled_stiffness_template_names[param_name] = template_name
+            else:
+                self.enabled_damping_template_names[param_name] = template_name
 
         self.enabled_param_names = tuple(self.registry.names)
+        self.enabled_template_names = {
+            **self.enabled_stiffness_template_names,
+            **self.enabled_damping_template_names,
+        }
+        self.enabled_stiffness_template_buffer_names = tuple(
+            self.enabled_stiffness_template_names[name]
+            for name in self.enabled_param_names
+            if name in self.enabled_stiffness_template_names
+        )
+        self.enabled_damping_template_buffer_names = tuple(
+            self.enabled_damping_template_names[name]
+            for name in self.enabled_param_names
+            if name in self.enabled_damping_template_names
+        )
         self.enabled_template_buffer_names = tuple(
             self.enabled_template_names[name]
             for name in self.enabled_param_names
+            if name in self.enabled_template_names
         )
-        self._fast_scalar_theta = int(self.registry.total_dim) == len(self.enabled_template_buffer_names)
+        slices = self.registry.slices
+        self._scalar_param_indices: dict[str, int] = {}
+        self._fast_scalar_theta = True
+        for name in self.enabled_param_names:
+            sl = slices[name]
+            if int(sl.stop - sl.start) != 1:
+                self._fast_scalar_theta = False
+                break
+            self._scalar_param_indices[name] = int(sl.start)
 
         if bool(self.config.precompute_newmark_matrices):
             self.register_buffer(
@@ -154,7 +211,7 @@ class DynamicPhysicalCoreTorch(nn.Module):
         theta_t=None:
             K_eff = K0
 
-        enabled params:
+        enabled stiffness params:
             K_eff = K0 + sum_p theta[p] * K_p_template
         """
         if theta_t is None:
@@ -165,11 +222,10 @@ class DynamicPhysicalCoreTorch(nn.Module):
 
         K_eff = self.K0
         dK_dict: dict[str, torch.Tensor] = {}
-        for param_name in self.registry.names:
+        for param_name, template_name in self.enabled_stiffness_template_names.items():
             value = theta_dict[param_name].reshape(-1)
             if value.numel() != 1:
                 raise ValueError(f"{param_name} must have one value, got {value.numel()}.")
-            template_name = self.enabled_template_names[param_name]
             template = getattr(self, template_name)
             dK = value[0] * template
             K_eff = K_eff + dK
@@ -179,6 +235,41 @@ class DynamicPhysicalCoreTorch(nn.Module):
             K_eff = 0.5 * (K_eff + K_eff.T)
 
         return K_eff, dK_dict
+
+    def assemble_damping(
+        self,
+        theta_t: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """
+        Assemble C_eff(theta_t).
+
+        theta_t=None:
+            C_eff = C0
+
+        enabled damping params:
+            C_eff = C0 + sum_p theta[p] * C_p_template
+        """
+        if theta_t is None:
+            return self.C0, {}
+
+        theta = self._normalize_theta(theta_t)
+        theta_dict = self.registry.split_theta(theta)
+
+        C_eff = self.C0
+        dC_dict: dict[str, torch.Tensor] = {}
+        for param_name, template_name in self.enabled_damping_template_names.items():
+            value = theta_dict[param_name].reshape(-1)
+            if value.numel() != 1:
+                raise ValueError(f"{param_name} must have one value, got {value.numel()}.")
+            template = getattr(self, template_name)
+            dC = value[0] * template
+            C_eff = C_eff + dC
+            dC_dict[param_name] = dC
+
+        if bool(self.config.symmetrize_k_eff):
+            C_eff = 0.5 * (C_eff + C_eff.T)
+
+        return C_eff, dC_dict
 
     def _compute_newmark_constants(self) -> tuple[float, float, float, float, float, float]:
         """Compute Newmark constants for the current fixed dt/gamma/beta."""
@@ -227,11 +318,10 @@ class DynamicPhysicalCoreTorch(nn.Module):
         theta_dict = self.registry.split_theta(theta)
 
         dK_total = torch.zeros_like(self.K0)
-        for param_name in self.registry.names:
+        for param_name, template_name in self.enabled_stiffness_template_names.items():
             value = theta_dict[param_name].reshape(-1)
             if value.numel() != 1:
                 raise ValueError(f"{param_name} must have one value, got {value.numel()}.")
-            template_name = self.enabled_template_names[param_name]
             template = getattr(self, template_name)
             dK_total = dK_total + value[0] * template
 
@@ -245,7 +335,8 @@ class DynamicPhysicalCoreTorch(nn.Module):
             return self._assemble_dynamic_stiffness_delta(theta)
 
         dK_total = None
-        for idx, template_name in enumerate(self.enabled_template_buffer_names):
+        for param_name, template_name in self.enabled_stiffness_template_names.items():
+            idx = self._scalar_param_indices[param_name]
             template = getattr(self, template_name)
             dK = theta[idx] * template
             dK_total = dK if dK_total is None else dK_total + dK
@@ -257,6 +348,45 @@ class DynamicPhysicalCoreTorch(nn.Module):
             dK_total = 0.5 * (dK_total + dK_total.T)
         return dK_total
 
+    def _assemble_dynamic_damping_delta(self, theta_t: Optional[torch.Tensor]) -> torch.Tensor:
+        """Assemble only the theta-dependent part of C_eff."""
+        if theta_t is None:
+            return torch.zeros_like(self.C0)
+
+        theta = self._normalize_theta(theta_t)
+        theta_dict = self.registry.split_theta(theta)
+
+        dC_total = torch.zeros_like(self.C0)
+        for param_name, template_name in self.enabled_damping_template_names.items():
+            value = theta_dict[param_name].reshape(-1)
+            if value.numel() != 1:
+                raise ValueError(f"{param_name} must have one value, got {value.numel()}.")
+            template = getattr(self, template_name)
+            dC_total = dC_total + value[0] * template
+
+        if bool(self.config.symmetrize_k_eff):
+            dC_total = 0.5 * (dC_total + dC_total.T)
+        return dC_total
+
+    def _assemble_dynamic_damping_delta_fast(self, theta: torch.Tensor) -> torch.Tensor:
+        """Fast theta-dependent damping assembly for already-normalized scalar theta."""
+        if not self._fast_scalar_theta:
+            return self._assemble_dynamic_damping_delta(theta)
+
+        dC_total = None
+        for param_name, template_name in self.enabled_damping_template_names.items():
+            idx = self._scalar_param_indices[param_name]
+            template = getattr(self, template_name)
+            dC = theta[idx] * template
+            dC_total = dC if dC_total is None else dC_total + dC
+
+        if dC_total is None:
+            dC_total = torch.zeros_like(self.C0)
+
+        if bool(self.config.symmetrize_k_eff):
+            dC_total = 0.5 * (dC_total + dC_total.T)
+        return dC_total
+
     def _assemble_stiffness_fast(self, theta: torch.Tensor) -> torch.Tensor:
         """Fast K_eff assembly for already-normalized scalar theta."""
         if not self._fast_scalar_theta:
@@ -264,13 +394,32 @@ class DynamicPhysicalCoreTorch(nn.Module):
             return K_eff
 
         K_eff = self.K0
-        for idx, template_name in enumerate(self.enabled_template_buffer_names):
+        for param_name, template_name in self.enabled_stiffness_template_names.items():
+            idx = self._scalar_param_indices[param_name]
             template = getattr(self, template_name)
             K_eff = K_eff + theta[idx] * template
 
         if bool(self.config.symmetrize_k_eff):
             K_eff = 0.5 * (K_eff + K_eff.T)
         return K_eff
+
+    def _assemble_damping_fast(self, theta: Optional[torch.Tensor]) -> torch.Tensor:
+        """Fast C_eff assembly for theta tensors already on core device/dtype."""
+        if theta is None:
+            return self.C0
+        if not self._fast_scalar_theta:
+            C_eff, _ = self.assemble_damping(theta)
+            return C_eff
+
+        C_eff = self.C0
+        for param_name, template_name in self.enabled_damping_template_names.items():
+            idx = self._scalar_param_indices[param_name]
+            template = getattr(self, template_name)
+            C_eff = C_eff + theta[idx] * template
+
+        if bool(self.config.symmetrize_k_eff):
+            C_eff = 0.5 * (C_eff + C_eff.T)
+        return C_eff
 
     def _newmark_effective_matrix(self, theta_t: Optional[torch.Tensor]) -> torch.Tensor:
         """Build A = K_eff + a0 M + a1 C for one Newmark step.
@@ -285,10 +434,15 @@ class DynamicPhysicalCoreTorch(nn.Module):
             A_base = self.newmark_A_base
             if A_base is None:
                 A_base = self._build_newmark_A_base()
-            return A_base + self._assemble_dynamic_stiffness_delta(theta_t)
+            return (
+                A_base
+                + self._assemble_dynamic_stiffness_delta(theta_t)
+                + a1 * self._assemble_dynamic_damping_delta(theta_t)
+            )
 
         K_eff, _ = self.assemble_stiffness(theta_t)
-        return K_eff + a0 * self.M0 + a1 * self.C0
+        C_eff, _ = self.assemble_damping(theta_t)
+        return K_eff + a0 * self.M0 + a1 * C_eff
 
     def _newmark_effective_matrix_fast(self, theta_t: Optional[torch.Tensor]) -> torch.Tensor:
         """Fast A assembly for theta tensors already on core device/dtype."""
@@ -305,10 +459,15 @@ class DynamicPhysicalCoreTorch(nn.Module):
             A_base = self.newmark_A_base
             if A_base is None:
                 A_base = self._build_newmark_A_base()
-            return A_base + self._assemble_dynamic_stiffness_delta_fast(theta_t)
+            return (
+                A_base
+                + self._assemble_dynamic_stiffness_delta_fast(theta_t)
+                + a1 * self._assemble_dynamic_damping_delta_fast(theta_t)
+            )
 
         K_eff = self._assemble_stiffness_fast(theta_t)
-        return K_eff + a0 * self.M0 + a1 * self.C0
+        C_eff = self._assemble_damping_fast(theta_t)
+        return K_eff + a0 * self.M0 + a1 * C_eff
 
     def _linear_solve(self, A: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         mode = str(self.config.linear_solve_mode)
@@ -352,7 +511,7 @@ class DynamicPhysicalCoreTorch(nn.Module):
         a0, a1, a2, a3, a4, a5 = self._newmark_constants()
 
         M = self.M0
-        C = self.C0
+        C, _ = self.assemble_damping(theta_t)
 
         A = self._newmark_effective_matrix(theta_t)
         rhs = (
@@ -382,10 +541,11 @@ class DynamicPhysicalCoreTorch(nn.Module):
         a0, a1, a2, a3, a4, a5 = self._newmark_constants()
 
         A = self._newmark_effective_matrix_fast(theta_t)
+        C = self._assemble_damping_fast(theta_t)
         rhs = (
             F_t1
             + self.M0 @ (a0 * u_t + a2 * v_t + a3 * a_t)
-            + self.C0 @ (a1 * u_t + a4 * v_t + a5 * a_t)
+            + C @ (a1 * u_t + a4 * v_t + a5 * a_t)
         )
 
         u_t1 = self._linear_solve(A, rhs)
@@ -418,7 +578,7 @@ class DynamicPhysicalCoreTorch(nn.Module):
         rhs = (
             F_t1
             + self.M0 @ (a0 * u_t + a2 * v_t + a3 * a_t)
-            + self.C0 @ (a1 * u_t + a4 * v_t + a5 * a_t)
+            + self._assemble_damping_fast(theta_t) @ (a1 * u_t + a4 * v_t + a5 * a_t)
         )
         timing["newmark_rhs_seconds"] = time_fn() - t0
 

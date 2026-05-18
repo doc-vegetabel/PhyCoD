@@ -84,6 +84,38 @@ def build_default_physical_parameter_specs() -> dict[str, PhysicalParameterSpec]
             smooth_weight=1.0,
             amplitude_weight=1.0,
         ),
+        "beta_damp_x": PhysicalParameterSpec(
+            name="beta_damp_x",
+            dim=1,
+            target="C",
+            max_abs=0.75,
+            template_name="C_x_template",
+            description=(
+                "x-bending directional damping residual. It enters the Newmark core as "
+                "C_eff(t)=C0+beta_damp_x(t)*C_x_template, with C_x_template built from "
+                "the same ux/ry directional stiffness pattern as alpha_x and scaled by "
+                "the structural damping factor. theta=0 exactly recovers the alpha baseline."
+            ),
+            enabled_by_default=False,
+            smooth_weight=1.0,
+            amplitude_weight=1.0,
+        ),
+        "beta_damp_y": PhysicalParameterSpec(
+            name="beta_damp_y",
+            dim=1,
+            target="C",
+            max_abs=0.75,
+            template_name="C_y_template",
+            description=(
+                "y-bending directional damping residual. It enters the Newmark core as "
+                "C_eff(t)=C0+beta_damp_y(t)*C_y_template, using the uy/rx bending "
+                "direction so amplitude correction has a physical damping interpretation "
+                "instead of directly scaling force or displacement."
+            ),
+            enabled_by_default=False,
+            smooth_weight=1.0,
+            amplitude_weight=1.0,
+        ),
     }
 
 
@@ -112,14 +144,17 @@ def _normalize_enabled_params(
             names.extend(_split_enabled_params(str(item)))
 
     if not names:
-        raise ValueError("enabled_params is empty. Supported parameters: alpha_x, alpha_xy.")
+        raise ValueError(
+            f"enabled_params is empty. Supported parameters: {list(all_specs.keys())}."
+        )
 
     unknown = [name for name in names if name not in all_specs]
     if unknown:
         raise KeyError(
             f"Unknown physical parameter(s): {unknown}. "
             f"Supported parameters: {list(all_specs.keys())}. "
-            "Use --enabled-params alpha_x for current alpha_x-only validation."
+            "Use --enabled-params alpha_x,alpha_xy,beta_damp_x,beta_damp_y "
+            "for the first amplitude/beta experiment."
         )
 
     out: list[str] = []

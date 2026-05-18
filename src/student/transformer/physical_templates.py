@@ -51,6 +51,12 @@ class PhysicalTemplateConfig:
     x_delta_scale: float = 0.01
     x_scale_mode: str = "x_bending"
 
+    # beta_damp_y uses the same finite-difference idea in the y-bending DOFs.
+    # The resulting stiffness-shape template is converted to a damping template
+    # after the training script knows the structural damping scale.
+    y_delta_scale: float = 0.01
+    y_scale_mode: str = "y_bending"
+
     # alpha_xy residual phi finite difference
     xy_template_mode: XYTemplateMode = "root_to_tip"
     xy_delta_phi_deg: float = 1.0
@@ -80,6 +86,7 @@ class PhysicalTemplateBundle:
     K0: np.ndarray
     K_phi_unscaled: np.ndarray
     K_x_template: np.ndarray
+    K_y_template: np.ndarray
     K_xy_template: np.ndarray
     phi_element_deg: np.ndarray
     metadata: dict[str, Any]
@@ -90,12 +97,20 @@ class PhysicalTemplateBundle:
             "K_xy_template": self.K_xy_template,
         }
 
+    def damping_template_dict(self, *, damping_scale: float) -> dict[str, np.ndarray]:
+        scale = float(damping_scale)
+        return {
+            "C_x_template": scale * self.K_x_template,
+            "C_y_template": scale * self.K_y_template,
+        }
+
     def summary(self) -> dict[str, Any]:
         shapes = {
             "M0": list(self.M0.shape),
             "K0": list(self.K0.shape),
             "K_phi_unscaled": list(self.K_phi_unscaled.shape),
             "K_x_template": list(self.K_x_template.shape),
+            "K_y_template": list(self.K_y_template.shape),
             "K_xy_template": list(self.K_xy_template.shape),
             "phi_element_deg": list(self.phi_element_deg.shape),
         }
@@ -105,6 +120,7 @@ class PhysicalTemplateBundle:
             "K0_fro": float(np.linalg.norm(self.K0)),
             "K_phi_unscaled_fro": float(np.linalg.norm(self.K_phi_unscaled)),
             "K_x_template_fro": float(np.linalg.norm(self.K_x_template)),
+            "K_y_template_fro": float(np.linalg.norm(self.K_y_template)),
             "K_xy_template_fro": float(np.linalg.norm(self.K_xy_template)),
         }
 
@@ -112,6 +128,9 @@ class PhysicalTemplateBundle:
             "K0_sym_max_abs": float(np.max(np.abs(self.K0 - self.K0.T))),
             "K_x_template_sym_max_abs": float(
                 np.max(np.abs(self.K_x_template - self.K_x_template.T))
+            ),
+            "K_y_template_sym_max_abs": float(
+                np.max(np.abs(self.K_y_template - self.K_y_template.T))
             ),
             "K_xy_template_sym_max_abs": float(
                 np.max(np.abs(self.K_xy_template - self.K_xy_template.T))
@@ -145,7 +164,7 @@ def _validate_enabled_params(enabled_params: str) -> list[str]:
     names = _split_enabled_params(enabled_params)
     if not names:
         names = ["alpha_x"]
-    allowed = {"alpha_x", "alpha_xy"}
+    allowed = {"alpha_x", "alpha_xy", "beta_damp_x", "beta_damp_y"}
     unknown = [n for n in names if n not in allowed]
     if unknown:
         raise ValueError(
@@ -277,6 +296,10 @@ def build_dynamic_stiffness_templates(cfg: PhysicalTemplateConfig) -> PhysicalTe
         raise ValueError(f"x_delta_scale must be non-zero, got {cfg.x_delta_scale}.")
     if 1.0 + float(cfg.x_delta_scale) <= 0.0:
         raise ValueError(f"1+x_delta_scale must be positive, got {1.0 + float(cfg.x_delta_scale)}.")
+    if abs(cfg.y_delta_scale) <= 0.0:
+        raise ValueError(f"y_delta_scale must be non-zero, got {cfg.y_delta_scale}.")
+    if 1.0 + float(cfg.y_delta_scale) <= 0.0:
+        raise ValueError(f"1+y_delta_scale must be positive, got {1.0 + float(cfg.y_delta_scale)}.")
     if abs(cfg.xy_delta_phi_deg) <= 0.0:
         raise ValueError(f"xy_delta_phi_deg must be non-zero, got {cfg.xy_delta_phi_deg}.")
 
@@ -286,6 +309,10 @@ def build_dynamic_stiffness_templates(cfg: PhysicalTemplateConfig) -> PhysicalTe
             templates.append("K_x_template")
         if "alpha_xy" in enabled_names:
             templates.append("K_xy_template")
+        if "beta_damp_x" in enabled_names:
+            templates.append("C_x_template")
+        if "beta_damp_y" in enabled_names:
+            templates.append("C_y_template")
         print()
         print("[Physical Templates Enabled Params]")
         print(f"  enabled_param_names = {enabled_names}")
@@ -334,6 +361,20 @@ def build_dynamic_stiffness_templates(cfg: PhysicalTemplateConfig) -> PhysicalTe
     )
     K_x_template = (K_x_perturbed - K0) / x_delta
     K_x_template = _symmetrize(K_x_template)
+
+    # ------------------------------------------------------------------
+    # 2b. K_y_template: y-bending stiffness-shape finite difference.
+    #     It is not used as an alpha stiffness correction in the first beta
+    #     experiment; it only supplies the physical shape for C_y_template.
+    # ------------------------------------------------------------------
+    y_delta = float(cfg.y_delta_scale)
+    K_y_perturbed, y_scale_info = _apply_directional_scale_to_k(
+        K0,
+        scale=1.0 + y_delta,
+        mode=str(cfg.y_scale_mode),
+    )
+    K_y_template = (K_y_perturbed - K0) / y_delta
+    K_y_template = _symmetrize(K_y_template)
 
     # ------------------------------------------------------------------
     # 3. K_xy_template: residual phi profile finite difference around K0.
@@ -396,6 +437,21 @@ def build_dynamic_stiffness_templates(cfg: PhysicalTemplateConfig) -> PhysicalTe
             "x_scale_mode": str(cfg.x_scale_mode),
             "x_scale_info": x_scale_info,
         },
+        "K_y_template": {
+            "meaning": (
+                "y-bending stiffness-shape template used to construct C_y_template for beta_damp_y; "
+                "it is not registered as a stiffness alpha parameter in the first amplitude experiment."
+            ),
+            "y_delta_scale": float(cfg.y_delta_scale),
+            "y_scale_mode": str(cfg.y_scale_mode),
+            "y_scale_info": y_scale_info,
+        },
+        "damping_templates": {
+            "meaning": (
+                "C_x_template and C_y_template are built as damping_scale times K_x_template/K_y_template, "
+                "where damping_scale is the same stiffness-proportional factor used for C0."
+            ),
+        },
         "K_xy_template": {
             "meaning": (
                 "dK / d alpha_xy, where alpha_xy is global residual phi amplitude "
@@ -416,6 +472,7 @@ def build_dynamic_stiffness_templates(cfg: PhysicalTemplateConfig) -> PhysicalTe
         K0=K0,
         K_phi_unscaled=K_phi_unscaled,
         K_x_template=K_x_template,
+        K_y_template=K_y_template,
         K_xy_template=K_xy_template,
         phi_element_deg=phi_element_deg,
         metadata=metadata,

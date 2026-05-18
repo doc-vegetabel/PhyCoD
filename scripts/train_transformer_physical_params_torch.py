@@ -169,6 +169,7 @@ from src.student.transformer.frequency_losses import (  # noqa: E402
     local_band_phase_loss,
     local_continuous_phase_lag_loss,
     local_phase_increment_loss,
+    local_phase_slope_loss,
     local_phase_correlation_loss,
     peak_and_lag_alignment_loss,
     peak_and_lag_alignment_loss_from_cache,
@@ -598,6 +599,26 @@ class TransformerPhysicalTrainConfig:
     continuous_phase_high_power_temperature: float = 0.04
     continuous_phase_static_failure_weight: float = 0.0
     continuous_phase_static_failure_max_weight: float = 3.0
+    use_local_phase_slope_loss: bool = False
+    w_local_phase_slope_x: float = 0.0
+    w_local_phase_slope_y: float = 0.0
+    local_phase_slope_observations: str = "tip,last5"
+    local_phase_slope_last_k: int = 5
+    local_phase_slope_start: float = 0.0
+    local_phase_slope_end: Optional[float] = None
+    local_phase_slope_window_seconds: float = 1.28
+    local_phase_slope_stride_seconds: float = 0.16
+    local_phase_slope_freq_min: float = 0.45
+    local_phase_slope_freq_max: Optional[float] = 1.50
+    local_phase_slope_n_freq_bins: int = 64
+    local_phase_slope_frequency_temperature: float = 0.08
+    local_phase_slope_time_shift_scale_seconds: float = 0.02
+    local_phase_slope_base_weight: float = 0.0
+    local_phase_slope_high_power_weight: float = 3.0
+    local_phase_slope_high_power_threshold: float = 0.08
+    local_phase_slope_high_power_temperature: float = 0.04
+    local_phase_slope_static_failure_weight: float = 0.0
+    local_phase_slope_static_failure_max_weight: float = 3.0
     use_slow_only_branch_diagnosis: bool = False
     w_slow_good_no_regression: float = 0.0
     w_slow_good_fast_suppress: float = 0.0
@@ -641,6 +662,10 @@ class TransformerPhysicalTrainConfig:
     w_theta_slow_smooth: float = 2.0e-3
     w_theta_fast_amp: float = 1.0e-3
     w_theta_fast_smooth: float = 1.0e-4
+    w_theta_fast_window_mean: float = 0.0
+    w_theta_gated_fast_window_mean: float = 0.0
+    theta_fast_window_mean_seconds: float = 1.54
+    theta_fast_window_mean_stride_seconds: float = 0.32
     w_phase_gate_l1: float = 1.0e-3
     w_phase_gate_tv: float = 1.0e-3
     phase_gate_active_threshold: float = 0.2
@@ -681,6 +706,7 @@ class TransformerPhysicalTrainConfig:
 
     # checkpoint / early stop
     init_checkpoint: Optional[str] = None
+    freeze_alpha_backbone_for_beta: bool = False
     use_valid_for_best: bool = True
 
     # validation frequency
@@ -856,6 +882,8 @@ def make_epoch_curriculum_cfg(
             "effective_w_local_phase_increment_y": float(cfg.w_local_phase_increment_y),
             "effective_w_continuous_phase_time_shift_x": float(cfg.w_continuous_phase_time_shift_x),
             "effective_w_continuous_phase_time_shift_y": float(cfg.w_continuous_phase_time_shift_y),
+            "effective_w_local_phase_slope_x": float(cfg.w_local_phase_slope_x),
+            "effective_w_local_phase_slope_y": float(cfg.w_local_phase_slope_y),
             "effective_w_phase_gate_l1": float(cfg.w_phase_gate_l1),
             "effective_w_phase_gate_tv": float(cfg.w_phase_gate_tv),
             "effective_w_phase_gate_bootstrap": float(epoch_cfg.w_phase_gate_bootstrap),
@@ -932,6 +960,8 @@ def make_epoch_curriculum_cfg(
         w_continuous_phase_absolute_y=float(cfg.w_continuous_phase_absolute_y) * phase_scale,
         w_continuous_phase_time_shift_x=float(cfg.w_continuous_phase_time_shift_x) * phase_scale,
         w_continuous_phase_time_shift_y=float(cfg.w_continuous_phase_time_shift_y) * phase_scale,
+        w_local_phase_slope_x=float(cfg.w_local_phase_slope_x) * phase_scale,
+        w_local_phase_slope_y=float(cfg.w_local_phase_slope_y) * phase_scale,
         w_phase_gate_l1=float(cfg.w_phase_gate_l1) * gate_reg_scale,
         w_phase_gate_tv=float(cfg.w_phase_gate_tv) * gate_reg_scale,
         w_phase_gate_bootstrap=bootstrap_weight,
@@ -964,6 +994,8 @@ def make_epoch_curriculum_cfg(
         "effective_w_local_phase_increment_y": float(epoch_cfg.w_local_phase_increment_y),
         "effective_w_continuous_phase_time_shift_x": float(epoch_cfg.w_continuous_phase_time_shift_x),
         "effective_w_continuous_phase_time_shift_y": float(epoch_cfg.w_continuous_phase_time_shift_y),
+        "effective_w_local_phase_slope_x": float(epoch_cfg.w_local_phase_slope_x),
+        "effective_w_local_phase_slope_y": float(epoch_cfg.w_local_phase_slope_y),
         "effective_w_phase_gate_l1": float(epoch_cfg.w_phase_gate_l1),
         "effective_w_phase_gate_tv": float(epoch_cfg.w_phase_gate_tv),
         "effective_w_phase_gate_bootstrap": float(epoch_cfg.w_phase_gate_bootstrap),
@@ -1069,9 +1101,22 @@ def _build_structural_damping_matrix(
             raise ValueError("Cannot infer ref_freq_hz from empty natural_freqs_hz.")
         ref_freq_hz = float(natural_freqs_hz[0])
 
-    beta_damp = 2.0 * float(zeta_structural) / (2.0 * np.pi * float(ref_freq_hz))
+    beta_damp = _structural_damping_scale(
+        zeta_structural=float(zeta_structural),
+        ref_freq_hz=float(ref_freq_hz),
+    )
     C = beta_damp * K
     return np.asarray(C, dtype=np.float64), float(ref_freq_hz)
+
+
+def _structural_damping_scale(
+        *,
+        zeta_structural: float,
+        ref_freq_hz: Optional[float],
+) -> float:
+    if zeta_structural <= 0.0 or ref_freq_hz is None:
+        return 0.0
+    return 2.0 * float(zeta_structural) / (2.0 * np.pi * float(ref_freq_hz))
 
 
 def _save_yaml(path: Path, payload: dict[str, Any]) -> None:
@@ -1092,6 +1137,191 @@ def _save_history_csv(path: Path, history: list[dict[str, float]]) -> None:
         writer.writeheader()
         for row in history:
             writer.writerow(row)
+
+
+def _is_head_row_expansion_key(key: str) -> bool:
+    return (
+        key.startswith("head.")
+        or ".head." in key
+        or key.endswith(".head.max_abs")
+        or key == "max_abs"
+    )
+
+
+def _can_partial_row_copy(key: str, source: torch.Tensor, target: torch.Tensor) -> bool:
+    if not _is_head_row_expansion_key(key):
+        return False
+    if source.ndim == 0 or source.ndim != target.ndim:
+        return False
+    if int(source.shape[0]) > int(target.shape[0]):
+        return False
+    return all(int(source.shape[i]) == int(target.shape[i]) for i in range(1, source.ndim))
+
+
+def _merge_partial_state_dict(
+        module: torch.nn.Module,
+        source_state: dict[str, torch.Tensor],
+) -> dict[str, Any]:
+    """
+    Merge an alpha checkpoint into a possibly wider beta model.
+
+    Exact-shape tensors are copied as usual. For the physical head, tensors that
+    grew only in the output/parameter dimension copy their leading alpha rows and
+    leave the new beta rows at the freshly initialized near-zero values.
+    """
+    target_state = module.state_dict()
+    merged_state = {
+        key: value.detach().clone()
+        for key, value in target_state.items()
+    }
+
+    exact_loaded: list[str] = []
+    partial_loaded: list[dict[str, Any]] = []
+    skipped_shape: list[dict[str, Any]] = []
+    unexpected: list[str] = []
+
+    for key, source_value in source_state.items():
+        if key not in target_state:
+            unexpected.append(key)
+            continue
+        if not torch.is_tensor(source_value):
+            skipped_shape.append({"key": key, "source_shape": None, "target_shape": None})
+            continue
+
+        target_value = target_state[key]
+        source_tensor = source_value.detach().to(
+            device=target_value.device,
+            dtype=target_value.dtype,
+        )
+
+        if tuple(source_tensor.shape) == tuple(target_value.shape):
+            merged_state[key] = source_tensor.clone()
+            exact_loaded.append(key)
+            continue
+
+        if _can_partial_row_copy(key, source_tensor, target_value):
+            out = target_value.detach().clone()
+            slices = tuple(slice(0, int(dim)) for dim in source_tensor.shape)
+            out[slices] = source_tensor
+            merged_state[key] = out
+            partial_loaded.append(
+                {
+                    "key": key,
+                    "source_shape": list(source_tensor.shape),
+                    "target_shape": list(target_value.shape),
+                }
+            )
+            continue
+
+        skipped_shape.append(
+            {
+                "key": key,
+                "source_shape": list(source_tensor.shape),
+                "target_shape": list(target_value.shape),
+            }
+        )
+
+    load_result = module.load_state_dict(merged_state, strict=True)
+    return {
+        "exact_loaded": exact_loaded,
+        "partial_loaded": partial_loaded,
+        "skipped_shape": skipped_shape,
+        "unexpected": unexpected,
+        "missing_after_merge": list(getattr(load_result, "missing_keys", [])),
+        "unexpected_after_merge": list(getattr(load_result, "unexpected_keys", [])),
+    }
+
+
+def _load_initial_checkpoint_partial(
+        *,
+        model: torch.nn.Module,
+        checkpoint: Any,
+) -> tuple[str, dict[str, Any]]:
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        return "model_state_dict", _merge_partial_state_dict(model, checkpoint["model_state_dict"])
+    if isinstance(checkpoint, dict) and "encoder_state_dict" in checkpoint:
+        return "encoder_state_dict", _merge_partial_state_dict(model.encoder, checkpoint["encoder_state_dict"])
+    if isinstance(checkpoint, dict):
+        return "raw_state_dict", _merge_partial_state_dict(model, checkpoint)
+    raise TypeError(
+        f"Unsupported checkpoint type {type(checkpoint)!r}; expected a state-dict-like mapping."
+    )
+
+
+def _beta_theta_indices(registry: Any) -> list[int]:
+    indices: list[int] = []
+    slices = registry.slices
+    for name in registry.names:
+        spec = registry.get_spec(name)
+        if spec.target != "C":
+            continue
+        sl = slices[name]
+        indices.extend(range(int(sl.start), int(sl.stop)))
+    return indices
+
+
+def _mask_parameter_rows(param: torch.nn.Parameter, train_rows: list[int]) -> None:
+    mask = torch.zeros_like(param.detach())
+    row_index = torch.as_tensor(train_rows, dtype=torch.long, device=mask.device)
+    if param.ndim == 1:
+        mask.index_fill_(0, row_index, 1.0)
+    elif param.ndim >= 2:
+        mask.index_fill_(0, row_index, 1.0)
+    else:
+        raise ValueError("Cannot row-mask a scalar parameter.")
+
+    param.register_hook(lambda grad, row_mask=mask: grad * row_mask.to(dtype=grad.dtype, device=grad.device))
+
+
+def _configure_beta_head_only_training(
+        *,
+        model: torch.nn.Module,
+        registry: Any,
+) -> dict[str, Any]:
+    """
+    Freeze the alpha backbone and train only C-target beta rows of theta heads.
+
+    This is intentionally conservative for the first amplitude run: alpha_x and
+    alpha_xy rows stay bitwise untouched by gradients, while beta rows can learn
+    damping residuals from the already-trained Transformer features.
+    """
+    beta_rows = _beta_theta_indices(registry)
+    if not beta_rows:
+        raise ValueError(
+            "freeze_alpha_backbone_for_beta=True but registry has no C-target beta parameters."
+        )
+
+    for param in model.encoder.parameters():
+        param.requires_grad_(False)
+
+    head = model.encoder.head
+    final_layers: list[torch.nn.Module] = []
+    if hasattr(head, "slow_net") and hasattr(head, "fast_net"):
+        final_layers.extend([head.slow_net[-1], head.fast_net[-1]])
+    elif hasattr(head, "net"):
+        final_layers.append(head.net[-1])
+    else:
+        raise TypeError(f"Unsupported physical head type for beta-only freezing: {type(head)!r}")
+
+    masked_tensors: list[str] = []
+    for layer_idx, layer in enumerate(final_layers):
+        if not isinstance(layer, torch.nn.Linear):
+            raise TypeError(f"Expected final theta head layer to be nn.Linear, got {type(layer)!r}.")
+        for tensor_name in ("weight", "bias"):
+            param = getattr(layer, tensor_name)
+            param.requires_grad_(True)
+            _mask_parameter_rows(param, beta_rows)
+            masked_tensors.append(f"head_final_{layer_idx}.{tensor_name}")
+
+    trainable_params = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
+    total_encoder_params = sum(p.numel() for p in model.encoder.parameters())
+    return {
+        "beta_rows": [int(i) for i in beta_rows],
+        "masked_tensors": masked_tensors,
+        "trainable_encoder_params": int(trainable_params),
+        "total_encoder_params": int(total_encoder_params),
+        "weight_decay_forced_to_zero": True,
+    }
 
 
 def _read_metrics_csv(path: Path) -> list[dict[str, Any]]:
@@ -1530,6 +1760,8 @@ PHASE_GATED_LOG_METRIC_KEYS = [
     "theta_slow_smooth",
     "theta_fast_amp",
     "theta_fast_smooth",
+    "theta_fast_window_mean",
+    "theta_gated_fast_window_mean",
     "phase_gate_l1",
     "phase_gate_tv",
     "phase_gate_bootstrap_loss",
@@ -1538,6 +1770,8 @@ PHASE_GATED_LOG_METRIC_KEYS = [
     "phase_gate_max",
     "phase_gate_active_ratio",
     "theta_fast_abs_max",
+    "theta_fast_window_mean_abs_max",
+    "theta_gated_fast_window_mean_abs_max",
     "theta_gated_fast_rms",
     "theta_gated_fast_abs_max",
 ]
@@ -1545,6 +1779,8 @@ PHASE_GATED_LOG_METRIC_KEYS = [
 PHASE_GATED_MAX_METRIC_KEYS = {
     "phase_gate_max",
     "theta_fast_abs_max",
+    "theta_fast_window_mean_abs_max",
+    "theta_gated_fast_window_mean_abs_max",
     "theta_gated_fast_abs_max",
 }
 
@@ -1688,6 +1924,25 @@ ADAPTIVE_PHASE_LOG_METRIC_KEYS = [
     "continuous_phase_y_target_freq_hz_mean",
     "continuous_phase_x_n_windows",
     "continuous_phase_y_n_windows",
+    "local_phase_slope_loss",
+    "local_phase_slope_x_loss",
+    "local_phase_slope_y_loss",
+    "local_phase_slope_x_phase_cos_mean",
+    "local_phase_slope_y_phase_cos_mean",
+    "local_phase_slope_x_equivalent_abs_dlag_s_mean",
+    "local_phase_slope_y_equivalent_abs_dlag_s_mean",
+    "local_phase_slope_x_high_weight_mean",
+    "local_phase_slope_y_high_weight_mean",
+    "local_phase_slope_x_static_failure_weight_mean",
+    "local_phase_slope_y_static_failure_weight_mean",
+    "local_phase_slope_x_combined_weight_mean",
+    "local_phase_slope_y_combined_weight_mean",
+    "local_phase_slope_x_target_freq_hz_mean",
+    "local_phase_slope_y_target_freq_hz_mean",
+    "local_phase_slope_x_n_windows",
+    "local_phase_slope_y_n_windows",
+    "local_phase_slope_x_n_slopes",
+    "local_phase_slope_y_n_slopes",
     "slow_only_diagnosis_loss",
     "slow_good_no_regression_loss",
     "slow_good_fast_suppress_loss",
@@ -1785,6 +2040,39 @@ def _time_now(cfg: TransformerPhysicalTrainConfig, device: torch.device | None =
     return time.perf_counter()
 
 
+def _theta_window_mean_loss(
+        theta_seq: torch.Tensor,
+        *,
+        dt: float,
+        window_seconds: float,
+        stride_seconds: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return mean-square and max-abs of sliding-window theta means."""
+    if theta_seq.ndim == 2:
+        theta_seq = theta_seq.unsqueeze(0)
+    if theta_seq.ndim != 3:
+        raise ValueError(f"theta_seq must be (T,P) or (B,T,P), got {tuple(theta_seq.shape)}")
+
+    zero = theta_seq.sum() * 0.0
+    T = int(theta_seq.shape[1])
+    win_steps = max(1, int(round(float(window_seconds) / float(dt))))
+    stride_steps = max(1, int(round(float(stride_seconds) / float(dt))))
+    if T <= 0:
+        return zero, zero.detach()
+    if T < win_steps:
+        mean_values = torch.mean(theta_seq, dim=1)
+        return torch.mean(mean_values ** 2), torch.max(torch.abs(mean_values)).detach()
+
+    means = []
+    for lo in range(0, T - win_steps + 1, stride_steps):
+        means.append(torch.mean(theta_seq[:, lo:lo + win_steps, :], dim=1))
+    if not means:
+        mean_values = torch.mean(theta_seq, dim=1)
+    else:
+        mean_values = torch.stack(means, dim=1)
+    return torch.mean(mean_values ** 2), torch.max(torch.abs(mean_values)).detach()
+
+
 def phase_gated_decomposition_regularization_loss(
         *,
         theta_aux: Optional[dict[str, torch.Tensor]],
@@ -1808,6 +2096,8 @@ def phase_gated_decomposition_regularization_loss(
             "theta_slow_smooth": zero,
             "theta_fast_amp": zero,
             "theta_fast_smooth": zero,
+            "theta_fast_window_mean": zero,
+            "theta_gated_fast_window_mean": zero,
             "phase_gate_l1": zero,
             "phase_gate_tv": zero,
             "phase_gate_bootstrap_loss": zero,
@@ -1816,6 +2106,8 @@ def phase_gated_decomposition_regularization_loss(
             "phase_gate_max": zero,
             "phase_gate_active_ratio": zero,
             "theta_fast_abs_max": zero,
+            "theta_fast_window_mean_abs_max": zero,
+            "theta_gated_fast_window_mean_abs_max": zero,
             "theta_gated_fast_rms": zero,
             "theta_gated_fast_abs_max": zero,
         }
@@ -1842,6 +2134,18 @@ def phase_gated_decomposition_regularization_loss(
     slow_smooth = theta_smoothness_loss(theta_slow)
     fast_amp = theta_amplitude_loss(theta_fast)
     fast_smooth = theta_smoothness_loss(theta_fast)
+    fast_window_mean, fast_window_mean_abs_max = _theta_window_mean_loss(
+        theta_fast,
+        dt=float(cfg.dt),
+        window_seconds=float(cfg.theta_fast_window_mean_seconds),
+        stride_seconds=float(cfg.theta_fast_window_mean_stride_seconds),
+    )
+    gated_fast_window_mean, gated_fast_window_mean_abs_max = _theta_window_mean_loss(
+        theta_gated_fast,
+        dt=float(cfg.dt),
+        window_seconds=float(cfg.theta_fast_window_mean_seconds),
+        stride_seconds=float(cfg.theta_fast_window_mean_stride_seconds),
+    )
     gate_l1 = torch.mean(g_phase)
     if g_phase.ndim >= 3 and g_phase.shape[1] >= 2:
         gate_tv = torch.mean(torch.abs(g_phase[:, 1:, :] - g_phase[:, :-1, :]))
@@ -1860,6 +2164,8 @@ def phase_gated_decomposition_regularization_loss(
         float(cfg.w_theta_slow_smooth) * slow_smooth
         + float(cfg.w_theta_fast_amp) * fast_amp
         + float(cfg.w_theta_fast_smooth) * fast_smooth
+        + float(cfg.w_theta_fast_window_mean) * fast_window_mean
+        + float(cfg.w_theta_gated_fast_window_mean) * gated_fast_window_mean
         + float(cfg.w_phase_gate_l1) * gate_l1
         + float(cfg.w_phase_gate_tv) * gate_tv
         + float(cfg.w_phase_gate_bootstrap) * gate_bootstrap_loss
@@ -1870,6 +2176,8 @@ def phase_gated_decomposition_regularization_loss(
         "theta_slow_smooth": slow_smooth,
         "theta_fast_amp": fast_amp,
         "theta_fast_smooth": fast_smooth,
+        "theta_fast_window_mean": fast_window_mean,
+        "theta_gated_fast_window_mean": gated_fast_window_mean,
         "phase_gate_l1": gate_l1,
         "phase_gate_tv": gate_tv,
         "phase_gate_bootstrap_loss": gate_bootstrap_loss,
@@ -1880,6 +2188,8 @@ def phase_gated_decomposition_regularization_loss(
             (g_phase > float(cfg.phase_gate_active_threshold)).to(dtype=dtype)
         ),
         "theta_fast_abs_max": torch.max(torch.abs(theta_fast)),
+        "theta_fast_window_mean_abs_max": fast_window_mean_abs_max,
+        "theta_gated_fast_window_mean_abs_max": gated_fast_window_mean_abs_max,
         "theta_gated_fast_rms": torch.sqrt(torch.mean(theta_gated_fast ** 2)),
         "theta_gated_fast_abs_max": torch.max(torch.abs(theta_gated_fast)),
     }
@@ -2537,6 +2847,106 @@ def continuous_phase_lag_training_loss(
         "continuous_phase_y_target_freq_hz_mean": phase_y["target_freq_hz_mean"],
         "continuous_phase_x_n_windows": phase_x["n_windows"],
         "continuous_phase_y_n_windows": phase_y["n_windows"],
+    }
+
+
+def local_phase_slope_training_loss(
+        *,
+        pred: torch.Tensor,
+        teacher: torch.Tensor,
+        static: torch.Tensor,
+        cfg: TransformerPhysicalTrainConfig,
+        x_idx: torch.Tensor,
+        y_idx: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    zero = torch.zeros((), dtype=pred.dtype, device=pred.device)
+    empty = {
+        "local_phase_slope_loss": zero,
+        "local_phase_slope_x_loss": zero,
+        "local_phase_slope_y_loss": zero,
+        "local_phase_slope_x_phase_cos_mean": zero.detach(),
+        "local_phase_slope_y_phase_cos_mean": zero.detach(),
+        "local_phase_slope_x_equivalent_abs_dlag_s_mean": zero.detach(),
+        "local_phase_slope_y_equivalent_abs_dlag_s_mean": zero.detach(),
+        "local_phase_slope_x_high_weight_mean": zero.detach(),
+        "local_phase_slope_y_high_weight_mean": zero.detach(),
+        "local_phase_slope_x_static_failure_weight_mean": zero.detach(),
+        "local_phase_slope_y_static_failure_weight_mean": zero.detach(),
+        "local_phase_slope_x_combined_weight_mean": zero.detach(),
+        "local_phase_slope_y_combined_weight_mean": zero.detach(),
+        "local_phase_slope_x_target_freq_hz_mean": zero.detach(),
+        "local_phase_slope_y_target_freq_hz_mean": zero.detach(),
+        "local_phase_slope_x_n_windows": zero.detach(),
+        "local_phase_slope_y_n_windows": zero.detach(),
+        "local_phase_slope_x_n_slopes": zero.detach(),
+        "local_phase_slope_y_n_slopes": zero.detach(),
+    }
+    if not bool(getattr(cfg, "use_local_phase_slope_loss", False)):
+        return empty
+
+    common_kwargs = dict(
+        dt=float(cfg.dt),
+        observations=str(cfg.local_phase_slope_observations),
+        last_k=int(cfg.local_phase_slope_last_k),
+        start_time=float(cfg.local_phase_slope_start),
+        end_time=cfg.local_phase_slope_end,
+        window_seconds=float(cfg.local_phase_slope_window_seconds),
+        stride_seconds=float(cfg.local_phase_slope_stride_seconds),
+        freq_min=float(cfg.local_phase_slope_freq_min),
+        freq_max=cfg.local_phase_slope_freq_max,
+        n_freq_bins=int(cfg.local_phase_slope_n_freq_bins),
+        frequency_temperature=float(cfg.local_phase_slope_frequency_temperature),
+        time_shift_scale_seconds=float(cfg.local_phase_slope_time_shift_scale_seconds),
+        base_weight=float(cfg.local_phase_slope_base_weight),
+        high_power_weight=float(cfg.local_phase_slope_high_power_weight),
+        high_power_threshold=float(cfg.local_phase_slope_high_power_threshold),
+        high_power_temperature=float(cfg.local_phase_slope_high_power_temperature),
+        static_failure_weight=float(cfg.local_phase_slope_static_failure_weight),
+        static_failure_max_weight=float(cfg.local_phase_slope_static_failure_max_weight),
+        static_failure_corr_threshold=float(cfg.static_quality_good_corr_threshold),
+        static_failure_lag_seconds=float(cfg.static_quality_good_lag_seconds),
+        static_failure_amp_log_tol=float(cfg.static_quality_good_amp_log_tol),
+        static_failure_max_lag_seconds=float(cfg.static_quality_max_lag_seconds),
+        lag_temperature=float(cfg.lag_temperature),
+    )
+    phase_x = local_phase_slope_loss(
+        pred,
+        teacher,
+        static_reference=static,
+        dof_indices=x_idx,
+        **common_kwargs,
+    )
+    phase_y = local_phase_slope_loss(
+        pred,
+        teacher,
+        static_reference=static,
+        dof_indices=y_idx,
+        **common_kwargs,
+    )
+    loss = (
+        float(cfg.w_local_phase_slope_x) * phase_x["slope_loss"]
+        + float(cfg.w_local_phase_slope_y) * phase_y["slope_loss"]
+    )
+    return {
+        "local_phase_slope_loss": loss,
+        "local_phase_slope_x_loss": phase_x["slope_loss"],
+        "local_phase_slope_y_loss": phase_y["slope_loss"],
+        "local_phase_slope_x_phase_cos_mean": phase_x["slope_phase_cos_mean"],
+        "local_phase_slope_y_phase_cos_mean": phase_y["slope_phase_cos_mean"],
+        "local_phase_slope_x_equivalent_abs_dlag_s_mean": phase_x["equivalent_abs_dlag_s_mean"],
+        "local_phase_slope_y_equivalent_abs_dlag_s_mean": phase_y["equivalent_abs_dlag_s_mean"],
+        "local_phase_slope_x_high_weight_mean": phase_x["high_weight_mean"],
+        "local_phase_slope_y_high_weight_mean": phase_y["high_weight_mean"],
+        "local_phase_slope_x_static_failure_weight_mean": phase_x["static_failure_weight_mean"],
+        "local_phase_slope_y_static_failure_weight_mean": phase_y["static_failure_weight_mean"],
+        "local_phase_slope_x_combined_weight_mean": phase_x["combined_weight_mean"],
+        "local_phase_slope_y_combined_weight_mean": phase_y["combined_weight_mean"],
+        "local_phase_slope_x_target_freq_hz_mean": phase_x["target_freq_hz_mean"],
+        "local_phase_slope_y_target_freq_hz_mean": phase_y["target_freq_hz_mean"],
+        "local_phase_slope_x_n_windows": phase_x["n_windows"],
+        "local_phase_slope_y_n_windows": phase_y["n_windows"],
+        "local_phase_slope_x_n_slopes": phase_x["n_slopes"],
+        "local_phase_slope_y_n_slopes": phase_y["n_slopes"],
     }
 
 
@@ -3337,6 +3747,14 @@ def compute_response_loss(
         x_idx=x_idx,
         y_idx=y_idx,
     )
+    local_phase_slope = local_phase_slope_training_loss(
+        pred=pred,
+        teacher=teacher,
+        static=case.u_static.to(device=u_pred.device, dtype=u_pred.dtype),
+        cfg=cfg,
+        x_idx=x_idx,
+        y_idx=y_idx,
+    )
     static_quality_gate = static_quality_gate_suppression_loss(
         static=case.u_static,
         teacher=teacher,
@@ -3379,6 +3797,7 @@ def compute_response_loss(
         + local_phase_corr["local_phase_corr_loss"]
         + local_phase_increment["local_phase_increment_loss"]
         + continuous_phase["continuous_phase_loss"]
+        + local_phase_slope["local_phase_slope_loss"]
         + slow_only_diag["slow_only_diagnosis_loss"]
     )
 
@@ -3507,6 +3926,25 @@ def compute_response_loss(
         "continuous_phase_y_target_freq_hz_mean": continuous_phase["continuous_phase_y_target_freq_hz_mean"],
         "continuous_phase_x_n_windows": continuous_phase["continuous_phase_x_n_windows"],
         "continuous_phase_y_n_windows": continuous_phase["continuous_phase_y_n_windows"],
+        "local_phase_slope_loss": local_phase_slope["local_phase_slope_loss"],
+        "local_phase_slope_x_loss": local_phase_slope["local_phase_slope_x_loss"],
+        "local_phase_slope_y_loss": local_phase_slope["local_phase_slope_y_loss"],
+        "local_phase_slope_x_phase_cos_mean": local_phase_slope["local_phase_slope_x_phase_cos_mean"],
+        "local_phase_slope_y_phase_cos_mean": local_phase_slope["local_phase_slope_y_phase_cos_mean"],
+        "local_phase_slope_x_equivalent_abs_dlag_s_mean": local_phase_slope["local_phase_slope_x_equivalent_abs_dlag_s_mean"],
+        "local_phase_slope_y_equivalent_abs_dlag_s_mean": local_phase_slope["local_phase_slope_y_equivalent_abs_dlag_s_mean"],
+        "local_phase_slope_x_high_weight_mean": local_phase_slope["local_phase_slope_x_high_weight_mean"],
+        "local_phase_slope_y_high_weight_mean": local_phase_slope["local_phase_slope_y_high_weight_mean"],
+        "local_phase_slope_x_static_failure_weight_mean": local_phase_slope["local_phase_slope_x_static_failure_weight_mean"],
+        "local_phase_slope_y_static_failure_weight_mean": local_phase_slope["local_phase_slope_y_static_failure_weight_mean"],
+        "local_phase_slope_x_combined_weight_mean": local_phase_slope["local_phase_slope_x_combined_weight_mean"],
+        "local_phase_slope_y_combined_weight_mean": local_phase_slope["local_phase_slope_y_combined_weight_mean"],
+        "local_phase_slope_x_target_freq_hz_mean": local_phase_slope["local_phase_slope_x_target_freq_hz_mean"],
+        "local_phase_slope_y_target_freq_hz_mean": local_phase_slope["local_phase_slope_y_target_freq_hz_mean"],
+        "local_phase_slope_x_n_windows": local_phase_slope["local_phase_slope_x_n_windows"],
+        "local_phase_slope_y_n_windows": local_phase_slope["local_phase_slope_y_n_windows"],
+        "local_phase_slope_x_n_slopes": local_phase_slope["local_phase_slope_x_n_slopes"],
+        "local_phase_slope_y_n_slopes": local_phase_slope["local_phase_slope_y_n_slopes"],
         "slow_only_diagnosis_loss": slow_only_diag["slow_only_diagnosis_loss"],
         "slow_good_no_regression_loss": slow_only_diag["slow_good_no_regression_loss"],
         "slow_good_fast_suppress_loss": slow_only_diag["slow_good_fast_suppress_loss"],
@@ -3564,6 +4002,8 @@ def compute_response_loss(
         "theta_slow_smooth": phase_reg["theta_slow_smooth"],
         "theta_fast_amp": phase_reg["theta_fast_amp"],
         "theta_fast_smooth": phase_reg["theta_fast_smooth"],
+        "theta_fast_window_mean": phase_reg["theta_fast_window_mean"],
+        "theta_gated_fast_window_mean": phase_reg["theta_gated_fast_window_mean"],
         "phase_gate_l1": phase_reg["phase_gate_l1"],
         "phase_gate_tv": phase_reg["phase_gate_tv"],
         "phase_gate_bootstrap_loss": phase_reg["phase_gate_bootstrap_loss"],
@@ -3572,6 +4012,8 @@ def compute_response_loss(
         "phase_gate_max": phase_reg["phase_gate_max"],
         "phase_gate_active_ratio": phase_reg["phase_gate_active_ratio"],
         "theta_fast_abs_max": phase_reg["theta_fast_abs_max"],
+        "theta_fast_window_mean_abs_max": phase_reg["theta_fast_window_mean_abs_max"],
+        "theta_gated_fast_window_mean_abs_max": phase_reg["theta_gated_fast_window_mean_abs_max"],
         "theta_gated_fast_rms": phase_reg["theta_gated_fast_rms"],
         "theta_gated_fast_abs_max": phase_reg["theta_gated_fast_abs_max"],
         **static_quality_gate,
@@ -4404,12 +4846,20 @@ def build_training_model(
         ref_freq_hz=cfg.ref_freq_hz,
         natural_freqs_hz=natural_freqs_hz,
     )
+    damping_template_scale = _structural_damping_scale(
+        zeta_structural=float(cfg.zeta_structural),
+        ref_freq_hz=ref_freq_used,
+    )
+    damping_templates = template_bundle.damping_template_dict(
+        damping_scale=damping_template_scale,
+    )
 
     core = DynamicPhysicalCoreTorch(
         M0=M0,
         K0=K0,
         C0=C0,
         stiffness_templates=template_bundle.stiffness_template_dict(),
+        damping_templates=damping_templates,
         registry=registry,
         config=DynamicPhysicalCoreConfig(
             dt=float(cfg.dt),
@@ -4482,6 +4932,7 @@ def build_training_model(
         "M0_shape": list(M0.shape),
         "K0_shape": list(K0.shape),
         "C0_shape": list(C0.shape),
+        "damping_template_scale": float(damping_template_scale),
     }
 
     return model, info
@@ -4678,6 +5129,10 @@ def parse_args() -> tuple[
     parser.add_argument("--w-theta-slow-smooth", type=float, default=d.w_theta_slow_smooth)
     parser.add_argument("--w-theta-fast-amp", type=float, default=d.w_theta_fast_amp)
     parser.add_argument("--w-theta-fast-smooth", type=float, default=d.w_theta_fast_smooth)
+    parser.add_argument("--w-theta-fast-window-mean", type=float, default=d.w_theta_fast_window_mean)
+    parser.add_argument("--w-theta-gated-fast-window-mean", type=float, default=d.w_theta_gated_fast_window_mean)
+    parser.add_argument("--theta-fast-window-mean-seconds", type=float, default=d.theta_fast_window_mean_seconds)
+    parser.add_argument("--theta-fast-window-mean-stride-seconds", type=float, default=d.theta_fast_window_mean_stride_seconds)
     parser.add_argument("--w-phase-gate-l1", type=float, default=d.w_phase_gate_l1)
     parser.add_argument("--w-phase-gate-tv", type=float, default=d.w_phase_gate_tv)
     parser.add_argument("--phase-gate-active-threshold", type=float, default=d.phase_gate_active_threshold)
@@ -4971,6 +5426,48 @@ def parse_args() -> tuple[
                         default=d.continuous_phase_static_failure_weight)
     parser.add_argument("--continuous-phase-static-failure-max-weight", type=float,
                         default=d.continuous_phase_static_failure_max_weight)
+    parser.add_argument("--use-local-phase-slope-loss", dest="use_local_phase_slope_loss",
+                        action="store_true", default=d.use_local_phase_slope_loss)
+    parser.add_argument("--no-local-phase-slope-loss", dest="use_local_phase_slope_loss",
+                        action="store_false")
+    parser.add_argument("--w-local-phase-slope-x", type=float,
+                        default=d.w_local_phase_slope_x)
+    parser.add_argument("--w-local-phase-slope-y", type=float,
+                        default=d.w_local_phase_slope_y)
+    parser.add_argument("--local-phase-slope-observations", type=str,
+                        default=d.local_phase_slope_observations)
+    parser.add_argument("--local-phase-slope-last-k", type=int,
+                        default=d.local_phase_slope_last_k)
+    parser.add_argument("--local-phase-slope-start", type=float,
+                        default=d.local_phase_slope_start)
+    parser.add_argument("--local-phase-slope-end", type=float,
+                        default=d.local_phase_slope_end)
+    parser.add_argument("--local-phase-slope-window-seconds", type=float,
+                        default=d.local_phase_slope_window_seconds)
+    parser.add_argument("--local-phase-slope-stride-seconds", type=float,
+                        default=d.local_phase_slope_stride_seconds)
+    parser.add_argument("--local-phase-slope-freq-min", type=float,
+                        default=d.local_phase_slope_freq_min)
+    parser.add_argument("--local-phase-slope-freq-max", type=float,
+                        default=d.local_phase_slope_freq_max)
+    parser.add_argument("--local-phase-slope-n-freq-bins", type=int,
+                        default=d.local_phase_slope_n_freq_bins)
+    parser.add_argument("--local-phase-slope-frequency-temperature", type=float,
+                        default=d.local_phase_slope_frequency_temperature)
+    parser.add_argument("--local-phase-slope-time-shift-scale-seconds", type=float,
+                        default=d.local_phase_slope_time_shift_scale_seconds)
+    parser.add_argument("--local-phase-slope-base-weight", type=float,
+                        default=d.local_phase_slope_base_weight)
+    parser.add_argument("--local-phase-slope-high-power-weight", type=float,
+                        default=d.local_phase_slope_high_power_weight)
+    parser.add_argument("--local-phase-slope-high-power-threshold", type=float,
+                        default=d.local_phase_slope_high_power_threshold)
+    parser.add_argument("--local-phase-slope-high-power-temperature", type=float,
+                        default=d.local_phase_slope_high_power_temperature)
+    parser.add_argument("--local-phase-slope-static-failure-weight", type=float,
+                        default=d.local_phase_slope_static_failure_weight)
+    parser.add_argument("--local-phase-slope-static-failure-max-weight", type=float,
+                        default=d.local_phase_slope_static_failure_max_weight)
     parser.add_argument("--use-slow-only-branch-diagnosis", action="store_true",
                         default=d.use_slow_only_branch_diagnosis)
     parser.add_argument("--no-slow-only-branch-diagnosis", dest="use_slow_only_branch_diagnosis",
@@ -5038,6 +5535,20 @@ def parse_args() -> tuple[
             "Only model/encoder weights are loaded; optimizer state is intentionally "
             "not restored so LR and loss weights can be changed for follow-up runs."
         ),
+    )
+    parser.add_argument(
+        "--freeze-alpha-backbone-for-beta",
+        action="store_true",
+        default=d.freeze_alpha_backbone_for_beta,
+        help=(
+            "Freeze the loaded encoder/Transformer/alpha rows and train only C-target "
+            "beta rows of the final theta head. This is the conservative first beta mode."
+        ),
+    )
+    parser.add_argument(
+        "--no-freeze-alpha-backbone-for-beta",
+        dest="freeze_alpha_backbone_for_beta",
+        action="store_false",
     )
 
     best_constraint_group = parser.add_mutually_exclusive_group()
@@ -5230,6 +5741,10 @@ def parse_args() -> tuple[
         w_theta_slow_smooth=args.w_theta_slow_smooth,
         w_theta_fast_amp=args.w_theta_fast_amp,
         w_theta_fast_smooth=args.w_theta_fast_smooth,
+        w_theta_fast_window_mean=args.w_theta_fast_window_mean,
+        w_theta_gated_fast_window_mean=args.w_theta_gated_fast_window_mean,
+        theta_fast_window_mean_seconds=args.theta_fast_window_mean_seconds,
+        theta_fast_window_mean_stride_seconds=args.theta_fast_window_mean_stride_seconds,
         w_phase_gate_l1=args.w_phase_gate_l1,
         w_phase_gate_tv=args.w_phase_gate_tv,
         phase_gate_active_threshold=float(args.phase_gate_active_threshold),
@@ -5406,6 +5921,26 @@ def parse_args() -> tuple[
         continuous_phase_high_power_temperature=float(args.continuous_phase_high_power_temperature),
         continuous_phase_static_failure_weight=float(args.continuous_phase_static_failure_weight),
         continuous_phase_static_failure_max_weight=float(args.continuous_phase_static_failure_max_weight),
+        use_local_phase_slope_loss=bool(args.use_local_phase_slope_loss),
+        w_local_phase_slope_x=float(args.w_local_phase_slope_x),
+        w_local_phase_slope_y=float(args.w_local_phase_slope_y),
+        local_phase_slope_observations=str(args.local_phase_slope_observations),
+        local_phase_slope_last_k=int(args.local_phase_slope_last_k),
+        local_phase_slope_start=float(args.local_phase_slope_start),
+        local_phase_slope_end=args.local_phase_slope_end,
+        local_phase_slope_window_seconds=float(args.local_phase_slope_window_seconds),
+        local_phase_slope_stride_seconds=float(args.local_phase_slope_stride_seconds),
+        local_phase_slope_freq_min=float(args.local_phase_slope_freq_min),
+        local_phase_slope_freq_max=args.local_phase_slope_freq_max,
+        local_phase_slope_n_freq_bins=int(args.local_phase_slope_n_freq_bins),
+        local_phase_slope_frequency_temperature=float(args.local_phase_slope_frequency_temperature),
+        local_phase_slope_time_shift_scale_seconds=float(args.local_phase_slope_time_shift_scale_seconds),
+        local_phase_slope_base_weight=float(args.local_phase_slope_base_weight),
+        local_phase_slope_high_power_weight=float(args.local_phase_slope_high_power_weight),
+        local_phase_slope_high_power_threshold=float(args.local_phase_slope_high_power_threshold),
+        local_phase_slope_high_power_temperature=float(args.local_phase_slope_high_power_temperature),
+        local_phase_slope_static_failure_weight=float(args.local_phase_slope_static_failure_weight),
+        local_phase_slope_static_failure_max_weight=float(args.local_phase_slope_static_failure_max_weight),
         use_slow_only_branch_diagnosis=bool(args.use_slow_only_branch_diagnosis),
         w_slow_good_no_regression=float(args.w_slow_good_no_regression),
         w_slow_good_fast_suppress=float(args.w_slow_good_fast_suppress),
@@ -5437,6 +5972,7 @@ def parse_args() -> tuple[
         best_score_mode=args.best_score_mode,
         best_start_epoch=int(args.best_start_epoch),
         init_checkpoint=args.init_checkpoint,
+        freeze_alpha_backbone_for_beta=bool(args.freeze_alpha_backbone_for_beta),
         early_stop_patience=args.early_stop_patience,
         early_stop_min_delta=args.early_stop_min_delta,
         min_epochs=args.min_epochs,
@@ -5613,6 +6149,21 @@ def main() -> None:
             f"base_weight={cfg.continuous_phase_base_weight}, "
             f"high_weight={cfg.continuous_phase_high_power_weight}, "
             f"static_failure_weight={cfg.continuous_phase_static_failure_weight}"
+        )
+    print(f"  use_local_phase_slope_loss = {cfg.use_local_phase_slope_loss}")
+    if bool(cfg.use_local_phase_slope_loss):
+        print(
+            "  local_phase_slope = "
+            f"obs={cfg.local_phase_slope_observations}, "
+            f"freq=[{cfg.local_phase_slope_freq_min}, {cfg.local_phase_slope_freq_max}], "
+            f"n_freq_bins={cfg.local_phase_slope_n_freq_bins}, "
+            f"window={cfg.local_phase_slope_window_seconds}, "
+            f"stride={cfg.local_phase_slope_stride_seconds}, "
+            f"lag_slope_scale={cfg.local_phase_slope_time_shift_scale_seconds}, "
+            f"w=({cfg.w_local_phase_slope_x}, {cfg.w_local_phase_slope_y}), "
+            f"base_weight={cfg.local_phase_slope_base_weight}, "
+            f"high_weight={cfg.local_phase_slope_high_power_weight}, "
+            f"static_failure_weight={cfg.local_phase_slope_static_failure_weight}"
         )
     print(f"  use_slow_only_branch_diagnosis = {cfg.use_slow_only_branch_diagnosis}")
     if bool(cfg.use_slow_only_branch_diagnosis):
@@ -5841,35 +6392,63 @@ def main() -> None:
     if bool(cfg.use_load_spectral_features) and spectral_mean is not None and spectral_std is not None:
         model.encoder.set_load_spectral_normalization(spectral_mean, spectral_std)
 
+    init_checkpoint_report: Optional[dict[str, Any]] = None
     if cfg.init_checkpoint is not None and str(cfg.init_checkpoint).strip():
         init_checkpoint_path = Path(str(cfg.init_checkpoint)).expanduser()
         if not init_checkpoint_path.exists():
             raise FileNotFoundError(f"Initial checkpoint not found: {init_checkpoint_path}")
 
         checkpoint = torch.load(init_checkpoint_path, map_location=device)
-        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            load_result = model.load_state_dict(checkpoint["model_state_dict"], strict=True)
-            loaded_part = "model_state_dict"
-        elif isinstance(checkpoint, dict) and "encoder_state_dict" in checkpoint:
-            load_result = model.encoder.load_state_dict(checkpoint["encoder_state_dict"], strict=True)
-            loaded_part = "encoder_state_dict"
-        else:
-            load_result = model.load_state_dict(checkpoint, strict=True)
-            loaded_part = "raw_state_dict"
+        loaded_part, init_checkpoint_report = _load_initial_checkpoint_partial(
+            model=model,
+            checkpoint=checkpoint,
+        )
 
         print()
         print("[Init Checkpoint]")
         print(f"  path        = {init_checkpoint_path}")
         print(f"  loaded_part = {loaded_part}")
-        if getattr(load_result, "missing_keys", None):
-            print(f"  missing_keys   = {list(load_result.missing_keys)}")
-        if getattr(load_result, "unexpected_keys", None):
-            print(f"  unexpected_keys = {list(load_result.unexpected_keys)}")
+        print(f"  exact_loaded   = {len(init_checkpoint_report['exact_loaded'])}")
+        print(f"  partial_loaded = {len(init_checkpoint_report['partial_loaded'])}")
+        if init_checkpoint_report["partial_loaded"]:
+            for item in init_checkpoint_report["partial_loaded"][:12]:
+                print(
+                    "    partial "
+                    f"{item['key']}: {item['source_shape']} -> {item['target_shape']}"
+                )
+        print(f"  skipped_shape  = {len(init_checkpoint_report['skipped_shape'])}")
+        if init_checkpoint_report["skipped_shape"]:
+            for item in init_checkpoint_report["skipped_shape"][:12]:
+                print(
+                    "    skipped "
+                    f"{item['key']}: {item['source_shape']} -> {item['target_shape']}"
+                )
+        if init_checkpoint_report["unexpected"]:
+            print(f"  unexpected     = {len(init_checkpoint_report['unexpected'])}")
+
+    if init_checkpoint_report is not None:
+        model_info["init_checkpoint_load"] = init_checkpoint_report
+
+    beta_freeze_report: Optional[dict[str, Any]] = None
+    if bool(cfg.freeze_alpha_backbone_for_beta):
+        beta_freeze_report = _configure_beta_head_only_training(
+            model=model,
+            registry=registry,
+        )
+        model_info["beta_head_only_training"] = beta_freeze_report
+        print()
+        print("[Beta Head Only Training]")
+        print(f"  beta_rows                = {beta_freeze_report['beta_rows']}")
+        print(f"  masked_tensors           = {beta_freeze_report['masked_tensors']}")
+        print(f"  trainable_encoder_params = {beta_freeze_report['trainable_encoder_params']}")
+        print("  optimizer_weight_decay   = 0.0")
+
+    optimizer_weight_decay = 0.0 if beta_freeze_report is not None else float(cfg.weight_decay)
 
     optimizer = torch.optim.AdamW(
-        model.encoder.parameters(),
+        [p for p in model.encoder.parameters() if p.requires_grad],
         lr=float(cfg.lr),
-        weight_decay=float(cfg.weight_decay),
+        weight_decay=float(optimizer_weight_decay),
     )
 
     # ------------------------------------------------------------

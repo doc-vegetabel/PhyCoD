@@ -1,26 +1,22 @@
-# Runtime outputs and experiment artifacts
+# Generated caches
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Local environments
+.venv/
+venv/
+env/
+
+# Large local data and experiment outputs
 data/
 result/
 results/
-runs/
-cache/
-*.npz
-*.pt
-*.pth
-*.ckpt
 
-# Python caches and local environments
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.venv/
-venv/
-
-# IDE and OS local files
+# Local editor/OS files
 .idea/
 .vscode/
 .DS_Store
 Thumbs.db
-
